@@ -27,7 +27,7 @@ test.describe("journey-compact-process.spec", { tag: ["@isolation:fresh", "@cate
  * Steps:
  *   1. Open a local Project and check default-open workspace folders and closed secondary sections.
  *   2. Collapse Files, send a request, verify streaming updates keep it closed, then grant permission and observe the running tool.
- *   3. Check completed records, copyable output and the unchanged declared Artifact card.
+ *   3. Check completed records, copyable output and the unchanged declared Artifact card, and the send time on the final reply.
  *      Inspect the trajectory transcript with a boundary between live progress and the final result.
  *   4. Run a failing tool and verify its compact error record.
  *   5. Reload on a narrow viewport and verify the same bounded evidence, persisted records and workspace files.
@@ -165,6 +165,9 @@ test("完成的过程去框，运行卡片和文件操作保留", { tag: "@mocke
         await expect(timeline.locator(".message.assistant .avatar")).toHaveCount(1);
         await expect(timeline.locator(".message.assistant .message-role")).toHaveCount(1);
         await expect(timeline.locator(".message-body")).toHaveCount(2);
+        // 终态回复的发送时间显示在身份行（ScienceDiscovery 右侧），与其它消息一致。
+        await expect(timeline.locator(".run-identity").first().locator(".message-time"))
+          .toHaveText(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
         await expect(timeline.locator(":scope > :first-child")).toHaveClass(/run-identity/);
         const summary = tool.locator(":scope > summary");
         await expect(summary).toHaveCSS("min-height", "28px");

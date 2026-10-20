@@ -45,7 +45,7 @@ test.use({ locale: "zh-CN" });
  *   3. Verify empty sessions keep a neutral heading and usable composer with no connectors, literature connectors, or PubMed/UniProt.
  *   4. Send a shell-backed request, inspect its marked tool input/output, and observe completion.
  *   5. Send a second request proving Workspace files persist but Shell cwd/export do not.
- *   6. Reload and verify the same Project, Session, messages, and expandable tool history remain.
+ *   6. Reload and verify the same Project, Session, messages with their send times, and expandable tool history remain.
  * Environment: Isolated local stack at E2E_BASE_URL with an empty model/project catalog; zh-CN browser locale and persisted UI locale.
  * Type: mocked
  * LLM: journey-owned OpenAI-compatible HTTP stub on 127.0.0.1; two deterministic user turns.
@@ -328,12 +328,15 @@ test("J1 首次进入即可完成并恢复两轮分析", { tag: "@mocked" }, asy
 
     await journey.step(
       "刷新页面后回到同一个会话",
-      "两轮的用户消息都还在，两条工具步骤都还在，展开后仍能看到上一轮读回的值。",
+      "两轮的用户消息都还在，各自带发送时间；两条工具步骤都还在，展开后仍能看到上一轮读回的值。",
       async () => {
         await page.reload();
         await openProjectSession(page, fixture!);
         await expect(page.locator(".message.user").filter({ hasText: firstPrompt })).toBeVisible();
         await expect(page.locator(".message.user").filter({ hasText: secondPrompt })).toBeVisible();
+        // 每条消息显示发送时间（本地时间，YYYY-MM-DD HH:MM:SS），刷新后仍可读。
+        await expect(page.locator(".message.user").filter({ hasText: firstPrompt })
+          .locator(".message-time")).toHaveText(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
         // Each run exposes the requested shell tool on its first model step.
         await expect(page.getByRole("region", { name: "Agent 活动" }).locator("details.timeline-disclosure.tool"))
           .toHaveCount(2);

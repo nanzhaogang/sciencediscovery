@@ -20,6 +20,9 @@
 .run-timeline > .assistant-continuation { margin-bottom: 12px; }
 .run-timeline > .run-identity { align-items: center; margin-bottom: 8px; }
 .run-identity .message-role { margin: 0; }
+/* The identity row already owns the gap below it, and the model disclosure can
+   follow on its own line: the meta row must not push either of them apart. */
+.run-identity .message-meta { margin: 0; }
 
 /* Only collapsed terminal records lose their card surface. */
 .process-record { min-width: 0; margin: 4px 0; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }

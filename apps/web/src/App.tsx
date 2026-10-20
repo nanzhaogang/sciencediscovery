@@ -229,6 +229,7 @@ import { createIdeaTreeSettingsDraft, IdeaTreeSettingsEditor, ideaTreeSettingsRe
 import { EvidenceModal } from "./EvidenceModal.js";
 import { ErrorBoundary } from "./ErrorBoundary.js";
 import { GovernedDownloadCards } from "./GovernedDownloadCards.js";
+import { MessageTime } from "./MessageTime.js";
 import { isMemoryGraphVisible, MemoryGraphView, useMemorySubgraph } from "./MemoryGraphView.js";
 import { EvolveSetup, useEvolveStatus } from "./evolve/EvolveSetup.js";
 import { EvolveAlgorithmPicker } from "./evolve/EvolveAlgorithmPicker.js";
@@ -4484,7 +4485,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
                       ) : (
                         <article className={`message ${block.message.role}${block.message.kind === "review_notice" ? " review-notice" : block.message.kind === "timeout_notice" ? " timeout-notice" : ""}`}>
                           <div className="avatar">{block.message.role === "user" ? t("app.roleYou") : block.message.kind === "review_notice" ? <CheckIcon size={16} /> : <BrandIcon size={19} />}</div>
-                          <div><span className="message-role">{block.message.role === "user" ? t("app.roleResearcher") : block.message.kind === "review_notice" ? t("app.roleReviewerNotice") : "ScienceDiscovery"}{block.message.modelName ? ` · ${block.message.modelName}` : ""}</span><MarkdownRenderer
+                          <div><span className="message-meta"><span className="message-role">{block.message.role === "user" ? t("app.roleResearcher") : block.message.kind === "review_notice" ? t("app.roleReviewerNotice") : "ScienceDiscovery"}{block.message.modelName ? ` · ${block.message.modelName}` : ""}</span><MessageTime value={block.message.createdAt} /></span><MarkdownRenderer
                             className="message-content"
                             content={block.message.content}
                             loadWorkspaceImage={block.message.role === "assistant" ? loadMarkdownImage : undefined}

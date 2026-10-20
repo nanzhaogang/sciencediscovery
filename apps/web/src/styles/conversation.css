@@ -87,6 +87,12 @@ button.session-bar-project:hover { color: var(--accent-strong); }
 .avatar { width: 38px; height: 38px; display: grid; place-items: center; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-soft); color: var(--text-secondary); font-size: 12px; font-weight: 700; }
 .message.assistant .avatar { border-color: var(--accent-border-soft); background: var(--accent-soft); color: var(--accent-strong); font: 600 18px ui-monospace, monospace; }
 .message-role { display: block; margin: 1px 0 8px; color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: .035em; text-transform: uppercase; }
+/* Send time of one chat message. The stamp is fixed `YYYY-MM-DD HH:MM:SS` and
+   stays small and muted so it reads as metadata next to the sender, never as
+   part of the message itself. Tabular figures keep a column of stamps aligned. */
+.message-meta { display: flex; align-items: baseline; gap: 8px; margin: 1px 0 8px; }
+.message-meta .message-role { margin: 0; }
+.message-time { color: var(--text-faint); font-size: 11px; font-variant-numeric: tabular-nums; letter-spacing: .02em; }
 .message p { color: var(--text); font-size: 16px; line-height: 1.78; }
 .message.user .markdown-body { display: inline-block; border-radius: 10px; background: var(--surface-sunk); padding: 11px 14px; color: var(--text-heading); }
 .cursor { display: inline-block; width: 7px; height: 17px; margin-left: 4px; vertical-align: -3px; background: var(--accent); animation: blink 1s steps(1) infinite; }

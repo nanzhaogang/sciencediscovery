@@ -19,6 +19,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocale } from "./i18n/index.js";
 import { BrandIcon, ChevronDownIcon, ChevronRightIcon, WarningIcon } from "./icons.js";
 import { MarkdownRenderer } from "./Markdown.js";
+import { MessageTime } from "./MessageTime.js";
 import { subagentStatusLabel } from "./Orchestration.js";
 import { RunTimeline, type RunTimelineEntry } from "./timeline/RunTimeline.js";
 
@@ -71,7 +72,7 @@ export function subagentTimelineEntries(subagent: Subagent): RunTimelineEntry[] 
       continue;
     }
 
-    entries.push({ content: step.content, id, type: "assistant" });
+    entries.push({ content: step.content, createdAt: step.createdAt, id, type: "assistant" });
   }
 
   return entries;
@@ -179,7 +180,7 @@ export function SubagentConversation({
       <article className="message user subagent-prompt-message">
         <div className="avatar"><BrandIcon size={18} /></div>
         <div>
-          <span className="message-role">{t("subagent.coordinator")}</span>
+          <span className="message-meta"><span className="message-role">{t("subagent.coordinator")}</span><MessageTime value={subagent.createdAt} /></span>
           <MarkdownRenderer className="message-content" content={subagent.input.prompt} />
         </div>
       </article>

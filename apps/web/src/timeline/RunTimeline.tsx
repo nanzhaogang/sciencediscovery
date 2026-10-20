@@ -32,6 +32,7 @@ import React, { useEffect, useRef, useState, type ReactNode } from "react";
 import { BrandIcon, CheckIcon, ChevronRightIcon, SpinnerIcon, WarningIcon } from "../icons.js";
 import { IdeaResearchTimelineCard } from "../IdeaResearchTimelineCard.js";
 import { MarkdownRenderer } from "../Markdown.js";
+import { MessageTime } from "../MessageTime.js";
 import { SubagentCards } from "../Orchestration.js";
 import { PermissionDecisionActions, permissionMatchingKey } from "../PermissionDecisionActions.js";
 import { mergePermissionRequestSnapshot } from "../permission-state.js";
@@ -91,6 +92,10 @@ export type RunTimelineEntry =
     }
   | {
       content: string;
+      /** When the run's terminal message carrying this answer was sent. Filled
+       * from `run.completed` only, because the streamed deltas that build the
+       * entry before that carry no clock of their own. */
+      createdAt?: string;
       id: string;
       /** Response identity this answer belongs to, when the producing event carried one. */
       responseId?: string;
@@ -673,11 +678,23 @@ export function reduceRunTimeline(
     // report-kind outputs (e.g. a leader delivery_summary alongside a
     // report-writer's squares_report).
     if (finished.some((entry) => entry.type === "assistant" && entry.content.trim())) {
-      return finished.map((entry) => entry.type === "assistant" && messageReferences?.length
-        ? { ...entry, references: messageReferences }
-        : entry);
+      // Only the reply the terminal message closes carries its send time: an
+      // earlier answer inside the same run streamed at its own moment, so
+      // stamping it with this run's completion would misdate it.
+      const reply = finished.findLastIndex((entry) => entry.type === "assistant" && entry.content.trim());
+      return finished.map((entry, index) => {
+        if (entry.type !== "assistant") return entry;
+        const sentAt = index === reply ? event.message.createdAt : undefined;
+        if (!sentAt && !messageReferences?.length) return entry;
+        return {
+          ...entry,
+          ...(sentAt ? { createdAt: sentAt } : {}),
+          ...(messageReferences?.length ? { references: messageReferences } : {}),
+        };
+      });
     }
     return [...finished, {
+      ...(event.message.createdAt ? { createdAt: event.message.createdAt } : {}),
       content: event.message.content,
       id: nextAnswerId(finished),
       ...(messageReferences?.length ? { references: messageReferences } : {}),
@@ -1079,11 +1096,18 @@ export function RunTimeline({
           </details>
         );
   }
+  // The run's own label row carries when its answer was sent. The answer body
+  // has no role line of its own, so a stamp inside it would sit on a line by
+  // itself while every other message shows its send time beside the sender.
+  const answerSentAt = entries.findLast(
+    (entry): entry is Extract<RunTimelineEntry, { type: "assistant" }> =>
+      entry.type === "assistant" && Boolean(entry.createdAt),
+  )?.createdAt;
   return (
     <section className="run-timeline" aria-label={t("timeline.activity")} aria-live="polite">
       <header className="message assistant run-identity">
         <div className="avatar"><BrandIcon size={19} /></div>
-        <div><span className="message-role">{agentLabel}</span>{modelName ? <details className="run-model-details"><summary>{t("timeline.details")}</summary>{modelName}</details> : null}</div>
+        <div><span className="message-meta"><span className="message-role">{agentLabel}</span><MessageTime value={answerSentAt} /></span>{modelName ? <details className="run-model-details"><summary>{t("timeline.details")}</summary>{modelName}</details> : null}</div>
       </header>
       {explorationGroups(entries).map(group => {
         const latest = group.findLast(entry => entry.type === "tool" && (entry.trace.preview || entry.preview || entry.trace.summary || entry.trace.paperCount !== undefined || entry.paperCount !== undefined));
