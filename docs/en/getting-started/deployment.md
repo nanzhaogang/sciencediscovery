@@ -11,56 +11,11 @@ The screenshots below show the installer and the first-launch wizard in Chinese;
 - 5 GB or more for the data directory, which prepares the Python runtime on first launch;
 - at least one model provider API key.
 
-## 1. Run the installer
-
-Double-click the downloaded package:
-
-```text
-ScienceDiscovery-<version>-win-x64-setup.exe
-```
-
-The installer verifies and unpacks itself first. Seeing the loading window below is normal; it proceeds on its own.
-
-![The installer verifying itself](../../images/install/win-01-verify.png)
-
-## 2. Accept the license
-
-The installer uses Apache License 2.0. Read the agreement and select **I Agree (我同意)** to continue.
-
-![License agreement](../../images/install/win-02-license.png)
-
-## 3. Choose who to install for
-
-- **Install for all users on this computer**: installs to a shared location and needs administrator rights;
-- **Install for me only**: installs under your user profile, needs no elevation, and is the recommended choice on a personal machine.
-
-Then select **Next (下一步)**.
-
-![Installation scope](../../images/install/win-03-scope.png)
-
-## 4. Choose the install location
-
-The default is `C:\Users\<your user name>\AppData\Local\Programs\ScienceDiscovery`. To use another drive, select **Browse (浏览)…** and pick a folder such as `E:\SD\`. The window shows the required and available space.
-
-Select **Install (安装)** to continue.
-
-![Choosing the install location](../../images/install/win-04-location.png)
-
-## 5. Wait for the installation
-
-Do not close the window until the progress bar finishes.
-
-![Installing](../../images/install/win-05-progress.png)
-
-On the last page, keep **Run ScienceDiscovery (运行 ScienceDiscovery)** checked and select **Finish (完成)**. The wizard closes and the app starts.
-
-![Installation complete](../../images/install/win-06-finish.png)
-
-## 6. First-launch setup
+## First-launch setup
 
 The first launch runs a three-screen setup wizard. You only go through it once.
 
-### 6.1 Choose the research workspace
+### Choose the research workspace
 
 Artifacts, intermediate results and the runtime environment all live in this directory. The default is
 `C:\Users\<your user name>\AppData\Local\ScienceDiscovery`, and the wizard shows the free space on that drive;
@@ -68,7 +23,7 @@ it needs at least 5 GB. Once **Directory is writable** is confirmed, select **Ne
 
 ![Choose the research workspace](../../images/install/win-07-workspace.png)
 
-### 6.2 Wait while the environment is prepared
+### Wait while the environment is prepared
 
 The first launch prepares the Python runtime and its dependencies inside the data directory, which can take
 a few minutes up to a quarter of an hour depending on disk speed and antivirus software. You can minimize
@@ -76,7 +31,7 @@ the window; the first preparation is not interrupted.
 
 ![Preparing the work environment](../../images/install/win-08-preparing.png)
 
-### 6.3 Choose a model provider
+### Choose a model provider
 
 Pick a preset provider under **Provider type** (DeepSeek, Moonshot Kimi, Zhipu GLM, Z.AI, MiniMax, Alibaba Cloud
 Model Studio, OpenAI, Anthropic, Google Gemini, SiliconFlow, OpenRouter, Ollama, and others). To use a
@@ -89,7 +44,7 @@ Then select **Test and continue**.
 
 ![A custom provider](../../images/install/win-10-provider-custom.png)
 
-### 6.4 Connection succeeds
+### Connection succeeds
 
 On success the wizard shows **Connection succeeded** with the round-trip time. Select **Start using** to open
 the main window. If the test fails, check the API key, base URL and model name, then select **Test again**.

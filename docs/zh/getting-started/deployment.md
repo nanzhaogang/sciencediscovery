@@ -9,71 +9,25 @@ Windows 使用桌面安装程序。装完之后双击就能用：不需要打开
 - 数据目录建议预留 5 GB 以上（首次启动会在其中准备 Python 运行时）；
 - 至少一个模型服务商的 API Key。
 
-## 1. 运行安装程序
-
-双击下载的安装包：
-
-```text
-ScienceDiscovery-<version>-win-x64-setup.exe
-```
-
-安装程序会先自检并解压，出现下面的加载窗口是正常的，等它自动进入下一步即可。
-
-![安装程序自检](../../images/install/win-01-verify.png)
-
-## 2. 接受许可协议
-
-安装程序使用 Apache License 2.0。阅读协议后点击 **我同意(I)** 继续。
-
-![许可协议](../../images/install/win-02-license.png)
-
-## 3. 选择安装范围
-
-- **为使用这台电脑的任何人安装（所有用户）**：装到公共位置，需要管理员权限；
-- **仅为我安装**：装到当前用户目录，不需要提权，推荐个人机器使用。
-
-选好后点击 **下一步(N)**。
-
-![安装选项](../../images/install/win-03-scope.png)
-
-## 4. 选择安装位置
-
-默认目录是 `C:\Users\<你的用户名>\AppData\Local\Programs\ScienceDiscovery`。
-需要换盘时点击 **浏览(B)…** 选择其他文件夹，例如 `E:\SD\`。窗口底部会显示所需空间和当前磁盘的可用空间。
-
-确认后点击 **安装(I)**。
-
-![选定安装位置](../../images/install/win-04-location.png)
-
-## 5. 等待安装完成
-
-进度条走完之前不要关闭窗口。
-
-![正在安装](../../images/install/win-05-progress.png)
-
-最后一页勾选 **运行 ScienceDiscovery(R)**，点击 **完成(F)**，安装向导关闭后应用会直接启动。
-
-![安装完成](../../images/install/win-06-finish.png)
-
-## 6. 首次启动设置
+## 首次启动设置
 
 第一次启动是一个三屏的初始化向导，只需要走一次。
 
-### 6.1 配置研究工作区
+### 配置研究工作区
 
 产物、中间结果和运行环境都会写在这里。默认目录是 `C:\Users\<你的用户名>\AppData\Local\ScienceDiscovery`，
 下方会显示当前磁盘剩余空间，需要 ≥5 GB。确认 **目录可写** 后点击 **下一步**。
 
 ![配置研究工作区](../../images/install/win-07-workspace.png)
 
-### 6.2 等待准备工作环境
+### 等待准备工作环境
 
 首次启动要在数据目录中准备 Python 运行时和依赖，可能需要几分钟到十几分钟，取决于磁盘速度与杀毒软件。
 中途可以最小化窗口，首次准备过程不会中断。
 
 ![正在准备工作环境](../../images/install/win-08-preparing.png)
 
-### 6.3 选择模型提供方
+### 选择模型提供方
 
 在 **服务商类型** 中选择预置服务商（DeepSeek、Moonshot Kimi、智谱 GLM、Z.AI、MiniMax、阿里云百炼、OpenAI、
 Anthropic、Google Gemini、SiliconFlow、OpenRouter、Ollama 等）；如果要接自建或中转服务，选择
@@ -86,7 +40,7 @@ Anthropic、Google Gemini、SiliconFlow、OpenRouter、Ollama 等）；如果要
 
 ![自定义服务商](../../images/install/win-10-provider-custom.png)
 
-### 6.4 连接成功
+### 连接成功
 
 测试通过后窗口会显示 **连接成功** 和耗时。点击 **开始使用** 进入主界面；
 如果失败，先核对 API Key、基础 URL 和模型名称，再点 **重新测试**。
