@@ -218,6 +218,7 @@ import {
 import { ProjectRemoteSettings, RemoteHostManager, RemoteJobsPanel, SessionRemoteSettings } from "./RemoteCompute.js";
 import { AgentActivityPanel, type ActivityFocus } from "./AgentActivityPanel.js";
 import { RunUsageInline, UsagePage, type UsageAnalyticsUiFilters } from "./UsagePage.js";
+import { LoginPage } from "./LoginPage.js";
 import { formatCompactTokenValue, usageInOutLabel } from "./usageFormat.js";
 import { ArtifactModal } from "./ScientificArtifacts.js";
 import { SourcePreview } from "./SourcePreview.js";
@@ -1127,6 +1128,9 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
   const [usageAnalytics, setUsageAnalytics] = useState<ModelUsageAnalyticsSummary>();
   const [usageFilters, setUsageFilters] = useState<UsageAnalyticsUiFilters>({});
   const [workspaceView, setWorkspaceView] = useState<"session" | "usage">(() => initialView.view === "usage" ? "usage" : "session");
+  // Sign-in is a full-screen takeover, not a main-area view: it owns the whole
+  // window and must not be rewritten by the URL sync below.
+  const [loginRoute, setLoginRoute] = useState(() => initialView.view === "login");
   // `/evolve-design` runs for the active session, plus which one the panel shows. The
   // card is the only persistent handle a search has (the command never creates
   // a chat run), so the list is kept even when the panel is closed.
@@ -1776,6 +1780,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
   // popstate handler so this effect re-runs — and normalizes the URL — even
   // when the navigation changed no state at all.
   useEffect(() => {
+    if (loginRoute) return;
     if (!projectsLoaded || !sessionsLoaded) return;
     const view: ViewState = {
       artifact: artifactModalName,
@@ -1808,7 +1813,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
     const url = `${next}${window.location.hash}`;
     if (replace) window.history.replaceState(null, "", url);
     else window.history.pushState(null, "", url);
-  }, [activeProjectId, activeSessionId, artifactModalName, trajectorySession, projectsLoaded, sessionListState, sessionsLoaded, settingsTarget, showConfig, systemSettingsGroup, urlEpoch, workspaceCollapsed, workspaceView]);
+  }, [activeProjectId, activeSessionId, artifactModalName, trajectorySession, projectsLoaded, sessionListState, sessionsLoaded, settingsTarget, showConfig, systemSettingsGroup, urlEpoch, workspaceCollapsed, workspaceView, loginRoute]);
 
   // Leaving a Session closes its inline trajectory view: switching back must
   // not silently reopen it and rewrite the path. The activeSessionId guard
@@ -1834,6 +1839,7 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
       if (view.settingsKind === "system") openSystemSettings();
       else cancelSystemSettings();
       setWorkspaceView(view.view === "usage" ? "usage" : "session");
+      setLoginRoute(view.view === "login");
       const projectId = view.projectId && projects.some((project) => project.id === view.projectId)
         ? view.projectId
         : projects[0]?.id;
@@ -4741,6 +4747,17 @@ export function App({ initialToken }: { initialToken?: string } = {}) {
         />
 
       </div>
+    );
+  }
+
+  if (loginRoute) {
+    return (
+      <LoginPage
+        onAuthenticated={() => {
+          window.history.replaceState(null, "", "/");
+          setLoginRoute(false);
+        }}
+      />
     );
   }
 
