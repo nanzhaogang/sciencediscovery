@@ -137,7 +137,8 @@ Which layer a write lands in is not uniform, and the difference is not visible f
 | Setting | Route | Why that route |
 |---|---|---|
 | default model, sandbox network | `PUT /api/settings`, or the dedicated route | global, and the whole-object write needs a read-merge-write |
-| skills | `GET /api/jiuwenswarm/skills`, `PUT /api/jiuwenswarm/skills/:name`, `PUT /api/jiuwenswarm/skills-by-id/:skillId` | JiuwenSwarm owns the global switches; ScienceDiscovery catalog packages are imported on first enable. Runs never mirror Project/Session selections into those switches. Native mode retains catalog browsing and creation without these switches. |
+| skills | `GET /api/jiuwenswarm/skills`, `PUT /api/jiuwenswarm/skills/:name`, `PUT /api/jiuwenswarm/skills-by-id/:skillId` | JiuwenSwarm owns the global switches; ScienceDiscovery bundled skills default to enabled; tasks import their selected enabled bundled packages before the first model turn; managed catalog packages are imported on first enable. Runs never mirror Project/Session selections into those switches. Native mode retains catalog browsing and creation without these switches. |
+| installing and editing a Skill | `POST /api/skills/import` (one `SKILL.md` or ZIP), `POST /api/skills/import-git/inspect`, `POST /api/skills/import-git`, `PUT /api/skills/:id`, `PUT /api/skills/:id/files/:path`, `GET /api/skills/:id/resources/:path` | 技能 draws its own header: 添加技能 offers 从零开始写, 上传技能 and 从 GitHub 导入, and each — like 编辑 — swaps the pane for a sub-page with a back control rather than opening a modal, so the list stays one press away. Imports install into the catalog this app owns rather than the web's Skill Library, which has no desktop surface. A Git import first inspects the repository and then imports each chosen package at the inspected commit; replacing an installed Skill requires the revision the user saw (`expectedRevision` with `overwrite`), so an edit made in another window is a 409 rather than a silent overwrite. The editor rebuilds `SKILL.md` from its fields and therefore sends back `license`, `compatibility`, `metadata` and `allowed-tools`, which its form does not show. The package-file route can write a file but not delete one, so the editor adds and overwrites only. Closing 设置 bumps an epoch that re-reads the catalog for the composer's `/` palette. |
 | a remote machine's registration, credentials and host key | `POST /api/remote-hosts`, `PUT /api/remote-hosts/:id/credentials`, `POST /api/remote-hosts/:id/trust-host-key` | credentials only ever travel inward, and the response to a credential write is itself the result of a fresh probe; accepting a host key is a step of its own and cannot be folded into another write |
 | which machines a Project may use | `PATCH /api/projects/:id` (`runnerIds`) | it is a field of the Project itself, and it has to be sent whole — it is a complete list, not a delta |
 
@@ -181,6 +182,71 @@ Serving this app at the root path instead of the built-in one is a restart with 
 Tests cover the transport (bearer header, 401 classification, SSE framing including comment frames and split chunks), the reducer (thinking and body folding, snapshot-versus-delta, truncated snapshots, terminal close, counters, permission requests and their resolution, tool traces, and the run times the fold's elapsed line is measured from — recorded once and never moved by a later snapshot), the replay layer (folding a log into a closed state, the three anchors a reconstruction can land on, and which runs are worth holding at all — an empty log is not, and a run that failed before answering keeps its status line without hiding the stored message), the transcript merge itself (a replayed run replacing its own answer in place, a run with no replay keeping its persisted answer, a run with no answer following the message that started it, a replayed run's unanswered authorization rendering disabled, the streaming run staying last, a message just sent showing its own text at once while the run's placeholder waits its beat, and a wake notice drawing no card while the run it started keeps its place), the fold (its line saying 正在思考 while the run works and 用时 … once it stops, a ring turning on that line only while the model is actually working and never while it is queued or over, falling back to a status word with no measured span, the thinking and the tool calls going inside it, and an unanswered authorization or a running tool call's sentence staying outside it), the tool card's two pure layers (the primary field picked by name rather than position, a single argument shown as its bare value, a labeled result split into sections with the leading text kept as a residual, the residual labelled Error when the call failed, and runner placeholders dropped rather than shown as data), the workspace tree (a node per segment, no directory repeated under one parent, directories before files in name order, a directory's count recursed to the bottom, and empty segments and doubled slashes dropped), the panel's width arithmetic (drag direction, both bounds, a window too narrow for both columns, and the ceiling that leaves the transcript its minimum), the tab placement rule, the startup decisions (empty catalog, an existing default is not rewritten, a default naming a deleted profile is replaced), the sidebar's recency order, which Session a launch resumes (the most recently used one, and nothing over a Session already open), structure detection (the precedence of extension, media type and sniffing, and the two `.cif` parsers), the settings surface as it is offered now — five pages under three groups, with 通用 carrying the language select and nothing else, the allowlist box read as entries (newlines and commas both separate them, blank lines dropped), vocabulary the network and remote pages no longer own (the private-network switch and the egress route, the Runner's 测试连接), an add-model form with no sentence under any field and three buttons in order (测试, 保存, 取消 — the last one absent when the caller has its own way back), and a composer row that is a model pill and a paperclip with no 会话配置 between them — the execution machines' value conversions (both host-key failures, destinations, reachability, usability, the local machine left out of the cards, the allowlist and toggling it) and their resources (a reading the machine did not report stated as unknown, the disk warning at a fixed free-space floor, NPU cards that cannot be added but can be removed), the language store (Chinese unless chosen otherwise, a switch reaching every top-level section of `TEXT` including its functions, subscribers firing once per real change and not at all on a no-op, and 通用 offering both languages with the one in force selected), and the composer's model pill and paperclip.
 
 `pnpm build` emits a separate chunk of about 3.2 MB for the structure browser (about 880 kB gzipped) against a main bundle of about 500 kB; only the former is downloaded when a structure file is opened, so that large chunk in the build output is not a startup cost.
+
+## 7. Conversational configuration cards
+
+`apps/web` and `apps/desktop` share the form, credential-draft, preview and confirmation
+logic in `packages/configuration-ui`. Hosts supply locale, API error identity, terminal
+record presentation and API actions. The desktop `app/use-configuration-requests.ts`
+loads and polls the current session, merges monotonic versions and rejects late responses
+from another session. A session without chat messages can still show a pending card.
+
+Exact destination consent, the dedicated credential channel, independent security-policy
+consent and final manual save stay separate. Saving refreshes settings and follows the
+server-created continuation without resending the user's message. Terminal receipts appear
+once at their persisted notice. Archived/evidence-only sessions and failed refreshes block writes.
+
+The shared renderer includes frontend compatibility for Memory, MCP, model/provider,
+security-policy and proxy modules. This does not register backend capabilities or imply
+that those modules are deployed. Corresponding backend adapters and endpoints are still
+required. When merging branches that edit the old Web card paths, retain their changes
+in the shared package instead of reintroducing two implementations.
+
+Both hosts send independent security-policy acknowledgments to
+`POST /api/sessions/:sessionId/configuration-requests/:requestId/security-consent`,
+with the displayed revision, target digest and explicit acknowledgment. Security-policy
+capabilities from [#758](https://github.com/openJiuwen-ai/sciencediscovery/pull/758) and
+`proxy.default` from [#734](https://github.com/openJiuwen-ai/sciencediscovery/pull/734)
+require their corresponding backend and this route. This change registers neither
+capabilities nor routes, and sends no security-consent request unless a server-projected
+card requires it and the user explicitly acknowledges and confirms. If that card's route
+is unavailable, the request fails closed; endpoint consent and ordinary Apply cannot
+substitute for security consent.
+
+`test/journey-desktop-configuration.spec.ts` drives the actual public API and desktop entry
+through timeout preview, save, reload and refusal in both languages and a narrow window.
+It makes no live model or external-service calls. Missing browser/runtime prerequisites
+are a coverage gap, never a pass; component tests do not replace rendered screenshot review.
+
+The pinned Playwright environment discovers both language cases automatically through
+`test/helpers/e2e.ts`, `@mocked` and `category:e2e`; no per-file package-script entry is
+needed. Its `status:reviewed`, `model:mock` and `isolation:global` tags include both
+language cases in the default `pnpm ci:e2e` / PR plan, in the serialized `standard-config`
+shard. It owns its temporary records and restores the timeout settings it changes.
+Use `pnpm test:list --slice e2e` to inspect the shared plan without executing it;
+listing tests does not verify the browser journey.
+
+From the repository root, prepare the pinned environment once, then list this file:
+
+```bash
+node test/sync-e2e.mjs --write
+npm --prefix .e2e ci
+.e2e/node_modules/.bin/playwright install chromium
+npm --prefix .e2e run test:list -- journey-desktop-configuration.spec.ts
+```
+
+To execute it, first start an isolated stack from the same committed revision
+using the [E2E isolation instructions](../../../.agents/skills/e2e-testing/SKILL.md#isolated-stack-per-run).
+Set `E2E_BASE_URL` to that stack's API URL and `E2E_API_TOKEN` to its generated token;
+never point this test at a personal instance. The spec starts and stops its own desktop
+Vite entry on port 4178, so keep that port free. Then run from the repository root:
+
+```bash
+npm --prefix .e2e run test:mocked -- journey-desktop-configuration.spec.ts
+```
+
+The journey reporter saves step screenshots and `report.md` / `report.html` under
+`.e2e/journey-reports/` (or `E2E_JOURNEY_REPORTS` when set).
 
 ## Related documentation
 

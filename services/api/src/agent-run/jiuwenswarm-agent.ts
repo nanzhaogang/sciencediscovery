@@ -29,8 +29,8 @@ import { waitForRecording } from "./recording-wait.js";
 import { RunDeadlines } from "./run-deadlines.js";
 import { jiuwenSwarmWebResult } from "./jiuwenswarm-web-settings.js";
 
-import { resolveModelClientPolicy, type streamModelTurn } from "@sciencediscovery/model";
-import { subagentCapableParentRunTimeoutMs } from "@sciencediscovery/specialist";
+import { resolveModelClientPolicy, type ModelUsage, type streamModelTurn } from "@sciencediscovery/model";
+import { BUNDLED_SKILL_IDS, subagentCapableParentRunTimeoutMs } from "@sciencediscovery/specialist";
 
 import {
   composeSystemPrompt,
@@ -90,7 +90,7 @@ export interface JiuwenSwarmAgentConfig {
    */
   skills?: "jiuwenswarm" | "ours";
   /**
-   * Desktop catalog packages require explicit first enable (SCIENCE_AGENT_SKILL_SELECTION=desktop).
+   * Desktop managed catalog packages require explicit first enable (SCIENCE_AGENT_SKILL_SELECTION=desktop).
    * JiuwenSwarm owns the global switches; starting a run never changes them.
    */
   skillSelection?: "desktop";
@@ -237,6 +237,7 @@ export function createJiuwenSwarmAgentFactory(config: JiuwenSwarmAgentConfig) {
 
 class JiuwenSwarmAgent implements NativeAgentHandle {
   private readonly listeners = new Set<Listener>();
+  private readonly usage = new UsageReporter(event => this.emit(event));
   private readonly controller = new AbortController();
   private approvalDeliveryError?: Error;
   private executed = false;
@@ -393,8 +394,14 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
       config: { planning: this.config.planning ?? "todo", prompt: this.config.prompt ?? "prepend", tools: this.config.tools ?? "jiuwenswarm", skills: this.config.skills ?? "jiuwenswarm", subagents: this.config.subagents ?? "task" },
     }).catch((error: unknown) => console.warn(`[jiuwenswarm-agent] trajectory not recorded: ${error instanceof Error ? error.message : String(error)}`));
     const modelGateway = await startModelGateway(endpoint, policy, this.controller.signal, this.config.modelStreamer,
-      trajectory.enabled ? { request: (input) => trajectory.modelRequest(input), completed: (turn, history) => trajectory.modelCompleted(turn, history) } : undefined,
+      trajectory.enabled ? {
+        request: (input) => trajectory.modelRequest(input),
+        // The gateway names each call before it sends it and passes the identity back here, so this
+        // call's record carries its own id even when another call is in flight (#1133).
+        completed: (turn, history, call) => trajectory.modelCompleted(turn, history, call),
+      } : undefined,
       { progress: () => this.markProgress("model:upstream"), beforeTurn: () => this.emit({ type: "turn_start" }),
+        onUsage: usage => this.usage.record(usage),
         // Only the run's own instance has the output-recovery boundary; JiuwenSwarm's sub-agents do not.
         recoversWithheldCalls: !jiuwenSwarmSubagents,
         // A call that leaves out an argument its tool cannot run without is withheld and re-issued
@@ -483,9 +490,11 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
     this.enabledSkillIds = new Set(skills.filter((skill) => {
       const existing = installedById.get(skill.id);
       if (existing) return existing.enabled;
-      // Desktop catalog packages enter through explicit enable. Library references
-      // and non-Desktop runs retain first-use import; neither may override a saved disable.
-      return this.config.skillSelection !== "desktop" || skill.importOnRun === true;
+      // Bundled skills default to enabled until JiuwenSwarm has a saved switch.
+      // Managed Desktop packages still require explicit enable; Library references
+      // and non-Desktop runs retain first-use import.
+      return BUNDLED_SKILL_IDS.some((id) => id === skill.id)
+        || this.config.skillSelection !== "desktop" || skill.importOnRun === true;
     }).map((skill) => skill.id));
     return { ...this.options, skills: skills.filter((skill) => this.enabledSkillIds.has(skill.id)) };
   }
@@ -636,7 +645,8 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
       : "Delegation is unavailable for this run. Ignore any generic instructions recommending Swarm-native subagent tools; complete the assigned work with the available tools."];
     const systemPromptSeed = this.options.seedModelContext && this.options.gatewayHistory?.length
       ? seedHistoryText(this.options.gatewayHistory) : "";
-    const systemPrompt = [systemPromptSeed, withHostRule, ...replacementSections,
+    const clarificationRule = "Ask clarification questions in a regular assistant message. Include any choices the user needs and end the turn so they can reply in chat.";
+    const systemPrompt = [systemPromptSeed, withHostRule, clarificationRule, ...replacementSections,
       ...(this.options.unsandboxedExecution === true ? [UNSANDBOXED_SUBAGENT_SECTION] : []), ...delegationRule]
       .filter(Boolean).join("\n\n");
     const nativeToolNames = [...(jiuwenSwarmPlans ? JIUWENSWARM_TODO_TOOLS : []), ...(jiuwenSwarmSubagents ? JIUWENSWARM_SUBAGENT_TOOLS : [])];
@@ -661,6 +671,8 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
         ...(nativeToolNames.length ? { nativeTools: nativeToolNames } : {}),
         jiuwenSwarmTools: allJiuwenSwarmTools ? "all" : "listed",
         hiddenJiuwenSwarmTools: [
+          // JiuwenSwarm workswarm0.2.6 registers this name in ask_user_rail.py.
+          "ask_user",
           ...(allJiuwenSwarmTools ? JIUWENSWARM_HOST_TOOLS : []),
           ...hiddenWebTools,
           ...(!jiuwenSwarmPlans ? JIUWENSWARM_TODO_TOOLS : []),
@@ -696,21 +708,25 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
     let finalText = "";
     let failure: string | undefined;
     let receivedTerminal = false;
-    let releaseUserInputWait: (() => void) | undefined;
     for await (const line of ndjson(response.body)) {
       if (receivedTerminal) throw new Error("Swarm adapter sent data after its terminal result");
       this.markProgress("event" in line ? `adapter:${line.event.type}` : "adapter:done");
       if ("event" in line && line.event.type === "permission.required") this.answerApproval(line.event.request as ApprovalQuestion);
       if ("event" in line && line.event.type === "user_input.required") {
-        releaseUserInputWait ??= this.beginExternalWait();
-        continue;
-      }
-      // Accounting/phase frames do not mean the run resumed: the adapter
-      // interleaves them with a paused question, so releasing on them would drop
-      // the wait and let the idle deadline fire while the user is still deciding.
-      if (!("event" in line && (line.event.type === "model.usage" || line.event.type === "agent.phase"))) {
-        releaseUserInputWait?.();
-        releaseUserInputWait = undefined;
+        const request = line.event.request as { question?: unknown } | undefined;
+        const question = typeof request?.question === "string" ? request.question.trim() : "";
+        if (!question) {
+          throw new Error("The assistant requested an interactive reply. Please send the clarification as a new chat message.");
+        }
+        // Publish the question through the normal chat stream and close the adapter's suspended turn.
+        const responseId = randomUUID();
+        const turn = typeof line.event.turn === "number" ? line.event.turn : 0;
+        translator.handle({ type: "assistant.response.started", responseId, turn });
+        translator.handle({ type: "assistant.delta", responseId, delta: question });
+        translator.handle({ type: "assistant.response.settled", responseId, turn });
+        finalText = question;
+        receivedTerminal = true;
+        break;
       }
       if ("done" in line) {
         receivedTerminal = true;
@@ -726,7 +742,7 @@ class JiuwenSwarmAgent implements NativeAgentHandle {
     }
     if (failure !== undefined) throw new Error(failure);
     if (!receivedTerminal) throw new Error("Swarm adapter stream ended without a terminal result");
-    translator.finish();
+    this.usage.finish();
     return finalText;
   }
 }
@@ -909,8 +925,6 @@ class Transcript {
  * bridge reporter, so the Swarm event is their authoritative fallback.
  */
 class EventTranslator {
-  private total: { cacheReadTokens: number | null; cacheWriteTokens: number | null; inputTokens: number; outputTokens: number; reasoningTokens: number | null; totalTokens: number } | undefined;
-
   constructor(
     private readonly emit: Listener,
     private readonly announcements: ToolAnnouncements,
@@ -1001,20 +1015,34 @@ class EventTranslator {
         this.transcript.settled();
         this.emit({ type: "response_settled", responseId: String(event.responseId), turn: Number(event.turn) });
         break;
-      case "model.usage": {
-        const reported = event as unknown as { reasoningTokens?: number | null; usage: { cacheReadTokens?: number | null; cacheWriteTokens?: number | null; inputTokens: number; outputTokens: number; reasoningTokens?: number | null; totalTokens: number } };
-        const usage = { ...reported.usage, reasoningTokens: reported.reasoningTokens ?? reported.usage.reasoningTokens ?? null };
-        this.emit({ type: "model_usage", usage, usageReported: true });
-        this.add(usage);
+      case "model.usage":
+        // Account at the model gateway instead: Swarm fills missing reasoning with zero
+        // and these events repeat calls already recorded there, including native children.
         break;
-      }
       default:
         break;
     }
   }
+}
+
+/** Each platform agent (main or task child) owns its provider-reported usage. */
+class UsageReporter {
+  private total: { cacheReadTokens: number | null; cacheWriteTokens: number | null; inputTokens: number; outputTokens: number; reasoningTokens: number | null; totalTokens: number } | undefined;
+
+  constructor(private readonly emit: Listener) {}
+
+  record(reported: ModelUsage | undefined): void {
+    if (!reported) {
+      this.emit({ type: "model_usage", usageReported: false });
+      return;
+    }
+    const usage = { ...reported, reasoningTokens: reported.reasoningTokens ?? null };
+    this.emit({ type: "model_usage", usage, usageReported: true });
+    this.add(usage);
+  }
 
   /** Sum of the model calls of the run; null stays null unless some call reported a number. */
-  private add(usage: { cacheReadTokens?: number | null; cacheWriteTokens?: number | null; inputTokens: number; outputTokens: number; reasoningTokens?: number | null; totalTokens: number }): void {
+  private add(usage: ModelUsage): void {
     const plus = (a: number | null, b: number | null | undefined) => (b === null || b === undefined ? a : (a ?? 0) + b);
     const total = this.total ?? { cacheReadTokens: null, cacheWriteTokens: null, inputTokens: 0, outputTokens: 0, reasoningTokens: null, totalTokens: 0 };
     // Key order matters: subagent summaries serialise this object into a tool result string.

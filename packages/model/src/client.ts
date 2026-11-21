@@ -21,6 +21,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { resolveRoute } from "@sciencediscovery/network";
 import { Agent as UndiciAgent, ProxyAgent, request, type Dispatcher } from "undici";
 
 import type { RuntimeMessage as AgentHistoryMessage } from "@sciencediscovery/runtime-core";
@@ -157,6 +158,8 @@ export interface ModelWireDiagnostics {
   truncated: boolean;
   /** Classification of each attempt that was retried before the final one. */
   retryErrors: ModelWireErrorClass[];
+  /** The provider sent a terminal completion marker before a transport reset. */
+  recoveredAfterCompletion?: boolean;
   error?: { classification: ModelWireErrorClass; httpStatus?: number };
 }
 
@@ -292,7 +295,7 @@ export class ModelJsonResponse extends Error {
 }
 
 export class ModelRequestError extends Error {
-  constructor(message: string, readonly statusCode: number, readonly responseDetail = "") {
+  constructor(message: string, readonly statusCode: number, readonly responseDetail = "", readonly retryAfterMs?: number) {
     super(message);
     this.name = "ModelRequestError";
   }
@@ -352,8 +355,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /** Dispatcher honouring the profile's resolved proxy. "environment" keeps the
- *  process default dispatcher; "direct" pins a plain agent; "url" pins one proxy. */
-export function proxyDispatcher(proxy: ResolvedProxy | undefined): Dispatcher | undefined {
+ *  process default dispatcher; "direct" pins a plain agent; "url" pins one proxy.
+ *  When the target is known, the profile's bypass rules are resolved against it,
+ *  so a localhost endpoint is not sent through an outbound proxy. */
+export function proxyDispatcher(proxy: ResolvedProxy | undefined, target?: string): Dispatcher | undefined {
+  if (target && proxy) proxy = resolveRoute(target, proxy);
   if (!proxy || proxy.mode === "environment") return undefined;
   if (proxy.mode === "url") {
     if (!proxy.url) throw new Error("Model proxy mode 'url' requires a proxy URL");
@@ -424,6 +430,7 @@ class ModelWireRecorder {
   private toolSeen = false;
   private finish?: string;
   private truncated = false;
+  private recoveredAfterCompletion = false;
 
   constructor(
     endpoint: ModelEndpoint,
@@ -468,6 +475,8 @@ class ModelWireRecorder {
   }
 
   markTruncated(): void { this.truncated = true; }
+
+  markRecoveredAfterCompletion(): void { this.recoveredAfterCompletion = true; }
 
   final(parts: { hasText: boolean; hasToolCalls: boolean; truncated?: boolean; hasReasoning?: boolean }): void {
     this.textSeen ||= parts.hasText;
@@ -514,6 +523,7 @@ class ModelWireRecorder {
       ...(this.finish === undefined ? {} : { finishReason: this.finish }),
       truncated: this.truncated,
       retryErrors: [...this.retryErrors],
+      ...(this.recoveredAfterCompletion ? { recoveredAfterCompletion: true } : {}),
       ...(errorClass === undefined ? {} : {
         error: { classification: errorClass, ...(errorClass === "provider_http" && this.httpStatus !== undefined ? { httpStatus: this.httpStatus } : {}) },
       }),
@@ -555,7 +565,7 @@ interface RequestOptions {
 /** POST with a bounded retry budget for pre-stream failures (connect errors,
  *  429, 5xx). Once the stream starts flowing, errors surface to the caller. */
 async function requestWithRetry(options: RequestOptions, recorder: ModelWireRecorder): Promise<{ body: AsyncIterable<Uint8Array> }> {
-  const dispatcher = proxyDispatcher(options.proxy);
+  const dispatcher = proxyDispatcher(options.proxy, options.url);
   let lastError: Error | undefined;
   for (let attempt = 0; attempt <= options.policy.maxRetries; attempt += 1) {
     if (options.signal.aborted) { await dispatcher?.close(); throw new Error("aborted"); }
@@ -639,6 +649,7 @@ async function requestWithRetry(options: RequestOptions, recorder: ModelWireReco
       `Model request failed with status ${statusCode}${detail ? `: ${detail}` : ""}`,
       statusCode,
       detail,
+      retryAfterMs,
     );
     if ((statusCode === 429 || statusCode >= 500) && attempt < options.policy.maxRetries) {
       lastError = failure;
@@ -802,6 +813,17 @@ function chatThinkingFields(endpoint: ModelEndpoint): Record<string, unknown> {
 }
 
 const thinkingControlFields = ["thinking", "reasoning_effort", "reasoning_split", "chat_template_kwargs"];
+/**
+ * Sampling fields a provider may refuse outright.
+ *
+ * #1265: an OpenAI-compatible gateway answered `400 … temperature is deprecated
+ * for this model`. That is a rejection of the parameter, not a complaint about
+ * its value, so the rule the thinking controls already use applies unchanged:
+ * strip exactly what the 400 names and retry once.
+ */
+const samplingFields = ["temperature", "top_p"];
+/** Everything one 400 may make this sender drop and retry without. */
+const strippableFields = [...thinkingControlFields, ...samplingFields];
 interface ThinkingControlRequest { body: string; headers: Record<string, string>; url: string }
 /**
  * A 400 proves a control was *rejected* only when it says so next to the field
@@ -811,7 +833,7 @@ interface ThinkingControlRequest { body: string; headers: Record<string, string>
  * providers use for an unknown/unsupported parameter; deliberately not a bare
  * "invalid", which is what a generic "invalid request" says.
  */
-const rejectedControlWording = /unsupported|not supported|does not support|unknown (?:parameter|field|argument|property|key)|unrecogni[sz]ed (?:[a-z]+ ){0,3}(?:parameter|field|argument|property|key)|invalid (?:parameter|field|argument|property|key)|unexpected (?:parameter|field|argument|property|key)|not allowed|not permitted|no such (?:parameter|field|argument)/;
+const rejectedControlWording = /unsupported|not supported|does not support|unknown (?:parameter|field|argument|property|key)|unrecogni[sz]ed (?:[a-z]+ ){0,3}(?:parameter|field|argument|property|key)|invalid (?:parameter|field|argument|property|key)|unexpected (?:parameter|field|argument|property|key)|not allowed|not permitted|no such (?:parameter|field|argument)|deprecated|no longer (?:supported|available|accepted|used)|(?:has|have) been removed/;
 /**
  * A complaint about a control's *value* or the *state* it was sent in is not a
  * rejection of the parameter. OpenAI answers `param: "reasoning_effort"` with
@@ -820,10 +842,19 @@ const rejectedControlWording = /unsupported|not supported|does not support|unkno
  * Stripping the control would silently change the requested mode, so clauses
  * carrying these words are dropped before any rejection wording is looked for.
  */
-const valueComplaintWording = /invalid value|unsupported value|not a valid value|supported values are|invalid_value|out of range|must be one of|when [a-z_ ]{0,40}(?:is|are) (?:enabled|on|set)/;
+const valueComplaintWording = /invalid value|unsupported value|not a valid value|supported values are|invalid_value|out of range|must be one of|must be between|must be (?:less|greater) than|should be between|when [a-z_ ]{0,40}(?:is|are) (?:enabled|on|set)/;
+/**
+ * A provider saying its default is the *only* value it takes. Every value the
+ * caller could have sent is refused, so dropping the field changes nothing that
+ * was possible and is a rejection, not a value complaint — the OpenAI reasoning
+ * models answer `Unsupported value: 'temperature' does not support 0.7 with this
+ * model. Only the default (1) is supported.` A bare "does not support 0.7" is not
+ * enough: another value might work there.
+ */
+const defaultOnlyWording = /only the default|default (?:value )?is the only|only its default/;
 /** How close the rejection word must be to the field name to describe it. */
 const rejectedControlWordingWindow = 80;
-const rejectedThinkingControls = new Map<string, Set<string>>();
+const rejectedFieldsByEndpoint = new Map<string, Set<string>>();
 
 /** `detail` (lower-cased) without the clauses that complain about a value or a state. */
 function withoutValueComplaints(detail: string): string {
@@ -833,11 +864,11 @@ function withoutValueComplaints(detail: string): string {
     .join(". ");
 }
 
-function thinkingControlEndpointKey(endpoint: ModelEndpoint): string {
+function rejectedFieldEndpointKey(endpoint: ModelEndpoint): string {
   return [endpointRoot(endpoint.baseUrl), endpoint.model, endpointProtocol(endpoint), endpointVariant(endpoint)].join("\0");
 }
 
-function withoutThinkingControls(request: ThinkingControlRequest, fields = thinkingControlFields) {
+function withoutFields(request: ThinkingControlRequest, fields: readonly string[] = strippableFields) {
   let body: Record<string, unknown>;
   try { body = JSON.parse(request.body) as Record<string, unknown>; } catch { return undefined; }
   if (!fields.some((field) => field in body)) return undefined;
@@ -845,12 +876,50 @@ function withoutThinkingControls(request: ThinkingControlRequest, fields = think
   return { ...request, body: JSON.stringify(body) };
 }
 
+/**
+ * Whether `field` is the one a "default is the only value" 400 refuses.
+ *
+ * Not a distance test. A body echo names every field the request carried, and a
+ * sentence may name another field as the way around the refusal — either would be
+ * stripped by proximity, and the stripped set is remembered for the endpoint, so
+ * an over-stripped `top_p` or `thinking` stays gone on every later turn.
+ *
+ * Two things count as evidence: the provider's own `param` pointer naming the
+ * field, or the field being the subject of the claim in the provider's own
+ * message — named before it, or introduced by it with "for"/"of".
+ */
+function fieldRefusedByDefaultOnly(lower: string, field: string): boolean {
+  if (rejectsByParamPointer(lower, field)) return true;
+  const message = errorMessageText(lower);
+  const claimAt = message.search(defaultOnlyWording);
+  if (claimAt < 0) return false;
+  const fieldAt = message.indexOf(field);
+  if (fieldAt < 0) return false;
+  // Before the claim, the field is what the refusal is about.
+  if (fieldAt < claimAt) return true;
+  // After it, the field is only the subject when the claim introduces it —
+  // "the default value for temperature is supported" — and not when the provider
+  // is offering it instead, which is "Use top_p to vary the sampling".
+  return /\b(?:for|of)\s+[\s"'[(]*$/u.test(message.slice(claimAt, fieldAt));
+}
+
+/** The provider's own message text, without any echoed request body. */
+function errorMessageText(lower: string): string {
+  const messages = [...lower.matchAll(/"message"\s*:\s*"((?:[^"\\]|\\.)*)"/gu)].map((match) => match[1] ?? "");
+  return messages.length ? messages.join(" ") : lower;
+}
+
+/** The provider's `param` pointer naming `field`. */
+function rejectsByParamPointer(lower: string, field: string): boolean {
+  return new RegExp(`"param"\\s*:\\s*"[^"]*${field}`).test(lower);
+}
+
 /** Whether `detail` rejects `field`, not merely mentions it: either the
  *  provider's own `param` pointer names it, or a rejection phrase sits within a
  *  short window of the name. A value or state complaint proves neither, even
  *  when it points at the field. */
 function detailRejectsField(lower: string, field: string): boolean {
-  if (new RegExp(`"param"\\s*:\\s*"[^"]*${field}`).test(lower) && !valueComplaintWording.test(lower)) return true;
+  if (rejectsByParamPointer(lower, field) && !valueComplaintWording.test(lower)) return true;
   const claims = withoutValueComplaints(lower);
   for (let at = claims.indexOf(field); at !== -1; at = claims.indexOf(field, at + field.length)) {
     const window = claims.slice(
@@ -863,29 +932,47 @@ function detailRejectsField(lower: string, field: string): boolean {
 }
 
 /**
- * The thinking controls `detail` rejects, judged by the rule the streamed sender
+ * The fields `detail` rejects — thinking controls and sampling knobs alike — judged by
+ * the rule the streamed sender
  * uses: the provider's own `param` pointer names the field, or a rejection
- * phrase sits next to it; a complaint about a control's value or the state it
- * was sent in proves nothing, and a body echo names every field without
- * rejecting any.
+ * phrase sits next to it; a complaint about a field's value or the state it was
+ * sent in proves nothing, and a body echo names every field without rejecting
+ * any. The one exception is a provider that says its default is the only value
+ * it takes — every value the caller could send is refused there, so the field is
+ * stripped (see `fieldRefusedByDefaultOnly`).
  *
  * Exported for callers that own their own retry. The non-stream boundary in
  * `completion.ts` deliberately carries no fallback (see its doc comment), so a
  * caller such as the Settings connectivity probe strips exactly the controls a
  * 400 named and retries once itself — after intersecting with
- * {@link carriedThinkingControls}, because a 400 can name a control the request
+ * {@link carriedRequestFields}, because a 400 can name a control the request
  * never carried.
  */
-export function rejectedThinkingControlFields(detail: string): Set<string> {
+export function rejectedRequestFields(detail: string): Set<string> {
   const lower = detail.toLowerCase();
-  return new Set(thinkingControlFields.filter((field) => detailRejectsField(lower, field)
-    || (field === "chat_template_kwargs" && detailRejectsField(lower, "enable_thinking"))));
+  // A body that complains about a value strips nothing, whatever else it says.
+  // The per-field rules below are precise about a *rejection*, but a value
+  // complaint arrives in too many shapes to be matched clause by clause — vLLM
+  // answers `{"message":"temperature must be between 0 and 2","param":"temperature"}`
+  // and Gemini `"Only the default (1) is supported."` with no `code` field at all.
+  // Dropping the field there would run the turn at the provider's default
+  // sampling, which is the silent behaviour change this rule exists to avoid, so
+  // the conservative answer wins: keep the field and let the request fail.
+  //
+  // The exception is `defaultOnly`: a provider that says its default is the only
+  // value it takes refuses every value the caller could send, so there is nothing
+  // to keep — the field is stripped and the turn runs at that only possible value.
+  const defaultOnly = defaultOnlyWording.test(lower);
+  if (!defaultOnly && valueComplaintWording.test(lower)) return new Set();
+  return new Set(strippableFields.filter((field) => detailRejectsField(lower, field)
+    || (field === "chat_template_kwargs" && detailRejectsField(lower, "enable_thinking"))
+    || (defaultOnly && fieldRefusedByDefaultOnly(lower, field))));
 }
 
 /**
- * The thinking controls `body` — a serialized chat request — actually carries.
+ * The fields `body` — a serialized chat request — actually carries.
  *
- * Only useful together with {@link rejectedThinkingControlFields}: a 400 names
+ * Only useful together with {@link rejectedRequestFields}: a 400 names
  * what the endpoint refused, never what this request sent. Which controls a
  * variant injects cannot be answered from the endpoint either, because the mode
  * is resolved through the catalog first (`constrainCatalogThinking` may rewrite
@@ -893,48 +980,48 @@ export function rejectedThinkingControlFields(detail: string): Set<string> {
  * trustworthy answer. A caller that strips a control it never sent reports a
  * recovery that did not happen and pays a second request to learn nothing.
  */
-export function carriedThinkingControls(body: string): Set<string> {
+export function carriedRequestFields(body: string): Set<string> {
   let parsed: Record<string, unknown>;
   try { parsed = JSON.parse(body) as Record<string, unknown>; } catch { return new Set(); }
-  return new Set(thinkingControlFields.filter((field) => field in parsed));
+  return new Set(strippableFields.filter((field) => field in parsed));
 }
 
-function rejectedThinkingFields(request: Pick<ThinkingControlRequest, "body">, detail: string): Set<string> {
-  const carried = carriedThinkingControls(request.body);
-  return new Set([...rejectedThinkingControlFields(detail)].filter((field) => carried.has(field)));
+function rejectedCarriedFields(request: Pick<ThinkingControlRequest, "body">, detail: string): Set<string> {
+  const carried = carriedRequestFields(request.body);
+  return new Set([...rejectedRequestFields(detail)].filter((field) => carried.has(field)));
 }
 
-function retryWithoutRejectedThinkingFields(
+function retryWithoutRejectedFields(
   request: ThinkingControlRequest,
   error: unknown,
 ) {
   if (!(error instanceof ModelRequestError)) return undefined;
-  return thinkingControlFallback(request, error.statusCode, error.responseDetail);
+  return rejectedFieldsFallback(request, error.statusCode, error.responseDetail);
 }
 
 /** The stripped request for a 400 that rejected controls it carried, or
  *  `undefined` when the 400 does not prove a rejection (a failed status, a value
  *  complaint, a body echo). */
-function thinkingControlFallback(request: ThinkingControlRequest, status: number | undefined, detail: string) {
-  if (status !== 400 || !/(thinking|reasoning|enable_thinking|chat_template_kwargs)/i.test(detail)) return undefined;
+function rejectedFieldsFallback(request: ThinkingControlRequest, status: number | undefined, detail: string) {
+  if (status !== 400 || !/(thinking|reasoning|enable_thinking|chat_template_kwargs|temperature|top_p)/i.test(detail)) return undefined;
   // Strip exactly what this 400 named: a control it did not complain about is
   // still wanted, and dropping all four would silently disable a mode the
   // provider accepts.
-  const fields = rejectedThinkingFields(request, detail);
+  const fields = rejectedCarriedFields(request, detail);
   if (!fields.size) return undefined;
-  const fallback = withoutThinkingControls(request, [...fields]);
+  const fallback = withoutFields(request, [...fields]);
   if (!fallback) return undefined;
   return { fallback, fields };
 }
 
-function withoutKnownRejectedThinkingControls(endpoint: ModelEndpoint, request: ThinkingControlRequest): ThinkingControlRequest {
-  const fields = rejectedThinkingControls.get(thinkingControlEndpointKey(endpoint));
-  return (fields?.size ? withoutThinkingControls(request, [...fields]) : undefined) ?? request;
+function withoutKnownRejectedFields(endpoint: ModelEndpoint, request: ThinkingControlRequest): ThinkingControlRequest {
+  const fields = rejectedFieldsByEndpoint.get(rejectedFieldEndpointKey(endpoint));
+  return (fields?.size ? withoutFields(request, [...fields]) : undefined) ?? request;
 }
 
-function rememberRejectedThinkingControls(endpoint: ModelEndpoint, fields: Iterable<string>): void {
-  const key = thinkingControlEndpointKey(endpoint);
-  rejectedThinkingControls.set(key, new Set([...(rejectedThinkingControls.get(key) ?? []), ...fields]));
+function rememberRejectedFields(endpoint: ModelEndpoint, fields: Iterable<string>): void {
+  const key = rejectedFieldEndpointKey(endpoint);
+  rejectedFieldsByEndpoint.set(key, new Set([...(rejectedFieldsByEndpoint.get(key) ?? []), ...fields]));
 }
 
 interface OpenAiToolCallFragment {
@@ -990,6 +1077,20 @@ function streamErrorDetail(value: unknown, endpoint: ModelEndpoint): string {
   return detail.slice(0, 2_000);
 }
 
+function canRecoverAfterCompletion(
+  error: unknown,
+  completionReason: string | undefined,
+  completionObserved: boolean,
+  truncated: boolean,
+  parseErrors: number,
+): boolean {
+  return completionObserved
+    && !truncated
+    && parseErrors === 0
+    && ["stop", "tool_calls", "function_call"].includes(completionReason ?? "")
+    && ["network", "timeout"].includes(classifyModelWireError(error));
+}
+
 async function streamOpenAiTurn(
   endpoint: ModelEndpoint,
   systemPrompt: string,
@@ -1001,7 +1102,7 @@ async function streamOpenAiTurn(
   recorder: ModelWireRecorder,
 ): Promise<ModelTurn> {
   const variant = endpointVariant(endpoint);
-  let request = withoutKnownRejectedThinkingControls(endpoint, createModelRequest(endpoint, systemPrompt, history, tools, policy, true));
+  let request = withoutKnownRejectedFields(endpoint, createModelRequest(endpoint, systemPrompt, history, tools, policy, true));
   // A provider may report unknown fields one 400 at a time, so each 400 strips
   // only the fields it names and the request is reissued. The memory is written
   // once such a request actually succeeds: a fallback that itself fails (429,
@@ -1009,13 +1110,13 @@ async function streamOpenAiTurn(
   let streamed: Awaited<ReturnType<typeof requestWithRetry>> | undefined;
   let lastError: unknown;
   const rejectedHere = new Set<string>();
-  for (let attempt = 0; attempt <= thinkingControlFields.length; attempt += 1) {
+  for (let attempt = 0; attempt <= strippableFields.length; attempt += 1) {
     try {
       streamed = await requestWithRetry({ ...request, policy, proxy: endpoint.proxy, signal }, recorder);
       break;
     } catch (error) {
       lastError = error;
-      const retry = retryWithoutRejectedThinkingFields(request, error);
+      const retry = retryWithoutRejectedFields(request, error);
       if (!retry) throw error;
       for (const field of retry.fields) rejectedHere.add(field);
       recorder.retry("provider_http");
@@ -1023,7 +1124,7 @@ async function streamOpenAiTurn(
     }
   }
   if (!streamed) throw lastError;
-  if (rejectedHere.size) rememberRejectedThinkingControls(endpoint, rejectedHere);
+  if (rejectedHere.size) rememberRejectedFields(endpoint, rejectedHere);
   const { body } = streamed;
 
   let text = "";
@@ -1035,87 +1136,96 @@ async function streamOpenAiTurn(
   let usage: AgentModelUsage | undefined;
   let truncated = false;
   let completionObserved = false;
+  let completionReason: string | undefined;
+  let recoveredAfterCompletion = false;
   const buffersInlineThinking = variant === "minimax" || variant === "ollama";
 
   const streamDiagnostics = { protocol: "openai-chat-completions" as const, unparseableSsePayloads: 0, toolCallDeltasWithoutIndex: 0 };
-  for await (const payload of sseData(body, recorder, callbacks.onProgress)) {
-    let chunk: Record<string, unknown>;
-    try {
-      chunk = JSON.parse(payload) as Record<string, unknown>;
-    } catch {
-      streamDiagnostics.unparseableSsePayloads += 1;
-      recorder.parseError();
-      continue;
-    }
-    if (chunk.error) throw new Error(`Chat API error: ${streamErrorDetail(chunk.error, endpoint)}`);
-    const chunkUsage = normalizeUsage(chunk.usage, "openai-chat-completions");
-    if (chunkUsage) usage = chunkUsage;
-    const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
-    if (choices.length && isRecord(choices[0]) && typeof choices[0].finish_reason === "string") {
-      completionObserved = true;
-      recorder.finishReason(choices[0].finish_reason);
-    }
-    // Read before the `delta` guard below: the chunk that carries
-    // `finish_reason` is the closing one, and it has no delta.
-    if (choices.length && isRecord(choices[0]) && choices[0].finish_reason === "length") {
-      truncated = true;
-      recorder.markTruncated();
-    }
-    const delta = choices.length && isRecord(choices[0]) && isRecord(choices[0].delta)
-      ? choices[0].delta
-      : undefined;
-    if (!delta) continue;
-
-    if ((variant === "deepseek" || variant === "kimi-k3") && typeof delta.reasoning_content === "string") {
-      deepseekReasoning += delta.reasoning_content;
-      callbacks.onThinkingDelta?.(delta.reasoning_content);
-    } else if (variant === "qwen" && delta.reasoning !== undefined) {
-      if (typeof delta.reasoning === "string") {
-        qwenReasoning = `${typeof qwenReasoning === "string" ? qwenReasoning : ""}${delta.reasoning}`;
-      } else {
-        qwenReasoning = structuredClone(delta.reasoning);
+  try {
+    for await (const payload of sseData(body, recorder, callbacks.onProgress)) {
+      let chunk: Record<string, unknown>;
+      try {
+        chunk = JSON.parse(payload) as Record<string, unknown>;
+      } catch {
+        streamDiagnostics.unparseableSsePayloads += 1;
+        recorder.parseError();
+        continue;
       }
-      const thought = reasoningText(delta.reasoning);
-      if (thought) callbacks.onThinkingDelta?.(thought);
-    } else if (variant === "minimax" && Array.isArray(delta.reasoning_details)) {
-      minimaxReasoning.push(...structuredClone(delta.reasoning_details));
-      const thought = reasoningText(delta.reasoning_details);
-      if (thought) callbacks.onThinkingDelta?.(thought);
-    } else if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
-      // A gateway that serves a reasoning model under the plain `openai`
-      // dialect still streams the thought in `reasoning_content` — Volcengine
-      // Ark, SiliconFlow and vLLM all do. Dropping it left the user watching an
-      // idle screen for the whole reasoning phase while the text was on the
-      // wire. Only display: the variants whose contract requires the thought to
-      // come back in the next request echo it in `assistantMessage` below, and
-      // an endpoint that never asked for it must not receive an unknown field.
-      callbacks.onThinkingDelta?.(delta.reasoning_content);
-    }
+      if (chunk.error) throw new Error(`Chat API error: ${streamErrorDetail(chunk.error, endpoint)}`);
+      const chunkUsage = normalizeUsage(chunk.usage, "openai-chat-completions");
+      if (chunkUsage) usage = chunkUsage;
+      const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+      if (choices.length && isRecord(choices[0]) && typeof choices[0].finish_reason === "string") {
+        completionObserved = true;
+        completionReason = choices[0].finish_reason;
+        recorder.finishReason(completionReason);
+      }
+      // Read before the `delta` guard below: the chunk that carries
+      // `finish_reason` is the closing one, and it has no delta.
+      if (choices.length && isRecord(choices[0]) && choices[0].finish_reason === "length") {
+        truncated = true;
+        recorder.markTruncated();
+      }
+      const delta = choices.length && isRecord(choices[0]) && isRecord(choices[0].delta)
+        ? choices[0].delta
+        : undefined;
+      if (!delta) continue;
 
-    if (typeof delta.content === "string" && delta.content) {
-      text += delta.content;
-      if (!buffersInlineThinking) callbacks.onTextDelta?.(delta.content);
-    }
-    if (Array.isArray(delta.tool_calls)) {
-      for (const raw of delta.tool_calls) {
-        if (!isRecord(raw)) continue;
-        if (typeof raw.index !== "number") streamDiagnostics.toolCallDeltasWithoutIndex += 1;
-        const index = typeof raw.index === "number" ? raw.index : fragments.size;
-        const existing = fragments.get(index) ?? { function: { arguments: "", name: "" } };
-        for (const [key, value] of Object.entries(raw)) {
-          if (key === "index" || key === "function") continue;
-          if (value !== undefined && value !== null) existing[key] = value;
+      if ((variant === "deepseek" || variant === "kimi-k3") && typeof delta.reasoning_content === "string") {
+        deepseekReasoning += delta.reasoning_content;
+        callbacks.onThinkingDelta?.(delta.reasoning_content);
+      } else if (variant === "qwen" && delta.reasoning !== undefined) {
+        if (typeof delta.reasoning === "string") {
+          qwenReasoning = `${typeof qwenReasoning === "string" ? qwenReasoning : ""}${delta.reasoning}`;
+        } else {
+          qwenReasoning = structuredClone(delta.reasoning);
         }
-        if (isRecord(raw.function)) {
-          const fn = existing.function ?? { arguments: "", name: "" };
-          if (typeof raw.function.name === "string" && raw.function.name) fn.name = raw.function.name;
-          if (typeof raw.function.arguments === "string") fn.arguments = (fn.arguments ?? "") + raw.function.arguments;
-          existing.function = fn;
+        const thought = reasoningText(delta.reasoning);
+        if (thought) callbacks.onThinkingDelta?.(thought);
+      } else if (variant === "minimax" && Array.isArray(delta.reasoning_details)) {
+        minimaxReasoning.push(...structuredClone(delta.reasoning_details));
+        const thought = reasoningText(delta.reasoning_details);
+        if (thought) callbacks.onThinkingDelta?.(thought);
+      } else if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
+        // A gateway that serves a reasoning model under the plain `openai`
+        // dialect still streams the thought in `reasoning_content` — Volcengine
+        // Ark, SiliconFlow and vLLM all do. Dropping it left the user watching an
+        // idle screen for the whole reasoning phase while the text was on the
+        // wire. Only display: the variants whose contract requires the thought to
+        // come back in the next request echo it in `assistantMessage` below, and
+        // an endpoint that never asked for it must not receive an unknown field.
+        callbacks.onThinkingDelta?.(delta.reasoning_content);
+      }
+
+      if (typeof delta.content === "string" && delta.content) {
+        text += delta.content;
+        if (!buffersInlineThinking) callbacks.onTextDelta?.(delta.content);
+      }
+      if (Array.isArray(delta.tool_calls)) {
+        for (const raw of delta.tool_calls) {
+          if (!isRecord(raw)) continue;
+          if (typeof raw.index !== "number") streamDiagnostics.toolCallDeltasWithoutIndex += 1;
+          const index = typeof raw.index === "number" ? raw.index : fragments.size;
+          const existing = fragments.get(index) ?? { function: { arguments: "", name: "" } };
+          for (const [key, value] of Object.entries(raw)) {
+            if (key === "index" || key === "function") continue;
+            if (value !== undefined && value !== null) existing[key] = value;
+          }
+          if (isRecord(raw.function)) {
+            const fn = existing.function ?? { arguments: "", name: "" };
+            if (typeof raw.function.name === "string" && raw.function.name) fn.name = raw.function.name;
+            if (typeof raw.function.arguments === "string") fn.arguments = (fn.arguments ?? "") + raw.function.arguments;
+            existing.function = fn;
+          }
+          fragments.set(index, existing);
+          emitTool(index, existing.id, existing.function?.name, existing.function?.arguments ?? "");
         }
-        fragments.set(index, existing);
-        emitTool(index, existing.id, existing.function?.name, existing.function?.arguments ?? "");
       }
     }
+  } catch (error) {
+    if (!canRecoverAfterCompletion(error, completionReason, completionObserved, truncated, streamDiagnostics.unparseableSsePayloads)) throw error;
+    recoveredAfterCompletion = true;
+    recorder.markRecoveredAfterCompletion();
   }
 
   if (buffersInlineThinking) {
@@ -1138,6 +1248,9 @@ async function streamOpenAiTurn(
     const parsed = parseToolCallArgs(call.function.arguments);
     return { args: parsed.args, id: call.id, name: call.function.name, ...(parsed.error ? { argsParseError: parsed.error } : {}) };
   });
+  if (recoveredAfterCompletion && (wireToolCalls.some((call) => !call.function.name) || toolCalls.some((call) => call.argsParseError))) {
+    throw new Error("Model stream ended after completion with incomplete tool arguments");
+  }
   const assistantMessage: AgentHistoryMessage = {
     role: "assistant",
     content: text,

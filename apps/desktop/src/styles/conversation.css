@@ -493,3 +493,114 @@
   text-align: center;
   letter-spacing: .02em;
 }
+
+/* What one turn produced (#1252). The strip sits after the assistant row, so it
+   is indented by the avatar column and its gap (32px + 12px) to start where the
+   answer's text starts.
+
+   Cards, two to a line, not full-width rows: a row per file reads as a table of
+   contents and pushes the next answer down the page. The `min(100%, 320px)`
+   floor is what fixes the count — the transcript column is about 716px wide at
+   the default window, so two 320px cards and the gap fit and a third does not.
+   On a narrow window the same rule collapses to one column instead of squeezing
+   a name down to two characters. */
+.turn-artifacts {
+  margin: -6px 0 18px 44px;
+  min-width: 0;
+}
+.turn-artifacts-title {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+.turn-artifacts-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.turn-artifact {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.turn-artifact:hover:not(:disabled) {
+  border-color: var(--primary-border-soft);
+  background: var(--primary-softer);
+}
+.turn-artifact:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-glow);
+}
+.turn-artifact:disabled { cursor: default; }
+
+/* The kind's tile. Colour is a second reading of the same fact the glyph says,
+   so it is quiet — a tint, not a badge. */
+.turn-artifact-icon {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-s);
+  background: var(--surface-soft);
+  color: var(--text-secondary);
+}
+.turn-artifact-icon.is-report,
+.turn-artifact-icon.is-markdown { background: var(--primary-soft); color: var(--primary-strong); }
+.turn-artifact-icon.is-figure { background: var(--discovery-soft); color: var(--discovery-strong); }
+.turn-artifact-icon.is-dataset,
+.turn-artifact-icon.is-structure { background: var(--insight-soft); color: var(--insight-strong); }
+.turn-artifact-icon.is-notebook { background: var(--warning-soft); color: var(--warning-strong); }
+.turn-artifact-icon.is-rest { background: none; color: var(--text-faint); }
+
+.turn-artifact-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.turn-artifact-name {
+  overflow: hidden;
+  color: var(--text-strong);
+  font-size: 13px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.turn-artifact-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-faint);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.turn-artifact-badge {
+  padding: 0 5px;
+  border-radius: var(--radius-pill);
+  background: var(--primary-soft);
+  color: var(--primary-strong);
+  font-size: 11px;
+  line-height: 16px;
+}
+/* The overflow tile is the same size as a card but reads as a door, not a file:
+   dashed outline, no tile fill, and it says where it goes. */
+.turn-artifact-rest {
+  border-style: dashed;
+  background: none;
+}
+.turn-artifact-rest:hover:not(:disabled) { background: var(--surface-subtle); }

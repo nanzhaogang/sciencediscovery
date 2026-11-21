@@ -213,6 +213,33 @@ export async function buildConversationBranch(
     }
     records.memoryGraph = { nodes, edges };
   }
+  // Evolve searches belong to the history the branch carries: keep the runs that
+  // finished at or before the selected reply (a run still active at the cutoff is
+  // not part of it either), drop another session's runs, and drop the candidate
+  // sources of a run the branch did not keep. Without this the branch package
+  // carries searches from turns it deliberately excludes (#1176 review F2).
+  const evolve = records.evolve as { candidates?: unknown; runs?: unknown } | undefined;
+  // A kept candidate entry is only usable with its source bytes: the top-level
+  // export lists those objects explicitly, so the branch has to do the same or the
+  // entry reaches the import as `missing candidate source object` (#1176 review F4).
+  let keptCandidateObjects: string[] = [];
+  if (evolve && Array.isArray(evolve.runs)) {
+    const keptRuns = evolve.runs.filter((entry) => {
+      const run = (entry as { run?: { createdAt?: unknown; finishedAt?: unknown; sessionId?: unknown } } | undefined)?.run;
+      if (!run) return false;
+      if (typeof run.sessionId === "string" && run.sessionId !== sourceId) return false;
+      return before(run.finishedAt ?? run.createdAt);
+    });
+    const keptIds = new Set(keptRuns.map((entry) => String((entry as { run?: { id?: unknown } } | undefined)?.run?.id ?? "")));
+    const candidates = Array.isArray(evolve.candidates)
+      ? evolve.candidates.filter((candidate) => keptIds.has(String((candidate as { runId?: unknown } | undefined)?.runId ?? "")))
+      : [];
+    keptCandidateObjects = candidates.flatMap((candidate) => {
+      const objectPath = (candidate as { objectPath?: unknown } | undefined)?.objectPath;
+      return typeof objectPath === "string" && objectPath ? [objectPath] : [];
+    });
+    records.evolve = { ...evolve, candidates, runs: keptRuns };
+  }
   source.session.updatedAt = new Date(cutoff).toISOString();
   source.session.conversationBranch = undefined;
   records.sessions = [source];
@@ -224,7 +251,9 @@ export async function buildConversationBranch(
   while (queue.length) {
     const ref = queue.shift()!;
     const object = objects.get(ref.digest.slice(7));
-    if (!object || !ref.mediaType.includes("json")) continue;
+    // A branch is built from a resident package; a streamed source only appears on
+    // the background-export path, which never branches a conversation.
+    if (!object || !("bytes" in object) || !object.bytes || !ref.mediaType.includes("json")) continue;
     try {
       for (const child of versionRefs(JSON.parse(Buffer.from(object.bytes).toString("utf8")))) {
         const key = `${child.pool}:${child.digest}`;
@@ -235,7 +264,7 @@ export async function buildConversationBranch(
   records.versionObjects = [...neededRefs.values()];
   const needed = new Set([...workspace.map((file) => file.objectPath),
     ...records.artifacts.flatMap((artifact) => artifact.versions.flatMap((version) => version.objectPath ? [version.objectPath] : [])),
-    ...casHashes(records), ...records.versionObjects.map((ref) => ref.digest.slice(7))]);
+    ...keptCandidateObjects, ...casHashes(records), ...records.versionObjects.map((ref) => ref.digest.slice(7))]);
   const included = count([source], records.artifacts, records.memoryGraph);
   const original = input.exportProfile?.included ?? included;
   const omitted = Object.fromEntries(Object.entries(original).map(([key, value]) => [key, Math.max(0, value - included[key as keyof ResearchPackageCounts])])) as unknown as ResearchPackageCounts;

@@ -41,6 +41,28 @@ test("workspace management includes other Projects, archived Sessions and previo
   assert.deepEqual(states, ["all", "all"]);
 });
 
+test("default Runner availability does not invent remote workspaces without explicit selection or prior use", async () => {
+  const store = {
+    getRemoteHost: () => ({ workspaceNamespace: "target" }),
+    listProjects: () => [{ id: "p", name: "Default", remoteRunnerHostIds: [] }],
+    listSessions: () => [
+      { id: "unused", title: "Never used" },
+      { id: "synced", title: "Synced before deselection", runnerIds: [] },
+      { id: "executed", title: "Executed before deselection", runnerIds: [] },
+      { id: "explicit", title: "Explicitly selected", runnerIds: ["host"] },
+      { id: "legacy", title: "Legacy selection", remoteRunnerHostIds: ["host"] },
+      { id: "other-host", title: "Used elsewhere" },
+    ],
+    listRemoteWorkspaceSyncs: (id: string) => id === "synced" ? [{ hostId: "host" }]
+      : id === "other-host" ? [{ hostId: "elsewhere" }] : [],
+    listExecutionRuns: async (id: string) => id === "executed" ? [{ runnerId: "host" }]
+      : id === "other-host" ? [{ runnerId: "elsewhere" }] : [],
+  } as unknown as SessionStore;
+  const items = await runnerWorkspaceBindings(store, "host");
+  assert.deepEqual(items.map(item => item.sessionId), ["synced", "executed", "explicit", "legacy"]);
+  assert.equal(items.every(item => item.workspaceKey.startsWith("p/")), true);
+});
+
 
 for (const id of ["local", "host"]) {
   test(`${id} exposes the same connection and workspace contract`, async () => {

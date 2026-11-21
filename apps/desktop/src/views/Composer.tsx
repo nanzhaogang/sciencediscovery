@@ -29,6 +29,7 @@ import { commitsOnEnter } from "../app/ime-enter.js";
 import type { LandingCategory, LandingSeed } from "../app/landing.js";
 import { skillChoices, skillDraft, skillMark, slashQuery } from "../app/slash.js";
 import { TEXT } from "../text.js";
+import type { EvolveDirectionInput } from "@sciencediscovery/schema";
 import { AttachmentTray } from "./AttachmentTray.js";
 import { EvolveGlyph, EvolveTreeGlyph } from "./evolve/glyphs.js";
 import { filterExperts } from "./expert-catalog.js";
@@ -53,6 +54,10 @@ export interface ComposerTag {
 export interface SeededCommand {
   /** The flags, exactly as they will be sent. */
   command: string;
+  /** The parameters the dialog confirmed, if its panel was used. They travel
+   *  with the token because the dialog closes before the user sends, and are
+   *  dropped with the token if the reader takes the flags back. */
+  direction?: EvolveDirectionInput;
   /** Bumped on every seed, so choosing the same design twice still lands. */
   nonce: number;
   /** What the dialog collected, written after the token for the user to
@@ -86,15 +91,16 @@ interface Props {
   onApprovalMode: (mode: ApprovalMode) => void;
   /** 新建项目 from the landing strip: a Project needs nothing but a name. */
   onCreateProject: (name: string) => void;
-  /** Opens the session's searches, or starts a new experiment when it has
-   *  none. It is a row in 会话设置 rather than a control of its own: the
-   *  header no longer carries a second entry point. */
-  onEvolve?: () => void;
+  /** Starts a new experiment. It is a row in 会话设置 rather than a control of
+   *  its own: the header no longer carries a second entry point. Existing
+   *  searches keep their cards in the transcript. The composer's draft rides
+   *  along, so a sentence already written becomes the new design's task. */
+  onEvolve?: (draft: string) => void;
   onOpenSettings: () => void;
   /** A skill whose choice has more to it than its command: the pick is handed
-   *  here, and `true` means the surface it opened has taken the draft, so no
-   *  command is written. */
-  onPickSkill?: (skill: SkillDescriptor) => boolean;
+   *  here with the draft it would have replaced, and `true` means the surface
+   *  it opened has taken the draft, so no command is written. */
+  onPickSkill?: (skill: SkillDescriptor, draft: string) => boolean;
   onSelectModel: (modelId: string) => void;
   /** Point the next conversation at a Project, or at none (`undefined`). */
   onSelectProject: (projectId?: string) => void;
@@ -109,7 +115,7 @@ interface Props {
   /** `command` is the seeded token when the draft started from a setup
    *  dialog; the two are one message, but only the caller knows how to join
    *  them. */
-  onSend: (content: string, command?: string) => void;
+  onSend: (content: string, command?: string, direction?: EvolveDirectionInput) => void;
   onStop: () => void;
   onUpload: (files: File[]) => void;
   /** Shown in the landing strip, beside the folder. Absent when the next
@@ -131,6 +137,9 @@ interface Props {
    *  the composer cannot clear it alone: the other mount would keep drawing it. */
   onClearCommand?: () => void;
   selectedModelId?: string;
+  /** Bumped by the shell when the skill catalog may have changed under this
+   *  composer — 设置 was just closed. See the palette's read below. */
+  skillsEpoch?: number;
   unavailableModel?: boolean;
   /** The expert the open session is bound to, if any. */
   selectedSpecialistId?: string;
@@ -139,7 +148,7 @@ interface Props {
   uploading: boolean;
 }
 
-type Menu = "model" | "settings";
+type Menu = "model" | "permission" | "settings";
 
 function PlusGlyph() {
   return (
@@ -160,7 +169,7 @@ function SlidersGlyph() {
   );
 }
 
-type SettingsPanel = "experts" | "permission";
+type SettingsPanel = "experts";
 
 /** The shield that marks permission, and its warning form for 完全访问. */
 function ShieldGlyph({ alert = false }: { alert?: boolean }) {
@@ -173,7 +182,7 @@ function ShieldGlyph({ alert = false }: { alert?: boolean }) {
           <path d="M12 15.6h.01" />
         </>
       ) : (
-        <path d="M12 9.2v3.1" />
+        <path d="m8.8 12.15 2.15 2.15 4.3-4.45" />
       )}
     </svg>
   );
@@ -235,11 +244,12 @@ function NoneGlyph() {
  * Exported because it is only mounted while its row is open.
  */
 export function PermissionFlyout({
-  fullAccess,
+  mode,
   onApprovalMode,
   onClose,
 }: {
-  fullAccess: boolean;
+  /** The current mode, or `undefined` while nothing has been chosen. */
+  mode?: ApprovalMode;
   onApprovalMode: (mode: ApprovalMode) => void;
   onClose: () => void;
 }) {
@@ -248,7 +258,7 @@ export function PermissionFlyout({
       <button
         aria-describedby="session-permission-ask-desc"
         aria-label={TEXT.composer.permission}
-        className={`session-flyout-row${fullAccess ? "" : " is-selected"}`}
+        className={`session-flyout-row${mode === "ask_for_dangerous" ? " is-selected" : ""}`}
         onClick={() => {
           onApprovalMode("ask_for_dangerous");
           onClose();
@@ -264,16 +274,16 @@ export function PermissionFlyout({
             {TEXT.composer.permissionAskDesc}
           </span>
         </span>
-        {fullAccess ? null : (
+        {mode === "ask_for_dangerous" ? (
           <span className="session-flyout-check">
             <CheckGlyph />
           </span>
-        )}
+        ) : null}
       </button>
       <button
         aria-describedby="session-permission-full-desc"
         aria-label={TEXT.composer.permissionFull}
-        className={`session-flyout-row is-danger${fullAccess ? " is-selected" : ""}`}
+        className={`session-flyout-row is-danger${mode === "always_allow" ? " is-selected" : ""}`}
         onClick={() => {
           onApprovalMode("always_allow");
           onClose();
@@ -289,7 +299,7 @@ export function PermissionFlyout({
             {TEXT.composer.permissionFullDesc}
           </span>
         </span>
-        {fullAccess ? (
+        {mode === "always_allow" ? (
           <span className="session-flyout-check">
             <CheckGlyph />
           </span>
@@ -304,37 +314,34 @@ export function PermissionFlyout({
  * rows and, beside the open one, its choices. The two columns are separate
  * cards so a flyout is never clipped by the row column's own scroll box.
  *
+ * 权限模式 is not one of these rows. It has its own control beside them in the
+ * footer (#1204), and a second door to the same two choices only made this menu
+ * look like it still held a setting the footer had taken over.
+ *
  * Exported because it is only mounted while open, and a static render of the
  * composer never gets there.
  */
 export function SessionSettingsMenu({
-  approvalMode,
   experts,
   expertsLoading,
-  onApprovalMode,
   onClose,
   onEvolve,
   onSelectSpecialist,
-  running,
   selectedSpecialistId,
 }: {
-  approvalMode?: ApprovalMode;
   /** The experts a session can be bound to, already read by the composer.
    *  Held there rather than here so reopening the menu does not blank the row
    *  above it back to 无 while the catalog is fetched again. */
   experts?: Specialist[];
   expertsLoading?: boolean;
-  onApprovalMode: (mode: ApprovalMode) => void;
   onClose: () => void;
   /** Opens the evolve surface. Absent in a static render, where the entry has
    *  nowhere to go. */
   onEvolve?: () => void;
   onSelectSpecialist?: (specialistId?: string) => void;
-  running: boolean;
   selectedSpecialistId?: string;
 }) {
   const [panel, setPanel] = useState<SettingsPanel>();
-  const fullAccess = approvalMode === "always_allow";
   const selectedExpert = (experts ?? []).find((row) => row.id === selectedSpecialistId);
   const toggle = (next: SettingsPanel) => setPanel((current) => (current === next ? undefined : next));
 
@@ -364,30 +371,6 @@ export function SessionSettingsMenu({
             </>
           )}
           <button
-            aria-expanded={panel === "permission"}
-            aria-haspopup="true"
-            className={`session-menu-row${panel === "permission" ? " is-open" : ""}`}
-            disabled={running}
-            onClick={() => toggle("permission")}
-            title={running ? TEXT.composer.permissionLocked : undefined}
-            type="button"
-          >
-            <span className="session-menu-icon">
-              <ShieldGlyph />
-            </span>
-            <span className="session-menu-label">{TEXT.composer.permissionMode}</span>
-            <span className="session-menu-value">
-              <span className="session-menu-value-icon">
-                <ShieldGlyph />
-              </span>
-              <span className="session-menu-value-text">
-                {fullAccess ? TEXT.composer.permissionFull : TEXT.composer.permissionAskShort}
-              </span>
-              <ChevronRightGlyph />
-            </span>
-          </button>
-          <div className="session-menu-divider" />
-          <button
             aria-describedby="session-experts-hint"
             aria-expanded={panel === "experts"}
             aria-haspopup="true"
@@ -415,10 +398,6 @@ export function SessionSettingsMenu({
           </button>
           <span className="sr-only" id="session-experts-hint">{TEXT.composer.expertsHint}</span>
         </div>
-
-        {panel === "permission" ? (
-          <PermissionFlyout fullAccess={fullAccess} onApprovalMode={onApprovalMode} onClose={onClose} />
-        ) : null}
 
         {panel === "experts" ? (
           <ExpertFlyout
@@ -707,11 +686,17 @@ export function Composer({
   seed,
   seededCommand,
   selectedModelId,
+  skillsEpoch = 0,
   unavailableModel = false,
   selectedSpecialistId,
   tag,
   uploading,
 }: Props) {
+  // The shell resolves a mode for every surface (the session's, the reader's last
+  // choice, or the project/global default); asking is only the last fallback, so
+  // there is no third "follow settings" state (#1204 owner decision).
+  const mode = approvalMode ?? "ask_for_dangerous";
+  const fullAccess = mode === "always_allow";
   const [text, setText] = useState(seededCommand?.text ?? "");
   /** The dialog's flags, kept apart from the sentence so the token cannot be
    *  edited into something the agent no longer understands. Seeded in the
@@ -754,7 +739,8 @@ export function Composer({
 
   /** The skills `/` can offer. Read once with the experts: both are small
    *  catalogs, and the palette has to have something to draw the moment the
-   *  slash is typed. */
+   *  slash is typed. `skillsEpoch` re-reads it after 设置 closes, where a skill
+   *  may have been imported or edited. */
   const [skills, setSkills] = useState<SkillDescriptor[]>([]);
   useEffect(() => {
     if (client === undefined) return;
@@ -769,7 +755,7 @@ export function Composer({
     return () => {
       cancelled = true;
     };
-  }, [client]);
+  }, [client, skillsEpoch]);
 
   // The palette is derived from the draft rather than opened by a key: it is
   // showing exactly while the draft is one `/` command (see `slashQuery`), so
@@ -787,9 +773,10 @@ export function Composer({
   const pickSkill = (skill: SkillDescriptor) => {
     // A skill with a setup surface of its own takes the pick: its command
     // carries flags the dialog asks for, so writing the bare command would
-    // only be a step towards opening that dialog anyway. The draft is emptied
-    // because the slash was the whole of it.
-    if (onPickSkill?.(skill) === true) {
+    // only be a step towards opening that dialog anyway. The draft goes with
+    // it — a task already written belongs in the dialog's task field — and is
+    // emptied here because the slash was the whole of it.
+    if (onPickSkill?.(skill, text) === true) {
       setText("");
       setDismissed(true);
       return;
@@ -898,11 +885,19 @@ export function Composer({
     return () => document.removeEventListener("pointerdown", dismiss);
   }, [menu]);
 
-  const submit = () => {
-    if (!canSend) return;
-    onSend(text, command);
+  const sendDraft = (content: string, selectedCommand?: string, direction?: EvolveDirectionInput) => {
+    if (direction) onSend(content, selectedCommand, direction);
+    else onSend(content, selectedCommand);
     setText("");
     setCommand(undefined);
+  };
+
+  const submit = () => {
+    if (!canSend) return;
+    // The token and the sentence are one message; the parameters the dialog
+    // confirmed belong to that token, so they leave with it and with nothing
+    // else.
+    sendDraft(text, command, command === undefined ? undefined : seededCommand?.direction);
   };
 
   /** Drop the dialog's flags and keep the sentence: the reader changed their
@@ -920,7 +915,7 @@ export function Composer({
 
   const stop = (event: { stopPropagation: () => void }) => event.stopPropagation();
 
-  return (
+  return <>
     <div
       className={`composer${landing ? " is-landing" : ""}${attachments.length > 0 ? " has-attachments" : ""}`}
       data-guide="composer"
@@ -1071,16 +1066,47 @@ export function Composer({
           </button>
           {menu === "settings" ? (
             <SessionSettingsMenu
-              approvalMode={approvalMode}
               experts={experts}
               expertsLoading={expertsLoading}
-              onApprovalMode={onApprovalMode}
               onClose={() => setMenu(undefined)}
-              onEvolve={onEvolve}
+              // The draft is carried into the setup dialog: a sentence already
+              // written is the task the new design would start from.
+              onEvolve={onEvolve === undefined ? undefined : () => onEvolve(text)}
               onSelectSpecialist={onSelectSpecialist}
-              running={running}
               selectedSpecialistId={selectedSpecialistId}
             />
+          ) : null}
+        </span>
+
+        {/* The active permission mode, and now its only door (#1204): 会话设置 no
+            longer repeats the row. The shield says which policy the next turn runs
+            under; the label names it. */}
+        <span className="composer-menu-anchor is-permission">
+          <button
+            aria-expanded={menu === "permission"}
+            aria-label={fullAccess ? TEXT.composer.permissionFull : TEXT.composer.permission}
+            className={`composer-permission${fullAccess ? " is-danger" : ""}`}
+            disabled={running}
+            onClick={(event) => {
+              event.stopPropagation();
+              setMenu(menu === "permission" ? undefined : "permission");
+            }}
+            title={running ? TEXT.composer.permissionLocked : TEXT.composer.permissionMode}
+            type="button"
+          >
+            <ShieldGlyph alert={fullAccess} />
+            <span className="composer-permission-label">
+              {fullAccess ? TEXT.composer.permissionFull : TEXT.composer.permission}
+            </span>
+          </button>
+          {menu === "permission" ? (
+            <div className="composer-dropdown is-permission" onPointerDown={(event) => event.stopPropagation()}>
+              <PermissionFlyout
+                mode={mode}
+                onApprovalMode={onApprovalMode}
+                onClose={() => setMenu(undefined)}
+              />
+            </div>
           ) : null}
         </span>
 
@@ -1114,7 +1140,7 @@ export function Composer({
             title={running ? TEXT.composer.pillLocked : TEXT.composer.modelSelect}
             type="button"
           >
-            <span className="model-name">
+            <span className="model-name" title={selectedName}>
               {selectedName ?? (unavailableModel ? TEXT.errors.modelUnavailable : TEXT.errors.modelRequired)}
             </span>
             <Chevron down={menu !== "model"} />
@@ -1176,5 +1202,5 @@ export function Composer({
         </div>
       ) : null}
     </div>
-  );
+  </>;
 }

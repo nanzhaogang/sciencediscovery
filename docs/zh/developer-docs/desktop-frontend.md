@@ -139,7 +139,7 @@ Mol* 及其依赖约 3.2 MB，因此这个视图是一个动态 import 的独立
 | 设置项 | 路由 | 为什么是这条 |
 |---|---|---|
 | 默认模型、沙箱网络 | `PUT /api/settings` 或各自的专用路由 | 全局设置，且整体替换写必须先读、合并、再发回 |
-| 技能 | `GET /api/jiuwenswarm/skills`, `PUT /api/jiuwenswarm/skills/:name`, `PUT /api/jiuwenswarm/skills-by-id/:skillId` | JiuwenSwarm 管理全局开关；ScienceDiscovery 目录技能包在首次启用时导入。运行不会把 Project/Session 选择同步到这些开关。native 模式保留目录浏览和新建功能，不提供这些开关。 |
+| 技能 | `GET /api/jiuwenswarm/skills`, `PUT /api/jiuwenswarm/skills/:name`, `PUT /api/jiuwenswarm/skills-by-id/:skillId` | JiuwenSwarm 管理全局开关；ScienceDiscovery 内置技能默认启用，任务启动时在首轮模型请求前导入所选且已启用的内置技能包；自建目录技能包在首次启用时导入。运行不会把 Project/Session 选择同步到这些开关。native 模式保留目录浏览和新建功能，不提供这些开关。 |
 | 远端机器的登记、登录凭据、主机密钥 | `POST /api/remote-hosts`、`PUT /api/remote-hosts/:id/credentials`、`POST /api/remote-hosts/:id/trust-host-key` | 凭据只进不出，写入后的响应本身就是一次新探测的结果；接受主机密钥是独立的一步，不能混在别的一次写里 |
 | 项目可用的执行机器 | `PATCH /api/projects/:id`（`runnerIds`） | 这是 Project 自身的字段，而且必须整份发回——它是一条完整名单，不是增量 |
 
@@ -183,6 +183,61 @@ pnpm --filter @sciencediscovery/desktop exec vite preview   # 构建产物跑在
 测试覆盖传输层（bearer header、401 归类、SSE 分帧，包括注释帧和拆分 chunk）、reducer（思考与正文折叠、snapshot 与 delta、截断 snapshot、终态封口、各类计数、权限请求与答复、工具 trace，以及折叠行「用时」所依据的那两个时间——记下之后不会被后来的快照挪动）、重放层（把一份日志折成收口状态、重建的三种锚点，以及哪些 run 值得留——空日志不值得，回答之前就失败的 run 保留状态条但不隐藏已存储消息）、transcript 合并本身（重放的 run 就地顶替自己那条回答、没有重放的 run 保留持久化回答、没有回答的 run 跟在开启它的消息之后、重放里没被答复的授权渲染为不可点、直播中的 run 排在最后、刚发出的消息先立刻画出自己、run 的占位行则等到那一拍之后、唤醒通知不画卡片但那次 run 仍锚在它发生的位置）、折叠本身（运行时写「正在思考」、结束写「用时 …」、只有模型真的在工作时那一行才转圆环而排队和结束时都不转、没有跨度时退回状态词、思考与工具调用在折叠内、未答复的授权或正在运行的工具调用那句话在折叠外）、工具卡的两个纯函数层（主字段按名字而不是按位置选取、单个参数显示为裸值而不是 JSON、带标记的结果拆成多节且标记前的文字留作残余节、调用失败时残余节标注为 Error、Runner 占位符被丢弃而不是当成数据显示）、工作区文件树（每段一层、同名目录不在同一父级下重复、目录排在文件前并按名字排序、目录的计数递归到底、空段与多余的斜杠被丢掉）、面板宽度的换算（拖拽方向、上下界、窗口窄到装不下两列、以及给 transcript 留出最小宽度的天花板）、页签放置规则、启动判断（空目录、已有默认不被改写、默认指向已删除 profile 时被替换）、侧栏的最近排序、启动时恢复哪个 Session（最近使用的那一个；已经有 Session 打开时不替换）、分子结构的格式判断（后缀、媒体类型、嗅探三者的优先级与 `.cif` 的两种解析器）、现在的设置界面（三个分组下的五个页面、「通用」只有语言选择、白名单输入框按条目解析——换行与逗号都算分隔、空行丢弃、网络与远程页不再拥有的词汇——允许内网与回环地址、出站路由、Runner 的「测试连接」、添加模型表单字段下没有说明且三个按钮按「测试、保存、取消」排列——调用方自带退路时没有取消、输入区只有模型 pill 与回形针而中间没有「会话配置」）、执行机器的取值换算（两种主机密钥失败、目的地址、可达性、可用性、本机不出现在机器卡片里、可用名单与勾选）、机器资源的呈现（机器没报的读数写成未知、磁盘在固定可用空间下限转警告色、NPU 卡不能新增但可以移除）、语言 store（默认中文，除非用户选过别的；一次切换会覆盖 `TEXT` 的每个顶级分节，包括其中的函数；订阅者在真正变化时只触发一次，无变化时一次都不触发；「通用」同时提供两种语言并选中正在生效的那个），以及输入区的模型 pill 与回形针。
 
 `pnpm build` 会为结构浏览器单独产出一个约 3.2 MB 的 chunk（gzip 后约 880 kB），主包约 500 kB；只有真正打开结构文件时才会下载前者，所以构建输出里的这个大 chunk 不是启动成本。
+
+## 7. 对话配置卡片
+
+`apps/web` 与 `apps/desktop` 共用 `packages/configuration-ui` 的表单、凭据草稿、
+预览和确认逻辑。宿主只提供语言、API 错误类型、终态记录样式和 API 操作。
+新 UI 的 `app/use-configuration-requests.ts` 负责当前会话的加载、轮询和版本归并；
+旧会话的迟到响应不会覆盖新会话。没有聊天消息的会话也能显示待处理卡片。
+
+卡片保留精确目的地同意、专用凭据通道、独立安全策略确认和最终手动保存。
+保存后客户端刷新设置、读取服务器创建的接续运行，不重发用户消息。
+终态回执在原通知处只显示一次；归档、只读证据会话或刷新失败时不能执行写操作。
+
+共享组件包含 Memory、MCP、模型/供应商、安全策略和代理模块的前端显示兼容。
+这不注册后端能力，也不代表这些模块已经部署；后端仍需有对应适配器和接口。
+合并修改旧卡片路径的分支时，应将组件/文案增量保留在共享包，而不是重新建立两份实现。
+
+两个宿主都通过
+`POST /api/sessions/:sessionId/configuration-requests/:requestId/security-consent`
+发送独立安全策略确认，绑定当前显示的版本、目标摘要和明确勾选的确认。
+[#758](https://github.com/openJiuwen-ai/sciencediscovery/pull/758) 的安全策略能力和
+[#734](https://github.com/openJiuwen-ai/sciencediscovery/pull/734) 的 `proxy.default`
+均需部署对应后端及此路由。本变更不会注册后端路由或能力，只有服务器返回需要独立确认的卡片、
+且用户明确勾选并确认后才会发送安全策略确认请求。若该卡片对应的路由不可用，
+请求失败并保持禁止写入；端点同意或普通 Apply 都不能替代安全策略确认。
+
+`test/journey-desktop-configuration.spec.ts` 通过实际公开 API 和桌面前端验证超时配置的
+预览、保存、重载回执及拒绝流程，覆盖中英文和窄窗口。它不调用真实模型或外部服务。
+浏览器依赖或运行环境未满足时不能将该旅程计为通过；组件测试不能代替截图验收。
+
+固定版本的 Playwright 环境通过 `test/helpers/e2e.ts`、`@mocked` 和 `category:e2e`
+自动发现中英文两条用例，不需要逐文件添加 package script。其 `status:reviewed`、
+`model:mock` 和 `isolation:global` 标签将两条用例纳入默认 `pnpm ci:e2e` / PR 计划，
+由 `standard-config` 分片串行执行。旅程只创建自己的临时记录，并恢复修改前的超时设置。
+可用 `pnpm test:list --slice e2e` 检查共享计划而不执行；只列出用例不能视为浏览器旅程通过。
+
+在仓库根目录准备一次固定版本的运行环境，然后列出此文件的用例：
+
+```bash
+node test/sync-e2e.mjs --write
+npm --prefix .e2e ci
+.e2e/node_modules/.bin/playwright install chromium
+npm --prefix .e2e run test:list -- journey-desktop-configuration.spec.ts
+```
+
+执行前，按 [E2E 隔离说明](../../../.agents/skills/e2e-testing/SKILL.md#isolated-stack-per-run)
+从同一已提交版本启动隔离栈，将 `E2E_BASE_URL` 设为该栈的 API 地址，
+将 `E2E_API_TOKEN` 设为该栈生成的令牌；不要指向日常使用的实例。
+旅程会自行启动并关闭端口 4178 上的桌面 Vite 入口，请保持该端口空闲。然后在仓库根目录执行：
+
+```bash
+npm --prefix .e2e run test:mocked -- journey-desktop-configuration.spec.ts
+```
+
+旅程报告器将逐步截图和 `report.md` / `report.html` 保存到 `.e2e/journey-reports/`，
+也可通过 `E2E_JOURNEY_REPORTS` 指定输出目录。
 
 ## 相关文档
 

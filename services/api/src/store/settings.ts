@@ -20,7 +20,6 @@ import {
   DEFAULT_WEB_SETTINGS,
   type EnabledSkillLibrary,
   FREE_SEARCH_ORDER,
-  IDEA_TREE_THINKING_ROLES,
   isSkillSelectionMode,
   migrateLegacyWebSettings,
   MODEL_THINKING_EFFORTS,
@@ -28,9 +27,7 @@ import {
   SKILL_SELECTION_FIELDS,
   type ConnectorId,
   type FreeSearchEngine,
-  type IdeaTreeRoleThinkingEfforts,
   type IdeaTreeSettings,
-  type IdeaTreeThinkingRole,
   type PaidSearchProvider,
   type McpProxyPolicies,
   type MemoryGraphSettings,
@@ -388,7 +385,7 @@ export function normalizeWebSettings(value: unknown): WebSettings {
   const freeInput = migrated.freeSearchEngines ?? { ...DEFAULT_WEB_SETTINGS.freeSearchEngines };
   if (!isRecord(freeInput)) throw new Error("freeSearchEngines must be an object");
   const unknownEngine = Object.keys(freeInput).find((key) => !FREE_SEARCH_ORDER.includes(key as FreeSearchEngine));
-  if (unknownEngine) throw new Error(`Unknown free search engine: ${unknownEngine}`);
+  if (unknownEngine) throw Object.assign(new Error(`Unknown free search engine: ${unknownEngine}`), { code: "INVALID_WEB_SETTINGS" });
   const freeSearchEngines = Object.fromEntries(FREE_SEARCH_ORDER.map((engine) => {
     const enabled = freeInput[engine];
     if (enabled !== undefined && typeof enabled !== "boolean") {
@@ -428,6 +425,10 @@ export function normalizeProxyUrl(value: string): string {
     throw new Error("The proxy URL must use http, https, or socks5");
   }
   if (parsed.hash) throw new Error("The proxy URL cannot contain a fragment");
+  // Only scheme://host:port is used when connecting; accepting a path or query
+  // would store something the proxy never receives.
+  if (parsed.search) throw new Error("The proxy URL cannot contain a query");
+  if (parsed.pathname !== "" && parsed.pathname !== "/") throw new Error("The proxy URL cannot contain a path");
   return parsed.toString();
 }
 
@@ -511,26 +512,6 @@ function boundedInteger(
   return numeric;
 }
 
-/** Per-stage efforts in canonical stage order. A `null` stage inherits. On
- *  write an unknown stage or level is rejected; on load it is dropped. */
-function normalizeRoleThinkingEfforts(input: unknown, strict: boolean): IdeaTreeRoleThinkingEfforts | undefined {
-  if (input === undefined || input === null) return undefined;
-  if (!isRecord(input)) {
-    if (strict) throw new Error("roleThinkingEfforts must be an object");
-    return undefined;
-  }
-  const unknownRole = Object.keys(input).find((role) => !IDEA_TREE_THINKING_ROLES.includes(role as IdeaTreeThinkingRole));
-  if (strict && unknownRole) throw new Error(`roleThinkingEfforts has an unknown stage: ${unknownRole}`);
-  const efforts: IdeaTreeRoleThinkingEfforts = {};
-  for (const role of IDEA_TREE_THINKING_ROLES) {
-    const effort = input[role];
-    if (effort === undefined || effort === null) continue;
-    if (isThinkingEffort(effort)) efforts[role] = effort;
-    else if (strict) throw new Error(`roleThinkingEfforts.${role} must be low, medium, high, xhigh, or max`);
-  }
-  return Object.keys(efforts).length ? efforts : undefined;
-}
-
 /**
  * Normalize an Idea Tree settings update against the current stored value.
  *
@@ -539,11 +520,18 @@ function normalizeRoleThinkingEfforts(input: unknown, strict: boolean): IdeaTree
  * - Numeric fields are range-validated and omitted fields retain the current
  *   value. Template and exploration intensity own research budgets and
  *   assessor definitions, so callers cannot configure them here.
+ * - `roleThinkingEfforts` is no longer a setting: every stage follows the
+ *   research model's own thinking level. A payload that still carries it is
+ *   ignored, and a stored map is dropped on load, so the old per-stage
+ *   overrides stop applying without failing anyone's save.
  */
 export function normalizeIdeaTreeSettings(
   input: UpdateIdeaTreeSettingsRequest,
   current: IdeaTreeSettings,
 ): IdeaTreeSettings {
+  // `maxTokensPerCall` used to live here (#1281). A stored settings row or a
+  // stale client may still send it; it is dropped silently rather than rejected,
+  // so an upgraded deployment reads its own catalog without a migration.
   const retiredField = [
     "maxRounds",
     "candidatesPerRound",
@@ -555,7 +543,6 @@ export function normalizeIdeaTreeSettings(
   if (retiredField) throw new Error(`${retiredField} is configured by the selected template and exploration intensity`);
   const templateId = input.templateId ?? current.templateId;
   const explorationIntensity = input.explorationIntensity ?? current.explorationIntensity;
-  const maxTokensPerCall = boundedInteger(input.maxTokensPerCall, "maxTokensPerCall", 256, 32768, current.maxTokensPerCall ?? 32768);
   const maxTokens = input.maxTokens === null ? null : input.maxTokens === undefined ? current.maxTokens ?? null
     : boundedInteger(input.maxTokens, "maxTokens", 1, Number.MAX_SAFE_INTEGER, 1);
   const maxDepth = boundedInteger(input.maxDepth, "maxDepth", 1, 20, current.maxDepth);
@@ -572,20 +559,16 @@ export function normalizeIdeaTreeSettings(
   const propagateInsightSystemPrompt = hasOwn(input, "propagateInsightSystemPrompt")
     ? optionalString(input.propagateInsightSystemPrompt)
     : current.propagateInsightSystemPrompt;
-  const roleThinkingEfforts = hasOwn(input, "roleThinkingEfforts")
-    ? normalizeRoleThinkingEfforts(input.roleThinkingEfforts, true)
-    : current.roleThinkingEfforts;
   return {
     templateId,
     explorationIntensity,
-    maxTokens, maxTokensPerCall,
+    maxTokens,
     maxDepth,
     maxNodes,
     scoreDirection,
     ...(designSystemPrompt ? { designSystemPrompt } : {}),
     ...(aggregatorSystemPrompt ? { aggregatorSystemPrompt } : {}),
     ...(propagateInsightSystemPrompt ? { propagateInsightSystemPrompt } : {}),
-    ...(roleThinkingEfforts ? { roleThinkingEfforts: structuredClone(roleThinkingEfforts) } : {}),
   };
 }
 
@@ -605,7 +588,6 @@ export function resolveIdeaTreeSettings(value: unknown): IdeaTreeSettings {
       ? value.explorationIntensity
       : DEFAULT_IDEA_TREE_SETTINGS.explorationIntensity,
     maxTokens: typeof value.maxTokens === "number" ? value.maxTokens : null,
-    maxTokensPerCall: typeof value.maxTokensPerCall === "number" ? value.maxTokensPerCall : 32768,
     maxDepth: typeof value.maxDepth === "number" ? value.maxDepth : DEFAULT_IDEA_TREE_SETTINGS.maxDepth,
     maxNodes: typeof value.maxNodes === "number" ? value.maxNodes : DEFAULT_IDEA_TREE_SETTINGS.maxNodes,
     scoreDirection: value.scoreDirection === "maximize" || value.scoreDirection === "minimize"
@@ -621,7 +603,5 @@ export function resolveIdeaTreeSettings(value: unknown): IdeaTreeSettings {
       ? { propagateInsightSystemPrompt: value.propagateInsightSystemPrompt.trim() }
       : {}),
   };
-  const roleThinkingEfforts = normalizeRoleThinkingEfforts(value.roleThinkingEfforts, false);
-  if (roleThinkingEfforts) current.roleThinkingEfforts = roleThinkingEfforts;
   return current;
 }

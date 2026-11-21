@@ -29,6 +29,17 @@ test.beforeEach(async ({ page }) => {
   );
 });
 
+/** The computed values the wizard's model field and its 刷新列表 button must
+ *  share. One helper so the two evaluations cannot drift apart. */
+const boxStyle = (element: HTMLElement) => {
+  const style = getComputedStyle(element);
+  return {
+    border: style.borderColor,
+    font: style.fontSize,
+    height: element.getBoundingClientRect().height,
+  };
+};
+
 test("a workspace with no model cannot be used until the wizard's test passes", async ({ page }) => {
   const mock = await installMockApi(page, { models: [], sessions: [] });
 
@@ -53,22 +64,34 @@ test("a workspace with no model cannot be used until the wizard's test passes", 
   await expect(page.getByRole("heading", { name: "选择一个模型提供方" })).toBeVisible();
   await expect(finish).toHaveCount(0);
 
+  // 刷新列表 shares the model field's row: it takes the wizard's 32px height,
+  // its line colour and its type scale, not the settings dialog's larger one.
+  const modelInput = page.getByPlaceholder("例如 deepseek-chat");
+  const refresh = page.getByRole("button", { name: "刷新列表" });
+  const [fieldBox, buttonBox] = await Promise.all([
+    modelInput.evaluate(boxStyle),
+    refresh.evaluate(boxStyle),
+  ]);
+  expect(buttonBox.height).toBeCloseTo(fieldBox.height, 0);
+  expect(buttonBox.font).toBe(fieldBox.font);
+  expect(buttonBox.border).toBe(fieldBox.border);
+
   await page.getByLabel("基础URL").fill("http://127.0.0.1:9999/v1");
   await page.getByPlaceholder("请输入 API key").fill("sk-e2e");
-  await page.getByPlaceholder("例如 deepseek-chat").fill("demo-model");
+  await modelInput.fill("demo-model");
 
   await page.getByRole("button", { name: "测试并继续" }).click();
 
   // The test wrote the provider and its profile, and only then did the
   // continuation appear.
-  await expect(page.getByText("✓ 连接成功", { exact: false })).toBeVisible();
+  await expect(page.getByText("✓ 基础检查通过", { exact: false })).toBeVisible();
   await expect(finish).toBeVisible();
   expect(mock.state.models.map((entry) => entry.model)).toEqual(["demo-model"]);
 
   // 测试 already saved this profile and got the provider's answer, so the click
   // that continues has nothing left to verify: it writes the default onto that
   // record. Asking again would put the reader through the same wait twice, with
-  // the same 连接成功 line at the end of it.
+  // the same 基础检查通过 line at the end of it.
   const connectivityTests = () => mock.calls.filter(
     (call) => call.method === "POST" && /\/api\/models\/[^/]+\/test$/u.test(call.path),
   );

@@ -13,41 +13,63 @@
 // limitations under the License.
 
 import { diagnosticIds, diagnosticLogPaths, errorDiagnosticSnapshot } from "./error-diagnostics.js";
+import { isLoopbackHost, verifyAccountAccessToken } from "./account-verification.js";
 import { randomUUID } from "node:crypto";
 import { matchesManualModelDestination } from "./manual-model-destination.js";
-import { createResearchSnapshots } from "../research-snapshots.js";
+import { testProxyConnectivity } from "../proxy-connectivity.js";
+import { createResearchSnapshots, type ImportedPackageSource } from "../research-snapshots.js";
+import { assertResearchPackageExportCapacity, assertResearchPackageResponseExportCapacity, assertResearchPackageRestoreCapacity, assertResearchPackageUploadCapacity, measureResearchPackageCapacity, researchPackageBudgetRefusal, researchPackageUnpackBudget, restoreSizeOf, type PackageCapacity } from "../research-package-preflight.js";
 import { isEvidenceSessionReadOnly } from "@sciencediscovery/schema";
 import { handleExecutionReadiness } from "./execution-readiness.js";
 import { prepareSkillSandbox } from "../skill-sandbox.js";
+import { cancelGitSkillImportJob, getGitSkillImportJob, startGitSkillImportJob } from "../skill-import-jobs.js";
 import { setTimeout as delay } from "node:timers/promises";
 import { filterEnabledMcpSources } from "@sciencediscovery/mcp-sources";
 import { explicitConnectorEnableTarget } from "../configuration/explicit-connector.js";
 import { handlePluginRequest } from "../plugins/http.js";
 import { researchPackagePlugin } from "@sciencediscovery/research-package/plugin";
-import { createResearchPackageAsync, type ImportedResearchPackage } from "@sciencediscovery/research-package";
+import { RESEARCH_PACKAGE_MAX_BYTES, RESEARCH_PACKAGE_MAX_MAX_BYTES, RESEARCH_PACKAGE_TOO_LARGE_CODE, RESEARCH_PACKAGE_TOO_LARGE_MESSAGE, createResearchPackageAsync, RESEARCH_PACKAGE_UNPACK_BUDGET_CODE, importResearchPackageStreamed, researchPackageUploadBytes, writeResearchPackage, type ImportedResearchPackage } from "@sciencediscovery/research-package";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createReadStream } from "node:fs";
-import { mkdir, open, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { CasStore, VersionStore, withWorkspaceMutation } from "@sciencediscovery/cas";
-import { sessionTrajectory } from "../trajectory.js";
+import { sessionTrajectory, trajectoryMaxEvents } from "../trajectory.js";
 import { jiuwenSwarmConfigFromEnv } from "../agent-run/jiuwenswarm-agent.js";
 import { importSkillsToJiuwenSwarm, listJiuwenSwarmSkills, setJiuwenSwarmLanguage, setJiuwenSwarmSkillEnabled } from "../agent-run/jiuwenswarm-skills.js";
 import { syncWebSettingsToJiuwenSwarm } from "../agent-run/jiuwenswarm-web-settings.js";
 import { dirname, join, resolve } from "node:path";
 import { listSshKeyFiles } from "../ssh-key-files.js";
 
-type ResearchPackageInspectionCacheEntry = { projectId: string; bytes: Buffer; imported: ImportedResearchPackage; expiresAt: number };
+type ResearchPackageInspectionCacheEntry = {
+  projectId: string; directory: string; packageFile: string; sizeBytes: number;
+  imported: ImportedResearchPackage; expiresAt: number;
+  /** An import is reading this directory: eviction must not delete it under that read. */
+  pinned: number;
+};
 const researchPackageInspectionCache = new Map<string, ResearchPackageInspectionCacheEntry>();
 const RESEARCH_PACKAGE_INSPECTION_CACHE_TTL_MS = 10 * 60_000;
-const RESEARCH_PACKAGE_INSPECTION_CACHE_MAX_BYTES = 512 * 1024 * 1024;
+// The upload carries the compressed archive. Compression never makes the bytes
+// disappear, and a tiny incompressible package can be a few bytes larger than its
+// tar, so the upload bound is the package cap plus 5% and a megabyte of slack.
+// Deriving it here is the point: the old 256 MiB literal refused packages the
+// 512 MiB exporter happily produced.
+// The upload is the first bound a client meets, so it has to cover what an
+// acknowledged export may produce — the hard ceiling, not the configured cap.
+// The number itself comes from the package's own derivation, so it cannot drift away
+// from the exporter's worst case without a unit test failing.
+const RESEARCH_PACKAGE_UPLOAD_MAX_BYTES = researchPackageUploadBytes(RESEARCH_PACKAGE_MAX_MAX_BYTES);
+// The inspection cache counts compressed + unpacked bytes, so it has to hold both
+// views of one package: otherwise a valid inspect hands the dialog a checksum the
+// import cannot reuse and the client uploads the whole archive twice.
+const RESEARCH_PACKAGE_INSPECTION_CACHE_MAX_BYTES = RESEARCH_PACKAGE_UPLOAD_MAX_BYTES * 2 + 8 * 1024 * 1024;
 let researchPackageInspectionCacheBytes = 0;
 
 function inspectedResearchPackageCacheBytes(entry: ResearchPackageInspectionCacheEntry): number {
-  // The compressed upload and the decompressed tar-backed views are both kept
-  // alive until import or expiry, so count both against the process budget.
+  // The compressed upload on disk and the decompressed objects behind it are both
+  // kept alive until import or expiry, so count both against the process budget.
   const unpacked = entry.imported.manifest.inventory.reduce((total, item) => total + item.sizeBytes, 0);
-  return entry.bytes.byteLength + unpacked;
+  return entry.sizeBytes + unpacked;
 }
 
 function removeInspectedResearchPackage(key: string): void {
@@ -55,18 +77,32 @@ function removeInspectedResearchPackage(key: string): void {
   if (!entry) return;
   researchPackageInspectionCache.delete(key);
   researchPackageInspectionCacheBytes -= inspectedResearchPackageCacheBytes(entry);
+  // A pinned entry is being imported: the importer owns the directory now and deletes
+  // it when the restore finishes.
+  if (entry.pinned > 0) return;
+  // The cache owns the upload directory; dropping the entry drops its files.
+  void rm(entry.directory, { recursive: true, force: true }).catch(() => undefined);
 }
 
-function cacheInspectedResearchPackage(projectId: string, checksum: string, bytes: Buffer, imported: ImportedResearchPackage): void {
+/** A private directory for one upload: the compressed package plus its unpacked objects. */
+async function createResearchPackageUpload(dataDir: string, purpose: string): Promise<{ directory: string; packageFile: string }> {
+  const root = resolve(dataDir, "research-package-uploads");
+  await mkdir(root, { recursive: true });
+  const directory = await mkdtemp(resolve(root, `${purpose}-`));
+  return { directory, packageFile: resolve(directory, "package.sdresearch") };
+}
+
+function cacheInspectedResearchPackage(projectId: string, checksum: string,
+  upload: { directory: string; packageFile: string; sizeBytes: number }, imported: ImportedResearchPackage): boolean {
   const now = Date.now();
   for (const [key, entry] of researchPackageInspectionCache) if (entry.expiresAt <= now) removeInspectedResearchPackage(key);
   // Keep at most one large upload alive per project. The cache only bridges the
   // review and import requests made by the evidence-package dialog.
   for (const [key, entry] of researchPackageInspectionCache) if (entry.projectId === projectId && key !== checksum) removeInspectedResearchPackage(key);
   removeInspectedResearchPackage(checksum);
-  const entry = { projectId, bytes, imported, expiresAt: now + RESEARCH_PACKAGE_INSPECTION_CACHE_TTL_MS };
+  const entry = { projectId, ...upload, imported, expiresAt: now + RESEARCH_PACKAGE_INSPECTION_CACHE_TTL_MS, pinned: 0 };
   const size = inspectedResearchPackageCacheBytes(entry);
-  if (size > RESEARCH_PACKAGE_INSPECTION_CACHE_MAX_BYTES) return;
+  if (size > RESEARCH_PACKAGE_INSPECTION_CACHE_MAX_BYTES) return false;
   while (researchPackageInspectionCacheBytes + size > RESEARCH_PACKAGE_INSPECTION_CACHE_MAX_BYTES) {
     const oldest = researchPackageInspectionCache.keys().next().value as string | undefined;
     if (!oldest) break;
@@ -74,6 +110,7 @@ function cacheInspectedResearchPackage(projectId: string, checksum: string, byte
   }
   researchPackageInspectionCache.set(checksum, entry);
   researchPackageInspectionCacheBytes += size;
+  return true;
 }
 
 import {
@@ -105,8 +142,9 @@ import {
   type UpdateModelProviderRequest,
 } from "@sciencediscovery/schema";
 import { createMainAgentProfile, createSubagentProfile, resolveSubagentConfig } from "@sciencediscovery/orchestration";
-import { resolveWorkspaceFile } from "@sciencediscovery/workspace";
+import { findWindowsReservedDeviceSegment, resolveWorkspaceFile } from "@sciencediscovery/workspace";
 import { handleEvolveCompletion } from "../evolution/llm-proxy.js";
+import { handleEvolveRunner } from "../evolution/runner-proxy.js";
 import {
   handleGetCandidate as handleEvolveGetCandidate,
   handleListRuns as handleEvolveListRuns,
@@ -156,6 +194,7 @@ import type {
   DeleteResourceRequest,
   ImportSkillFromGitRequest,
   InspectGitSkillRepositoryRequest,
+  StartGitSkillImportJobRequest,
   MergeSkillReviewDraftsRequest,
   InstallEnvironmentRequest,
   UninstallEnvironmentRequest,
@@ -240,12 +279,16 @@ import {
 } from "../artifact-dashboard.js";
 import { mgLog, type ObserveUploadFilePayload } from "@sciencediscovery/memory";
 import { resolveProxyForUrl } from "@sciencediscovery/data-source";
+import { draftEvolveDirection } from "../evolution/direction-draft.js";
 import { apiLog, runLog } from "../logging.js";
+import { createMemoryWatch } from "../memory-watch.js";
+import { heapBudget } from "../heap-budget.js";
 import { shortErrorMessage } from "@sciencediscovery/operational-logging";
 import { createPromptManifest } from "../prompt-manifest.js";
 import { createMcpWorkspaceTools } from "@sciencediscovery/artifact-manager";
 import { createWebWorkspaceTools } from "@sciencediscovery/data-source";
 import {
+  BUNDLED_SKILL_IDS,
   createDialogueSkillDraft,
   createSessionSkillDraft,
   SkillCatalogError,
@@ -306,7 +349,7 @@ import { modelUsageAnalyticsToCsv } from "../model-usage.js";
 import { UsageExchangeRateProvider } from "../exchange-rates.js";
 import { timeoutFailure, timeoutMessage } from "../timeouts/index.js";
 import { isAuthorized } from "./auth.js";
-import { readBytes, readJson, readMultipartSkill, readOptionalJson } from "./body.js";
+import { readBytes, readBytesToFile, readJson, readMultipartSkill, readOptionalJson } from "./body.js";
 import { accessTokenBanner } from "./bootstrap-tokens.js";
 import { loadServerConfig, repositoryRoot, type ServerConfig } from "../bootstrap/config.js";
 import { isKnownClientInputError } from "./error-classification.js";
@@ -414,8 +457,99 @@ function extractReplacementModelId(body: unknown): string | null | undefined {
   throw new ApiStatusError(400, "replacementModelId must be a string or null");
 }
 
+/**
+ * The Specialist routes forward plain `Error`s from the store, and the store's
+ * wording is the message the settings pane shows. Only the store's own
+ * rejections may be answered as client errors; anything else raised in these
+ * handlers is an internal fault and must read 500. Exported for the route test.
+ */
+export function specialistErrorStatus(error: unknown): 400 | 404 | undefined {
+  if (!(error instanceof Error)) return undefined;
+  const match = SPECIALIST_REJECTIONS.find(([wording]) =>
+    typeof wording === "string" ? error.message === wording : wording.test(error.message));
+  return match?.[1];
+}
+
+/**
+ * One entry per rejection `services/api/src/store.ts` raises for these routes,
+ * by its exact wording. A wording the store does not raise is not client input:
+ * `isKnownClientInputError` matches any message containing "must" or "cannot",
+ * which would relabel an internal fault as 400 and hide it from the log.
+ */
+const SPECIALIST_REJECTIONS: ReadonlyArray<readonly [string | RegExp, 400 | 404]> = [
+  ["Specialist not found", 404],
+  ["Specialist name is required", 400],
+  ["Specialist description is required", 400],
+  ["Specialist description must be 1-500 characters", 400],
+  ["Specialist instructions must be 1-20000 characters", 400],
+  ["Specialist name already exists", 400],
+  [/^Specialist (?:skills|connectors) are unavailable: /, 400],
+  ["Built-in specialists are read-only; only their enabled flag can be toggled", 400],
+  ["Built-in specialists cannot be deleted", 400],
+  ["Specialist is referenced by a Session or subagent and cannot be deleted", 400],
+  ["enabled must be a boolean", 400],
+];
+
+/**
+ * Answer one Specialist route, keeping the store's message and its status.
+ *
+ * A rejection the store did not raise is a fault. It is answered here rather
+ * than rethrown, because the catch-all judges an unknown `Error` by its
+ * wording: a failed `saveCatalog()` surfaces `node:sqlite`'s
+ * `cannot start a transaction within a transaction` (with
+ * `code: "ERR_SQLITE_ERROR"`), which would answer 400 with its raw text. Only
+ * the two typed errors and the one coded store rejection the catch-all maps
+ * without reading the message go through it.
+ */
+async function answerSpecialistRoute<T>(
+  response: ServerResponse,
+  request: IncomingMessage,
+  path: string,
+  status: number,
+  work: () => Promise<T>,
+): Promise<void> {
+  try {
+    sendJson(response, status, await work());
+  } catch (error) {
+    const errorStatus = specialistErrorStatus(error);
+    if (errorStatus !== undefined) {
+      sendError(response, errorStatus, error instanceof Error ? error.message : "Specialist request failed");
+      return;
+    }
+    if (error instanceof ApiStatusError || error instanceof SessionStoreHttpError
+      || (error as { code?: unknown } | null)?.code === "SPECIALIST_RUNTIME_INVALID") {
+      throw error;
+    }
+    apiLog.error("unclassified_specialist_request_error", {
+      errorMessage: shortErrorMessage(error),
+      method: request.method ?? "UNKNOWN",
+      path,
+      status: 500,
+    });
+    sendError(response, 500, "Internal server error");
+  }
+}
+
+/**
+ * Read a Specialist body that has to be a JSON object.
+ *
+ * `readJson` returns whatever `JSON.parse` produced, so a bare `null` body
+ * reaches the store and fails on a property read. That `TypeError` names
+ * nothing in `SPECIALIST_REJECTIONS`, so the route would answer it as a 500
+ * fault; rejecting it here keeps the status class the base answered for a
+ * malformed client body, before any of it touches the store.
+ */
+async function readSpecialistBody<T>(request: IncomingMessage): Promise<T> {
+  const body = (await readJson<unknown>(request)) as unknown;
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    throw new ApiStatusError(400, "Request body must be a JSON object");
+  }
+  return body as T;
+}
+
 export function createApiServer(config = loadServerConfig(), dependencies: ApiServerDependencies = {}): Server {
   const platform = createPlatformServices(config, repositoryRoot, dependencies);
+  const measurePackageCapacity = dependencies.measureResearchPackageCapacity ?? measureResearchPackageCapacity;
   const {
     artifactManager,
     evolutionStore,
@@ -443,6 +577,8 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
     store,
     webBroker,
   } = platform;
+  /** How much room a package operation has. The test seam lets a case report a
+   *  short volume without filling one; production measures `dataDir`'s. */
   const skillLibraryCatalog = new SkillLibraryCatalog(config.dataDir);
   const modelConnectivityTests = new ModelConnectivityTestCoordinator();
   /** Availability plus the isolation a run would actually get.
@@ -460,6 +596,15 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       .catch(() => null),
   });
   const conversationalConfiguration = () => {
+    store.setConfigurationMcpProxySource(() => {
+      const services = new Map<string, { id: string; names: string[]; connectorIds: string[] }>();
+      for (const manifest of mcpRegistry.listManifests()) {
+        const id = manifest.transport.mcpServerId;
+        const service = services.get(id) ?? { id, names: [], connectorIds: [] };
+        service.names.push(manifest.displayName); service.connectorIds.push(manifest.id); services.set(id, service);
+      }
+      return [...services.values()].map(service => ({ id: service.id, name: service.names.sort().join(", "), connectorIds: service.connectorIds.sort() }));
+    });
     store.setConfigurationConnectorRevisionSource((ids?: readonly string[]) => {
       const selected = mcpRegistry.listManifests().filter(manifest => !ids || ids.includes(manifest.id));
       const servers = new Set(selected.map(manifest => manifest.transport.mcpServerId));
@@ -480,6 +625,13 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
     });
     return configurationFramework(store, {
     nativeExecutor: !jiuwenSwarmConfigFromEnv(),
+    mcpMetadata: platform.customMcpServers,
+    mcpTimeout: platform.customMcpServers,
+    mcpHeaderRemoval: platform.customMcpServers,
+    mcpEnvironmentRemoval: platform.customMcpServers,
+    mcpHeaderCredential: platform.customMcpServers,
+    mcpAvailability: platform.customMcpServers,
+    mcpDeletion: platform.customMcpServers,
     jiuwenLiveWait: Boolean(jiuwenSwarmConfigFromEnv()),
     connectors: () => mcpRegistry.listManifests().map(manifest => {
       const status = mcpCatalog.getStatus(manifest.id);
@@ -783,7 +935,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
   // Provider model listings are cached briefly so composer and settings reads
   // do not hammer vendor endpoints; provider edits invalidate the entry and
   // `?refresh=1` forces a live fetch.
-  const providerModelListCache = new Map<string, { fetchedAt: string; models: DiscoveredModel[] }>();
+  const providerModelListCache = new Map<string, { revision: string; fetchedAt: string; models: DiscoveredModel[] }>();
   const PROVIDER_MODEL_CACHE_TTL_MS = 5 * 60_000;
   const usageExchangeRateProvider = new UsageExchangeRateProvider({
     config: config.usageExchangeRates,
@@ -792,6 +944,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
   });
   const usageAnalyticsSummary = async (url: URL) => {
     const summary = await store.getModelUsageAnalyticsSummary(usageAnalyticsFilters(url));
+    if (url.searchParams.get("includeExchangeRates") === "false") return summary;
     const exchangeRates = await usageExchangeRateProvider.rates();
     return exchangeRates.length ? { ...summary, exchangeRates } : summary;
   };
@@ -1043,6 +1196,31 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
     const requestPath = (request.url ?? "/").split("?", 1)[0] || "/";
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
+      // The desktop shell has already authenticated the person through HUAWEI
+      // ID. Its local control plane still needs the internal bearer token, but
+      // asking a person to copy that token is a setup step, not a security
+      // boundary: only a loopback caller may read it. The presented account
+      // access token is checked with the account service first — a `Bearer`
+      // prefix is not proof of anything — and a Host header that is not this
+      // machine is refused so a page cannot reach the route by DNS rebinding.
+      if (request.method === "POST" && url.pathname === "/api/bootstrap/local-token") {
+        const address = request.socket.remoteAddress ?? "";
+        const loopback = address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
+        if (!loopback || !isLoopbackHost(request.headers.host)) {
+          sendError(response, 403, "Forbidden");
+          return;
+        }
+        const verified = await verifyAccountAccessToken(request.headers.authorization, {
+          baseUrl: config.accountsBaseUrl ?? "",
+        });
+        if (!verified.ok) {
+          if (verified.reason === "unauthorized") sendError(response, 401, "Unauthorized");
+          else sendError(response, 503, "Account verification is unavailable");
+          return;
+        }
+        sendJson(response, 200, { token: config.authToken });
+        return;
+      }
       // F10.6p: /health used to gate on `await ready` like every route and then
       // wait out the runner client's 5s timeout — on a machine whose runner
       // wedged, every answer arrived after the shell wizard's shorter poll
@@ -1052,7 +1230,20 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       // checks after that — never a hung response.
       if (request.method === "GET" && (url.pathname === "/health" || url.pathname === "/api/health")) {
         if (!(await settleWithin(ready.then(() => true), 3_000, false))) {
-          sendJson(response, 503, { service: "sciencediscovery-api", status: "starting" });
+          sendJson(response, 503, { service: "sciencediscovery-api", liveness: "starting" });
+          return;
+        }
+        // Liveness for everyone, detail for a caller that proves it may read it:
+        // the record below carries the Runner's platform, the sandbox egress
+        // allowlist and the workspace quotas, which are reconnaissance for
+        // anyone who can reach this port without a token.
+        //
+        // The two answers share no field name on purpose. `status` in the detail
+        // is derived from the Runner, so a liveness body spelling it `"ok"` would
+        // let every reader that gates on `status === "ok"` pass without ever
+        // having read the detail — a wrong token would look like a healthy stack.
+        if (!isAuthorized(request, config.authToken)) {
+          sendJson(response, 200, { service: "sciencediscovery-api", liveness: "ok" });
           return;
         }
         const runner = await settleWithin(runnerClient.health().catch(() => undefined), 2_000, undefined);
@@ -1078,7 +1269,12 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
           },
           runner: runner ?? { status: "unavailable" },
           service: "sciencediscovery-api",
-          status: runner && runner.execution?.ready !== false ? "ok" : "degraded",
+          // `status` follows the Runner's readiness record, not the fact that a
+          // Runner answered: a Runner that does not accept this token answers
+          // 200 with its public body, which carries no `execution`. Reading that
+          // as "ok" would tell an operator the stack is healthy while its Runner
+          // was never consulted.
+          status: runner?.execution && runner.execution.ready !== false ? "ok" : "degraded",
           workspace,
         });
         return;
@@ -1097,6 +1293,11 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         });
         return;
       }
+      if (url.pathname.startsWith("/internal/evolve-runner/") && await handleEvolveRunner(request, response, url, {
+        grants: evolveOrchestrator.runnerGrants,
+        runnerClient: (runnerId) => remoteCompute.runnerClient(runnerId),
+        sessions: store,
+      })) return;
 
       // OAuth callbacks are authorized by a single-use state and SDK PKCE verifier.
       if (await handleMcpOAuthCallback(request, response, url, platform.customMcpServers)) return;
@@ -1148,6 +1349,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         return sendJson(response, 200, await evolveStatusPayload(true));
       }
       if ((url.pathname.startsWith("/api/evolve/") || /^\/api\/sessions\/[^/]+\/idea-tree(?:\/|$)/.test(url.pathname))
+          && !(request.method === "GET" && /^\/api\/evolve\/runs(?:\/[^/]+\/(?:events|candidates\/[^/]+))?$/.test(url.pathname))
           && (await evolveAvailability.refresh()).state !== "ready") {
         return sendError(response, 503, "Evolve is not initialized or unavailable. Select Init Evolve or check the configured service.");
       }
@@ -1225,7 +1427,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         if (request.method === "POST" && !taskId) {
           const body = await readJson(request) as {
             sessionId?: unknown; level?: unknown; filePaths?: unknown; includeFullTrajectory?: unknown;
-            includeFullMemoryGraph?: unknown; revision?: unknown;
+            includeFullMemoryGraph?: unknown; revision?: unknown; allowOverCap?: unknown;
           };
           if (body.level !== "necessary" && body.level !== "complete") return sendError(response, 400, "Invalid export level");
           if (body.sessionId !== undefined && typeof body.sessionId !== "string") return sendError(response, 400, "Invalid session id");
@@ -1235,13 +1437,30 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
           const sessionId = body.sessionId as string | undefined;
           const title = (sessionId ? store.getSession(sessionId)?.title : undefined) || store.getProject(projectId)?.name || projectId;
           const packageFileName = title.trim().replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").slice(0, 120) || "科研会话";
+          const allowOverCap = body.allowOverCap === true;
+          const sizeCap = allowOverCap ? RESEARCH_PACKAGE_MAX_MAX_BYTES : RESEARCH_PACKAGE_MAX_BYTES;
+          // Size from metadata before the task reads anything: the preview walks the same
+          // closure without loading payloads, so an over-cap selection is refused up
+          // front instead of after the read it was supposed to avoid.
+          const sized = await previewResearchPackage(projectId, sessionId, body.level,
+            body.filePaths ? new Set(body.filePaths as string[]) : undefined,
+            body.level === "complete" && body.includeFullTrajectory === true,
+            body.level === "complete" && body.includeFullMemoryGraph === true);
+          if ((sized.archiveBytes ?? 0) > sizeCap)
+            return sendError(response, 413, RESEARCH_PACKAGE_TOO_LARGE_MESSAGE, "RESEARCH_PACKAGE_TOO_LARGE");
+          try {
+            assertResearchPackageExportCapacity(await measurePackageCapacity(store.dataDir), sized.archiveBytes ?? 0);
+          } catch (error) {
+            return sendError(response, 507, error instanceof Error ? error.message : "Insufficient capacity",
+              (error as { code?: string }).code);
+          }
           try {
             const task = await packageExports.start({
               projectId, sessionId, level: body.level,
               selectedFiles: body.filePaths as string[] | undefined,
               includeFullTrajectory: body.level === "complete" && body.includeFullTrajectory === true,
               includeFullMemoryGraph: body.level === "complete" && body.includeFullMemoryGraph === true,
-              revision: body.revision,
+              revision: body.revision, allowOverCap,
             }, `${packageFileName}.sdresearch`);
             return sendJson(response, 202, task);
           } catch (error) { return sendError(response, 409, error instanceof Error ? error.message : "Unable to start export"); }
@@ -1272,9 +1491,24 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       const researchPackageMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/research-package(?:\/(inspect|import|preview))?$/);
       if (researchPackageMatch) {
         const projectId = decodeURIComponent(researchPackageMatch[1]!);
-        if (!store.getProject(projectId)) return sendError(response, 404, "Project not found");
         const sessionId = url.searchParams.get("sessionId") ?? undefined;
-        if (request.method === "GET" && (!researchPackageMatch[2] || researchPackageMatch[2] === "preview")) {
+        const previewRead = request.method === "GET" && (!researchPackageMatch[2] || researchPackageMatch[2] === "preview");
+        // Only the polling shape (`defaults=1`, what a mounted panel asks every
+        // 3 s) ends quietly. A one-shot preview read keeps its status: there the
+        // caller asked once, and a deleted scope is worth reporting.
+        const previewPoll = previewRead && researchPackageMatch[2] === "preview" && url.searchParams.get("defaults") === "1";
+        const packagePreviewGone = () => !store.getProject(projectId)
+          || (sessionId !== undefined && sessionId !== "" && !store.getSession(sessionId));
+        // A mounted panel polls the preview of the Session it is showing. When
+        // that Session or Project has been deleted, the honest answer to the
+        // poll is "there is nothing left to preview" — not a 404, which the
+        // browser reports as a console error and which a polling client would
+        // keep asking for (#1072). The panel stops on this answer. Downloads
+        // keep their 404 below: asking for a package that is gone is a mistake
+        // worth reporting, asking after a polled preview is not.
+        if (previewPoll && packagePreviewGone()) return sendJson(response, 200, { state: "deleted" as const });
+        if (!store.getProject(projectId)) return sendError(response, 404, "Project not found");
+        if (previewRead) {
           const requestedLevel = url.searchParams.get("level");
           const level = requestedLevel === "complete" ? "complete" : "necessary";
           const includeFullTrajectory = url.searchParams.get("includeFullTrajectory") !== "0";
@@ -1289,6 +1523,14 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
               }
               return sendJson(response, 200, await previewResearchPackage(projectId, sessionId, level, selectedFiles, includeFullTrajectory, includeFullMemoryGraph));
             } catch (error) {
+              // The scope can disappear while a preview is being calculated —
+              // teardown, or another client deleting the Project/Session. That
+              // ends the poll; it is not a failure of the page still showing it.
+              // An ENOENT counts only when the scope is really gone, so a
+              // missing input of a live Project still surfaces as an error.
+              if (previewPoll && ((error instanceof ApiStatusError && error.code === "EXPORT_PREVIEW_RESOURCE_DELETED")
+                || (packagePreviewGone() && (error as NodeJS.ErrnoException).code === "ENOENT")))
+                return sendJson(response, 200, { state: "deleted" as const });
               // Pending is expected while a run changes evidence. Opt-in clients can
               // wait without turning that state into a browser resource error.
               const preferAsync = [request.headers.prefer].flat().join(",").split(",").some((preference) => preference.trim().toLowerCase() === "respond-async");
@@ -1299,33 +1541,90 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
               throw error;
             }
           }
-          const input = await buildResearchPackageInput(projectId, sessionId, level, selectedFiles, undefined, undefined, includeFullTrajectory, includeFullMemoryGraph);
-          const result = await createResearchPackageAsync(input);
+          const allowOverCap = url.searchParams.get("allowOverCap") === "1";
+          const sizeCap = allowOverCap ? RESEARCH_PACKAGE_MAX_MAX_BYTES : RESEARCH_PACKAGE_MAX_BYTES;
+          // Size from metadata first: the preview measures the same closure without
+          // reading payloads, so the refusal costs a walk instead of the whole read.
+          const sized = await previewResearchPackage(projectId, sessionId, level, selectedFiles,
+            includeFullTrajectory, includeFullMemoryGraph);
+          if ((sized.archiveBytes ?? 0) > sizeCap)
+            return sendError(response, 413, RESEARCH_PACKAGE_TOO_LARGE_MESSAGE, "RESEARCH_PACKAGE_TOO_LARGE");
+          // The archive streams straight into the response: with the 5 GiB default the old
+          // path held payload + tar + gzip and then copied the archive again for the body,
+          // which OOMed the API on a package the cap allowed (#1211 F2).
+          // This route writes the response, not a file: only its memory headroom is
+          // charged, so a short data volume cannot refuse a streamed download (#1216
+          // review 1).
+          try {
+            assertResearchPackageResponseExportCapacity(await measurePackageCapacity(store.dataDir), sized.archiveBytes ?? 0);
+          } catch (error) {
+            return sendError(response, 507, error instanceof Error ? error.message : "Insufficient capacity",
+              (error as { code?: string }).code);
+          }
+          const input = await buildResearchPackageInput(projectId, sessionId, level, selectedFiles, undefined, undefined,
+            includeFullTrajectory, includeFullMemoryGraph, undefined, { streamObjects: true });
           const packageFileName = ((sessionId ? store.getSession(sessionId)?.title : undefined) || input.source.title || projectId).trim().replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").slice(0, 120) || "科研会话";
           response.writeHead(200, {
             "cache-control": "no-store",
             "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(`${packageFileName}.sdresearch`)}`,
-            "content-length": result.bytes.byteLength,
             "content-type": "application/octet-stream",
             "x-content-type-options": "nosniff",
           });
-          response.end(Buffer.from(result.bytes));
+          try {
+            await writeResearchPackage(input, response, sizeCap);
+          } catch (error) {
+            // Headers are out already; a truncated body is the honest signal the client gets.
+            response.destroy(error instanceof Error ? error : undefined);
+          }
           return;
         }
         if (request.method === "POST" && researchPackageMatch[2] === "inspect") {
-          const bytes = await readBytes(request, 256 * 1024 * 1024, "Research package");
-          const imported = researchPackageProvider.importReadOnly(bytes);
-          const inspection = {
-            manifest: imported.manifest,
-            packageChecksum: imported.receipt.packageChecksum,
-            files: imported.manifest.inventory,
-            recordsBytes: imported.receipt.importedRecordBytes,
-            objectCount: imported.receipt.importedObjectCount,
-            totalBytes: imported.manifest.inventory.reduce((sum, entry) => sum + entry.sizeBytes, 0),
-            valid: true as const,
-          };
-          cacheInspectedResearchPackage(projectId, inspection.packageChecksum, bytes, imported);
-          sendJson(response, 200, inspection);
+          // The archive lands on disk as it arrives and is parsed from there, so an
+          // upload never becomes one resident buffer (#1152 stage 2).
+          const upload = await createResearchPackageUpload(store.dataDir, "research-package-inspect");
+          try {
+            await readBytesToFile(request, RESEARCH_PACKAGE_UPLOAD_MAX_BYTES, "Research package", upload.packageFile);
+            // Bound the unpacking by the disk the restore can hold, so a highly
+            // compressible archive is refused before it fills the volume.
+            const opening = await measurePackageCapacity(store.dataDir);
+            // An inspect unpacks one copy and writes nothing else, so it is bounded at
+            // `free / 2`; the restore's three extra copies would refuse it (#1216 review 3).
+            const unpackBudget = researchPackageUnpackBudget(opening, RESEARCH_PACKAGE_MAX_MAX_BYTES, 1);
+            const imported = await importResearchPackageStreamed(createReadStream(upload.packageFile), {
+              objectDirectory: resolve(upload.directory, "objects"),
+              maxBytes: unpackBudget,
+            });
+            // An inspect writes nothing after this point: the unpacked objects are the
+            // ones the parser already wrote, and the upload file is the one it read.
+            // Its disk was bounded by `researchPackageUnpackBudget` above, so charging
+            // the restore's two remaining copies here would refuse a package that fits
+            // (#1200 review 3).
+            const inspection = {
+              manifest: imported.manifest,
+              packageChecksum: imported.receipt.packageChecksum,
+              files: imported.manifest.inventory,
+              recordsBytes: imported.receipt.importedRecordBytes,
+              objectCount: imported.receipt.importedObjectCount,
+              totalBytes: imported.manifest.inventory.reduce((sum, entry) => sum + entry.sizeBytes, 0),
+              valid: true as const,
+            };
+            const { size } = await stat(upload.packageFile);
+            if (!cacheInspectedResearchPackage(projectId, inspection.packageChecksum, { ...upload, sizeBytes: size }, imported))
+              await rm(upload.directory, { recursive: true, force: true }).catch(() => undefined);
+            sendJson(response, 200, inspection);
+          } catch (error) {
+            // The streamed parse stops at the measured free-disk budget: that is a disk
+            // answer, not an internal failure. Measure before dropping the staged upload,
+            // so the message compares what the package needs with the space it met.
+            if ((error as { code?: string }).code === RESEARCH_PACKAGE_UNPACK_BUDGET_CODE) {
+              const capacity = await measurePackageCapacity(store.dataDir);
+              await rm(upload.directory, { recursive: true, force: true }).catch(() => undefined);
+              const refusal = researchPackageBudgetRefusal((error as { unpackedBytes?: number }).unpackedBytes ?? 0, capacity.freeDiskBytes);
+              return sendError(response, 507, refusal.message, RESEARCH_PACKAGE_UNPACK_BUDGET_CODE);
+            }
+            await rm(upload.directory, { recursive: true, force: true }).catch(() => undefined);
+            throw error;
+          }
           return;
         }
         if (request.method === "POST" && researchPackageMatch[2] === "import") {
@@ -1334,11 +1633,66 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
           const reusable = cached && cached.projectId === projectId && cached.expiresAt > Date.now() ? cached : undefined;
           if (cached && cached.expiresAt <= Date.now()) removeInspectedResearchPackage(checksum!);
           if (checksum && !reusable && Number(request.headers["content-length"] ?? "0") === 0) return sendError(response, 409, "Inspected package expired; upload it again");
-          const bytes = reusable
-            ? reusable.bytes
-            : await readBytes(request, 256 * 1024 * 1024, "Research package");
-          if (reusable) removeInspectedResearchPackage(checksum!);
-          sendJson(response, 201, await persistImportedResearchPackage(projectId, sessionId, bytes, reusable?.imported));
+          if (!reusable) {
+            // Refuse before a long upload when the machine cannot hold the work, and
+            // say what is missing rather than failing halfway through the restore.
+            try {
+              assertResearchPackageUploadCapacity(await measurePackageCapacity(store.dataDir),
+                Number(request.headers["content-length"] ?? "0"));
+            } catch (error) {
+              return sendError(response, 507, error instanceof Error ? error.message : "Insufficient capacity",
+                (error as { code?: string }).code);
+            }
+          }
+          let source: ImportedPackageSource;
+          let owned: string | undefined;
+          let imported: ImportedResearchPackage;
+          if (reusable) {
+            // Pin the upload for this import: another inspect would evict the entry and
+            // delete the directory the restore is still reading (#1200 review 6).
+            reusable.pinned += 1;
+            removeInspectedResearchPackage(checksum!);
+            owned = reusable.directory;
+            imported = reusable.imported;
+            source = { imported, packageFile: reusable.packageFile };
+          } else {
+            const upload = await createResearchPackageUpload(store.dataDir, "research-package-import");
+            owned = upload.directory;
+            try {
+              await readBytesToFile(request, RESEARCH_PACKAGE_UPLOAD_MAX_BYTES, "Research package", upload.packageFile);
+              const opening = await measurePackageCapacity(store.dataDir);
+              imported = await importResearchPackageStreamed(createReadStream(upload.packageFile), {
+                objectDirectory: resolve(upload.directory, "objects"),
+                maxBytes: researchPackageUnpackBudget(opening, RESEARCH_PACKAGE_MAX_MAX_BYTES),
+              });
+              source = { imported, packageFile: upload.packageFile };
+            } catch (error) {
+              if ((error as { code?: string }).code === RESEARCH_PACKAGE_UNPACK_BUDGET_CODE) {
+                const capacity = await measurePackageCapacity(store.dataDir);
+                await rm(upload.directory, { recursive: true, force: true }).catch(() => undefined);
+                const refusal = researchPackageBudgetRefusal((error as { unpackedBytes?: number }).unpackedBytes ?? 0, capacity.freeDiskBytes);
+                return sendError(response, 507, refusal.message, RESEARCH_PACKAGE_UNPACK_BUDGET_CODE);
+              }
+              await rm(upload.directory, { recursive: true, force: true }).catch(() => undefined);
+              throw error;
+            }
+          }
+          try {
+            // The compressed upload says nothing about the unpacked work: check what the
+            // restore will write and hold now that the archive has been parsed.
+            try {
+              assertResearchPackageRestoreCapacity(await measurePackageCapacity(store.dataDir),
+                restoreSizeOf(imported.manifest.inventory, imported.receipt.importedRecordBytes));
+            } catch (error) {
+              return sendError(response, 507, error instanceof Error ? error.message : "Insufficient capacity",
+                (error as { code?: string }).code);
+            }
+            sendJson(response, 201, await persistImportedResearchPackage(projectId, sessionId, source));
+          } finally {
+            // The restore has already copied the archive into its snapshot and read
+            // every object it needed, so the upload is disposable now.
+            if (owned) await rm(owned, { recursive: true, force: true }).catch(() => undefined);
+          }
           return;
         }
         return sendError(response, 405, "Unsupported research package operation");
@@ -1572,6 +1926,10 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         sendJson(response, 200, store.getProxySettings());
         return;
       }
+      if (url.pathname === "/api/proxy/test" && request.method === "POST") {
+        sendJson(response, 200, await testProxyConnectivity(await readJson(request)));
+        return;
+      }
       if (url.pathname === "/api/proxy/settings" && request.method === "PUT") {
         sendJson(response, 200, await store.updateProxySettings(await readJson<UpdateProxySettingsRequest>(request)));
         return;
@@ -1691,7 +2049,8 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
           sendJson(response, 200, { enabled: body.enabled, name: existingName, skillId });
           return;
         }
-        if (!body.enabled) {
+        // Persist a disable even before a default-enabled bundled skill is first used.
+        if (!body.enabled && !BUNDLED_SKILL_IDS.some((id) => id === skillId)) {
           sendJson(response, 200, { enabled: false, name: null, skillId });
           return;
         }
@@ -1702,8 +2061,8 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
           const imported = await importSkillsToJiuwenSwarm(jiuwenSwarm, [{ hash: snapshot.hash, id: snapshot.id }], packagesRoot);
           const name = imported.get(snapshot.id);
           if (!name) throw new ApiStatusError(502, "JiuwenSwarm did not import the skill");
-          await setJiuwenSwarmSkillEnabled(jiuwenSwarm, name, true);
-          sendJson(response, 200, { enabled: true, name, skillId });
+          await setJiuwenSwarmSkillEnabled(jiuwenSwarm, name, body.enabled);
+          sendJson(response, 200, { enabled: body.enabled, name, skillId });
         } catch (error) {
           throw new ApiStatusError(502, error instanceof Error ? error.message : String(error));
         } finally {
@@ -2201,6 +2560,10 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
             versionId: commit.version.id,
           };
         });
+        // The publication also installed the package into the catalog; that set is
+        // what `resolveRuntimeSettings` resolves `all` mode from and what a run
+        // stages, so every other catalog mutation refreshes it too.
+        store.setAvailableSkillIds(skillCatalog.ids());
         sendJson(response, 201, published);
         return;
       }
@@ -2232,20 +2595,21 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         return;
       }
       if (request.method === "POST" && url.pathname === "/api/specialists") {
-        sendJson(response, 201, await store.createSpecialist(await readJson<CreateSpecialistRequest>(request)));
+        const body = await readSpecialistBody<CreateSpecialistRequest>(request);
+        await answerSpecialistRoute(response, request, url.pathname, 201, () => store.createSpecialist(body));
         return;
       }
       const specialistMatch = url.pathname.match(/^\/api\/specialists\/([^/]+)$/);
       if (specialistMatch && request.method === "PUT") {
-        sendJson(response, 200, await store.updateSpecialist(
-          specialistMatch[1]!,
-          await readJson<UpdateSpecialistRequest>(request),
-        ));
+        const body = await readSpecialistBody<UpdateSpecialistRequest>(request);
+        await answerSpecialistRoute(response, request, url.pathname, 200, () => store.updateSpecialist(specialistMatch[1]!, body));
         return;
       }
       if (specialistMatch && request.method === "DELETE") {
-        await store.deleteSpecialist(specialistMatch[1]!);
-        sendJson(response, 200, { deleted: specialistMatch[1] });
+        await answerSpecialistRoute(response, request, url.pathname, 200, async () => {
+          await store.deleteSpecialist(specialistMatch[1]!);
+          return { deleted: specialistMatch[1] };
+        });
         return;
       }
       if (request.method === "POST" && url.pathname === "/api/skills") {
@@ -2256,10 +2620,53 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       }
       if (request.method === "POST" && url.pathname === "/api/skills/import") {
         const upload = await readMultipartSkill(request);
-        const detail = await skillCatalog.import(upload.filename, upload.bytes);
+        const onDuplicate = url.searchParams.get("onDuplicate");
+        if (onDuplicate !== null && onDuplicate !== "rename") {
+          throw new ApiStatusError(400, "onDuplicate must be rename when present");
+        }
+        const detail = await skillCatalog.import(
+          upload.filename,
+          upload.bytes,
+          onDuplicate === "rename" ? { onDuplicate: "rename" } : {},
+        );
         store.setAvailableSkillIds(skillCatalog.ids());
         sendJson(response, 201, detail);
         return;
+      }
+      if (request.method === "POST" && url.pathname === "/api/skills/import-git/jobs") {
+        // The import runs in the API process, not in this request: the reader
+        // may leave 设置 while the packages are installed.
+        let job;
+        try {
+          job = startGitSkillImportJob(
+            skillCatalog,
+            await readJson<StartGitSkillImportJobRequest>(request),
+            () => store.setAvailableSkillIds(skillCatalog.ids()),
+          );
+        } catch (error) {
+          if (error instanceof Error && /already running/.test(error.message)) {
+            throw new ApiStatusError(409, error.message);
+          }
+          throw error;
+        }
+        sendJson(response, 202, job);
+        return;
+      }
+      const gitImportJobMatch = url.pathname.match(/^\/api\/skills\/import-git\/jobs\/([^/]+)$/);
+      if (gitImportJobMatch) {
+        const jobId = decodeURIComponent(gitImportJobMatch[1]!);
+        if (request.method === "GET") {
+          const job = getGitSkillImportJob(jobId);
+          if (!job) throw new ApiStatusError(404, "Git Skill import job not found");
+          sendJson(response, 200, job);
+          return;
+        }
+        if (request.method === "DELETE") {
+          const job = cancelGitSkillImportJob(jobId);
+          if (!job) throw new ApiStatusError(404, "Git Skill import job not found");
+          sendJson(response, 202, job);
+          return;
+        }
       }
       if (request.method === "POST" && url.pathname === "/api/skills/import-git/inspect") {
         sendJson(response, 200, await skillCatalog.inspectGitRepository(
@@ -2342,6 +2749,20 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
           decodeURIComponent(skillResourceMatch[1]!),
           decodeURIComponent(skillResourceMatch[2]!),
         ));
+        return;
+      }
+
+      const skillPackageMatch = url.pathname.match(/^\/api\/skills\/([^/]+)\/package$/);
+      if (skillPackageMatch && request.method === "GET") {
+        const archive = skillCatalog.exportPackage(decodeURIComponent(skillPackageMatch[1]!));
+        response.writeHead(200, {
+          "cache-control": "no-store",
+          "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(archive.filename)}`,
+          "content-length": String(archive.bytes.byteLength),
+          "content-type": "application/zip",
+          "x-content-type-options": "nosniff",
+        });
+        response.end(archive.bytes);
         return;
       }
 
@@ -2625,12 +3046,15 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       const providerModelsMatch = url.pathname.match(/^\/api\/providers\/([^/]+)\/models$/);
       if (providerModelsMatch && request.method === "GET") {
         const providerId = providerModelsMatch[1]!;
-        const provider = store.getProvider(providerId);
-        if (!provider) throw new ApiStatusError(404, "Provider not found");
+        const source = store.getProvider(providerId);
+        const revision = store.providerDiscoveryRevision(providerId);
+        if (!source || !revision) throw new ApiStatusError(404, "Provider not found");
+        const provider = structuredClone(source);
         const profileFor = (modelId: string) =>
           store.listModels().find((profile) => profile.providerId === providerId && profile.model === modelId)?.id;
         const refresh = url.searchParams.get("refresh") === "1";
         let cached = providerModelListCache.get(providerId);
+        if (cached?.revision !== revision) cached = undefined;
         if (refresh || !cached || Date.now() - Date.parse(cached.fetchedAt) > PROVIDER_MODEL_CACHE_TTL_MS) {
           try {
             const models = await listProviderModels({
@@ -2639,9 +3063,15 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
               discovery: provider.modelDiscovery,
               proxy: resolveProxyForUrl(store.resolveProxy(provider.proxyPolicy), provider.baseUrl),
             });
-            cached = { fetchedAt: new Date().toISOString(), models };
+            if (store.providerDiscoveryRevision(providerId) !== revision) {
+              throw new ApiStatusError(409, "Provider connection changed while loading models. Refresh the model list.");
+            }
+            cached = { revision, fetchedAt: new Date().toISOString(), models };
             providerModelListCache.set(providerId, cached);
           } catch (error) {
+            if (store.providerDiscoveryRevision(providerId) !== revision) {
+              throw new ApiStatusError(409, "Provider connection changed while loading models. Refresh the model list.");
+            }
             if (error instanceof ModelDiscoveryError) {
               // Surface the upstream failure honestly; the UI keeps manual
               // model entry available as the fallback path.
@@ -2668,7 +3098,9 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         // Seed the profile from the best facts available: explicit request,
         // then the live listing, then the curated catalog. A model typed by
         // hand simply has no listing entry, so it lands on the same path.
-        const remote = providerModelListCache.get(providerId)?.models.find((model) => model.id === modelId);
+        const cached = providerModelListCache.get(providerId);
+        const remote = cached?.revision === store.providerDiscoveryRevision(providerId)
+          ? cached?.models.find((model) => model.id === modelId) : undefined;
         const catalog = modelId ? lookupModelCatalog(modelId, provider.presetId) : undefined;
         const vision = body.vision ?? remote?.vision ?? catalog?.vision;
         const label = body.label ?? remote?.displayName ?? catalog?.label;
@@ -2696,7 +3128,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
             UNTITLED_SESSION_TITLE,
             {},
             {},
-            { allowUnconfiguredModel: true },
+            { allowUnconfiguredModel: true, selectFallbackModel: true },
           );
           sendJson(response, 201, { ...project, firstSession, project });
         } catch (error) {
@@ -2781,6 +3213,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
           }
         }
         await store.deleteProject(projectMatch[1]!, body.confirmationId ?? "");
+        exportPreviews.cancel(projectMatch[1]!);
         void Promise.all(impact.sessionIds.map(sid => ideaResearch.cleanup(projectMatch[1]!, sid))).catch(error => {
           console.warn("Could not clean up deleted Project research:", error);
         });
@@ -2835,6 +3268,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
           },
           {
             allowUnconfiguredModel: body.modelId === undefined && body.settingsOverrides?.modelId === undefined,
+            selectFallbackModel: true,
           },
         ));
         return;
@@ -3066,7 +3500,10 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       if (sessionMatch && request.method === "GET") {
         const session = await store.getSessionDetail(sessionMatch[1]!);
         if (!session) return sendError(response, 404, "Session not found");
-        if (!session.researchSnapshot || session.researchSnapshot.state === "ready") exportPreviews.watch(session.projectId, session.id);
+        // Reading a session must not start an export build: warming here ran
+        // five full preview profiles per read and per 3 s tick, exhausting the
+        // default heap on large projects (#1085). The export dialog warms on
+        // its own `defaults` request instead.
         sendJson(response, 200, session);
         return;
       }
@@ -3134,6 +3571,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         await reviewerAuditCoordinator.cancelSession(sessionMatch[1]!);
         const researchProjectId = store.getSession(sessionMatch[1]!)!.projectId;
         await store.deleteSession(sessionMatch[1]!, body.confirmationId ?? "");
+        exportPreviews.cancel(researchProjectId, sessionMatch[1]!);
         void ideaResearch.cleanup(researchProjectId, sessionMatch[1]!).catch(error => {
           console.warn("Could not clean up deleted Session research:", error);
         });
@@ -3598,6 +4036,24 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         return;
       }
 
+      const evolveDraftMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/evolve\/draft$/);
+      if (evolveDraftMatch && request.method === "POST") {
+        const sessionId = decodeURIComponent(evolveDraftMatch[1]!);
+        const session = store.assertSessionWritable(sessionId);
+        const body = await readJson<{ task?: unknown }>(request);
+        const task = typeof body.task === "string" ? body.task.trim() : "";
+        if (!task || task.length > 8000) return sendError(response, 400, "Enter a task of 1–8000 characters.");
+        const model = store.getModel(store.resolveRuntimeSettings(sessionId).effective.modelId);
+        const apiToken = model && store.getModelApiToken(model.id);
+        if (!model || !apiToken) return sendError(response, 409, "Configure a model for this session to generate a draft.");
+        const abort = new AbortController();
+        response.once("close", () => abort.abort());
+        const draft = await draftEvolveDirection(store, session, model, apiToken, task, abort.signal);
+        if (!draft) return sendError(response, 502, "The model did not return a usable JSON draft.");
+        sendJson(response, 200, draft);
+        return;
+      }
+
       if (url.pathname === "/api/evolve/runs" && request.method === "GET") {
         await handleEvolveListRuns(response, evolutionStore, url.searchParams.get("sessionId"));
         return;
@@ -3800,6 +4256,13 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       }
       const artifactVersionProvenanceMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/artifact-versions\/([^/]+)\/provenance$/);
       if (artifactVersionProvenanceMatch && request.method === "GET") {
+        // The same answer the sibling content route gives: a version id that does not
+        // exist is a missing resource, not a server fault. The helper throws a plain
+        // Error for it, which the catch-all cannot classify, so it would answer 500 and
+        // log an unclassified_request_error for a stale link.
+        if (!store.getArtifactVersion(artifactVersionProvenanceMatch[1]!, artifactVersionProvenanceMatch[2]!)) {
+          return sendError(response, 404, "Artifact version not found");
+        }
         sendJson(response, 200, await artifactVersionProvenance(
           store,
           provenanceRecorder,
@@ -3811,12 +4274,24 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       }
       const artifactVersionDiffMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/artifact-versions\/([^/]+)\/diff$/);
       if (artifactVersionDiffMatch && request.method === "GET") {
+        // Both ids on this route name a version: the one being described and the
+        // `against` comparison base. Neither is a server fault when it does not exist,
+        // and the helper's plain Error for them reaches the catch-all as a 500.
+        const described = store.getArtifactVersion(artifactVersionDiffMatch[1]!, artifactVersionDiffMatch[2]!);
+        if (!described) return sendError(response, 404, "Artifact version not found");
+        const against = url.searchParams.get("against") ?? undefined;
+        // `against` is resolved inside the described artifact's own version list, so an
+        // id from another artifact, or one retention removed, is missing here as well.
+        if (against && !store.listArtifactVersions(artifactVersionDiffMatch[1]!, described.artifactId)
+          .some((version) => version.id === against)) {
+          return sendError(response, 404, "Artifact version not found");
+        }
         sendJson(response, 200, await artifactVersionDiff(
           store,
           provenanceRecorder,
           artifactVersionDiffMatch[1]!,
           artifactVersionDiffMatch[2]!,
-          url.searchParams.get("against") ?? undefined,
+          against,
         ));
         return;
       }
@@ -4245,9 +4720,22 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       if (filesMatch && request.method === "POST") {
         store.assertSessionWritable(filesMatch[1]!);
         const body = await readJson<UploadFileRequest>(request);
-        const target = resolveWorkspaceFile(store.workspacePath(filesMatch[1]!), body.path ?? "");
+        const workspaceRoot = store.workspacePath(filesMatch[1]!);
+        const target = resolveWorkspaceFile(workspaceRoot, body.path ?? "");
+        // A segment named for a Windows device is not a file there: the write
+        // targets the device, fails, or, for CON, goes to the console. The rule is
+        // checked on every host and on both separators, so the answer does not
+        // depend on which platform serves the request.
+        const deviceSegment = findWindowsReservedDeviceSegment(workspaceRoot, target);
+        if (deviceSegment) {
+          return sendError(
+            response,
+            400,
+            `Workspace path names the reserved Windows device "${deviceSegment}"; rename it before writing`,
+          );
+        }
         if (Buffer.byteLength(body.content ?? "") > 1_000_000) return sendError(response, 413, "File exceeds 1 MB");
-        await withWorkspaceMutation(new VersionStore(store.dataDir), store.workspacePath(filesMatch[1]!), async () => {
+        await withWorkspaceMutation(new VersionStore(store.dataDir), workspaceRoot, async () => {
           await mkdir(dirname(target), { recursive: true });
           await writeFile(target, body.content ?? "", "utf8");
           await provenanceRecorder.registerWorkspaceArtifact({
@@ -4255,7 +4743,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
             originMeta: { uploadedFilename: body.path },
             path: body.path,
             sessionId: filesMatch[1]!,
-            workspaceRoot: store.workspacePath(filesMatch[1]!),
+            workspaceRoot,
           });
         }, { kind: "user-file-write" });
         sendJson(response, 201, (await listWorkspaceFiles(store, filesMatch[1]!)).find((file) => file.path === body.path));
@@ -4378,16 +4866,30 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       else if (code === "EVOLVE_UNAVAILABLE") sendError(response, 503, message);
       else if (code === "ENOENT") sendError(response, 404, "File not found");
       else if (code === "PAYLOAD_TOO_LARGE" || code === "QUOTA_EXCEEDED") {
-        sendError(response, 413, error instanceof Error ? error.message : "Payload too large");
+        // A research package over the cap gets a stable code so both clients show
+        // localized copy; the generic branches keep their existing messages.
+        if ((error as { limitLabel?: string }).limitLabel === "Research package")
+          sendError(response, 413, RESEARCH_PACKAGE_TOO_LARGE_MESSAGE, "RESEARCH_PACKAGE_TOO_LARGE");
+        else sendError(response, 413, error instanceof Error ? error.message : "Payload too large");
       }
+      else if (code === RESEARCH_PACKAGE_TOO_LARGE_CODE || message === RESEARCH_PACKAGE_TOO_LARGE_MESSAGE)
+        sendError(response, 413, RESEARCH_PACKAGE_TOO_LARGE_MESSAGE, RESEARCH_PACKAGE_TOO_LARGE_CODE);
       else if (code === "CONFLICT") sendError(response, 409, message);
       else if (code === "UNSUPPORTED_MEDIA_TYPE") sendError(response, 415, message);
       else if (code === "SKILL_NOT_FOUND") sendError(response, 404, message);
       else if (code === "SKILL_CONFLICT" || code === "SKILL_READ_ONLY") sendError(response, 409, message);
+      // A package the caller handed over is wrong, whatever wording the
+      // validator chose: the code is the stable signal, not its prose.
+      else if (code === "SKILL_VALIDATION") sendError(response, 400, message);
       else if (code === "SKILL_LIBRARY_NOT_FOUND") sendError(response, 404, message);
       else if (code === "SKILL_LIBRARY_CONFLICT") sendError(response, 409, message);
       else if (code === "SKILL_LIBRARY_VALIDATION") sendError(response, 400, message);
       else if (code === "INVALID_WEB_SETTINGS") sendError(response, 400, message);
+      // A refused upload name is the caller's own input, whatever the wording of
+      // the guard that refused it: `sanitizeUploadFilename` tags every branch with
+      // this code, so the status follows the code rather than the prose of a
+      // message a later edit could reword.
+      else if (code === "INVALID_UPLOAD_PATH") sendError(response, 400, message);
       else if (/^(Project|Session|Proxy server|Provider|Model) not found(?:: .+)?$/.test(message)) sendError(response, 404, message);
       else if (/^(Execution|Transfer|Timer|Subagent) not found: .+$/.test(message)) sendError(response, 404, message);
       else if (message === "Session is archived and read-only") sendError(response, 409, message);
@@ -4428,6 +4930,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
     mcpBroker.close();
     webBroker.close();
     try {
+      await platform.customMcpServers.close();
       await mcpGateway.close?.();
     } catch (error) {
       apiLog.warn("mcp_shutdown_failed", { errorMessage: shortErrorMessage(error) });
@@ -4556,6 +5059,13 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
 }
 
 export async function startApiServer(config = loadServerConfig()): Promise<Server> {
+  // Resolve and validate the foot-guns before the socket exists. A bad
+  // `SCIENCE_AGENT_API_MAX_OLD_SPACE_MB` used to throw here, after `listen`, and
+  // the entry point's catch only logs and sets `process.exitCode`: the process
+  // kept the socket open, answered /api/health with 200, and never registered
+  // SIGTERM handling or the memory watch (#1105 F1).
+  const budget = heapBudget();
+  const trajectoryEvents = trajectoryMaxEvents();
   const server = createApiServer(config);
   await new Promise<void>((resolveListen, reject) => {
     server.once("error", reject);
@@ -4567,6 +5077,12 @@ export async function startApiServer(config = loadServerConfig()): Promise<Serve
   const address = server.address();
   const port = typeof address === "object" && address ? address.port : config.port;
   apiLog.info("service_started", { host: config.host, port });
+  // The budget and the sampled heap belong to the launched service, not to a
+  // server created in a test: a fixture gets no 30 s timeline and no boot line
+  // it did not ask for (#1063).
+  const stopMemoryWatch = createMemoryWatch({ log: apiLog, budget }).start();
+  server.once("close", stopMemoryWatch);
+  apiLog.info("api_trajectory_budget", { maxEvents: trajectoryEvents });
   console.log(`ScienceDiscovery listening on http://${config.host}:${port}`);
   for (const line of accessTokenBanner({ ...config, port: config.publicPort ?? port })) console.log(line);
   if (config.host !== "127.0.0.1" && config.host !== "localhost" && config.host !== "::1") {

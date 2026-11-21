@@ -15,10 +15,21 @@
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import type { CustomMcpServerConfig, CustomMcpServerDetails, McpCatalog, McpCatalogTool } from "@sciencediscovery/schema";
+import type {
+  CustomMcpServerConfig,
+  CustomMcpServerDetails,
+  McpCatalog,
+  McpCatalogTool,
+  ResolvedProxy,
+} from "@sciencediscovery/schema";
+import type { ConfigurationExternalOperation, ConfigurationExternalOutcome } from "../configuration/types.js";
 import type { McpSourceRegistry } from "@sciencediscovery/mcp-sources";
+import { shortErrorMessage } from "@sciencediscovery/operational-logging";
 
+import { apiLog } from "../logging.js";
 import { decryptSecretValue, encryptSecretValue, loadOrCreateModelSecretKey } from "../store/secrets.js";
+import { canonicalMcpEnvironmentName, mcpEnvironmentRemovalEffect } from "./runtime-environment.js";
+import { isMcpCredentialHeader, isMcpHeaderCredentialValue } from "./header-credential-policy.js";
 import { customMcpAdapter } from "./custom-adapter.js";
 import { loadExtensionsConfig, type ExtensionsConfigFile, type McpServerEntry } from "./extensions-config.js";
 import { McpOAuthManager, validateOAuthUrl } from "./oauth.js";
@@ -114,13 +125,25 @@ function entry(config: CustomMcpServerConfig): McpServerEntry {
   };
 }
 
+const CONFIGURATION_JOURNAL_CAPACITY = 10_000;
+const UNREADABLE_CONFIGURATION_JOURNAL_ROW = "MCP_CONFIGURATION_JOURNAL_ROW_UNREADABLE";
+
+function journalRowLabel(operationId: string): string {
+  return /^[a-f0-9-]{36}:[1-9][0-9]{0,15}:external_submit$/.test(operationId) ? operationId : "unrecognised-id";
+}
+
 export class CustomMcpServers {
   readonly oauth: McpOAuthManager;
   private configs: Record<string, CustomMcpServerConfig> = {};
+  private configurationOperations: Record<string, ConfigurationExternalOutcome> = {};
+  private pendingConfigurationDeletions: Record<string, string> = {};
+  private deletionJournal = false;
   private readonly checks = new Map<string, { checkedAt: string; tools: McpCatalogTool[]; error?: string; durationMs?: number }>();
   private key?: Buffer;
   private queue: Promise<unknown> = Promise.resolve();
   private readonly path: string;
+  private backgroundRefresh: Promise<void> = Promise.resolve();
+  private closed = false;
 
   constructor(
     private readonly dataDir: string,
@@ -128,9 +151,10 @@ export class CustomMcpServers {
     private readonly onIdsChanged: (ids: string[]) => void,
     private readonly refresh: () => Promise<unknown>,
     private readonly onRemoved: (id: string) => Promise<void> = async () => undefined,
+    private readonly probeProxy: (id: string) => ResolvedProxy | undefined = () => undefined,
   ) {
     this.path = resolve(dataDir, "custom-mcp-servers.enc");
-    this.oauth = new McpOAuthManager(dataDir, (id) => this.configs[id]);
+    this.oauth = new McpOAuthManager(dataDir, (id) => this.configs[id], probeProxy);
   }
 
   async load(): Promise<void> {
@@ -140,15 +164,37 @@ export class CustomMcpServers {
       const encrypted = await readFile(this.path, "utf8");
       const saved: unknown = JSON.parse(decryptSecretValue(this.key, "custom-mcp-servers", encrypted));
       if (!object(saved)) throw new Error("Invalid saved MCP configuration");
-      for (const [id, value] of Object.entries(saved)) {
+      const envelope = ["sciencediscovery-custom-mcp-v2", "sciencediscovery-custom-mcp-v3"].includes(String(saved.format)) ? saved : undefined;
+      this.deletionJournal = saved.format === "sciencediscovery-custom-mcp-v3";
+      const servers = envelope ? envelope.servers : saved;
+      if (!object(servers) || envelope && !object(envelope.operations)) throw new Error("Invalid saved MCP configuration envelope");
+      if (envelope) for (const [operationId, value] of Object.entries(envelope.operations as Record<string, unknown>)) {
+        const outcome = this.configurationOperationFromSaved(operationId, value);
+        if (outcome) this.configurationOperations[operationId] = outcome;
+      }
+      if (Object.keys(this.configurationOperations).length > CONFIGURATION_JOURNAL_CAPACITY) throw new Error("MCP configuration operation journal exceeds capacity");
+      for (const [id, value] of Object.entries(servers)) {
         if (!/^custom-[a-f0-9]{12}$/.test(id)) throw new Error("Invalid saved MCP server id");
         this.configs[id] = normalizeCustomMcpConfig(value);
+      }
+      if (this.deletionJournal) {
+        if (!object(envelope?.pendingDeletions)) throw new Error("Invalid pending MCP deletions");
+        for (const [operationId, id] of Object.entries(envelope.pendingDeletions)) {
+          const outcome = this.configurationOperations[operationId];
+          const recoverable = outcome?.status === "applied" || outcome?.status === "rejected" && outcome.code === UNREADABLE_CONFIGURATION_JOURNAL_ROW;
+          if (typeof id !== "string" || !/^custom-[a-f0-9]{12}$/u.test(id) || this.configs[id] || !recoverable) {
+            console.warn(`mcp_configuration_pending_deletion_skipped: ${journalRowLabel(operationId)}`);
+            continue;
+          }
+          this.pendingConfigurationDeletions[operationId] = id;
+        }
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
     await this.oauth.load(this.key);
     this.sync();
+    for (const operationId of Object.keys(this.pendingConfigurationDeletions)) { await this.finishConfigurationDeletion(operationId); }
   }
 
   private sync(): void {
@@ -172,6 +218,14 @@ export class CustomMcpServers {
     return createHmac("sha256", this.key).update(JSON.stringify([
       sourceIds ? sourceIds.slice().sort().map(id => [id, this.transportConfig().servers[id] ?? null]) : this.transportConfig().signature,
       this.oauth.configurationRevision(sourceIds),
+    ])).digest("hex");
+  }
+
+  /** 以配置及用户授权绑定校验发现结果，允许发现期间正常续期令牌。 */
+  discoveryRevision(): string {
+    if (!this.key) return "not_loaded";
+    return createHmac("sha256", this.key).update(JSON.stringify([
+      this.transportConfig().signature, this.oauth.discoveryRevision(),
     ])).digest("hex");
   }
 
@@ -224,13 +278,305 @@ export class CustomMcpServers {
     return result;
   }
 
-  private async persist(next: Record<string, CustomMcpServerConfig>): Promise<void> {
+  /** Queue discovery separately from mutations; one failed refresh cannot stop later work. */
+  private scheduleRefresh(reason: string): void {
+    if (this.closed) return;
+    this.backgroundRefresh = this.backgroundRefresh
+      .then(async () => {
+        if (this.closed) return;
+        const configs = Object.entries(this.configs).filter(([, config]) => config.enabled);
+        const started = Date.now();
+        let authorization: string | undefined;
+        try {
+          authorization = this.oauth.discoveryRevision();
+          await this.refresh();
+        } catch (error) {
+          let message = error instanceof Error ? error.message : String(error);
+          for (const [, config] of configs) message = this.cleanError(config, message);
+          message = shortErrorMessage(message);
+          // 错误处理仅检查内存绑定，不能再次读取可能已损坏的扩展配置。
+          if (authorization !== undefined && authorization === this.oauth.discoveryRevision()) {
+            for (const [id, config] of configs) {
+              if (this.configs[id] !== config) continue;
+              this.checks.set(id, { checkedAt: new Date().toISOString(), tools: [], error: message, durationMs: Date.now() - started });
+            }
+            this.sync();
+          }
+          apiLog.warn("custom_mcp_background_refresh_failed", {
+            errorMessage: message, reason, durationMs: Date.now() - started,
+            serverIds: configs.map(([id]) => id),
+          });
+        }
+      })
+      .catch(() => {
+        // 状态同步或日志自身失败也不能让保存的队列保持拒绝状态。
+        try { apiLog.warn("custom_mcp_background_error_handler_failed", { reason }); } catch { /* 日志故障不影响后续刷新。 */ }
+      });
+  }
+
+  /** Stop scheduling discovery and drain the active refresh before transport shutdown. */
+  async close(): Promise<void> {
+    this.closed = true;
+    await this.queue;
+    await this.backgroundRefresh;
+  }
+
+  private async persist(next: Record<string, CustomMcpServerConfig>, operations = this.configurationOperations, invalidateChecks: readonly string[] = [], pendingDeletions = this.pendingConfigurationDeletions): Promise<void> {
     if (!this.key) throw new Error("MCP storage is not initialized");
     const temporary = `${this.path}.tmp`;
-    await writeFile(temporary, encryptSecretValue(this.key, "custom-mcp-servers", JSON.stringify(next)), { mode: 0o600 });
+    const deletionJournal = this.deletionJournal || Object.keys(pendingDeletions).length > 0;
+    const payload = Object.keys(operations).length ? { format: deletionJournal ? "sciencediscovery-custom-mcp-v3" : "sciencediscovery-custom-mcp-v2", servers: next, operations, ...(deletionJournal ? { pendingDeletions } : {}) } : next;
+    await writeFile(temporary, encryptSecretValue(this.key, "custom-mcp-servers", JSON.stringify(payload)), { mode: 0o600 });
     await rename(temporary, this.path);
     this.configs = next;
+    for (const id of invalidateChecks) { this.checks.delete(id); }
+    this.configurationOperations = operations;
+    this.pendingConfigurationDeletions = pendingDeletions;
+    this.deletionJournal = deletionJournal;
     this.sync();
+  }
+
+  configurationDeletion(serverId = "") {
+    const source = this.configurationMetadata(serverId);
+    return { ...source, version: serverId && !source.current ? this.deletedConfigurationRevision(serverId) : source.version };
+  }
+
+  private deletedConfigurationRevision(id: string): string {
+    if (!this.key) throw new Error("MCP storage is not initialized");
+    return createHmac("sha256", this.key).update(JSON.stringify(["mcp-deleted-v1", id])).digest("hex");
+  }
+
+  /** Only local, convergent cleanup. Never refresh/probe or replay an invocation. */
+  private async finishConfigurationDeletion(operationId: string): Promise<void> {
+    const id = this.pendingConfigurationDeletions[operationId];
+    if (!id) return;
+    if (this.configs[id]) throw new Error("Deleted MCP identity was replaced before cleanup");
+    this.registry.remove(id); this.checks.delete(id);
+    await this.oauth.clear(id);
+    await this.onRemoved(id);
+    const pending = { ...this.pendingConfigurationDeletions }; delete pending[operationId];
+    await this.persist(this.configs, this.configurationOperations, [], pending);
+  }
+
+  submitConfigurationDeletion(operation: ConfigurationExternalOperation, serverId: string, expectedVersion: string): Promise<ConfigurationExternalOutcome> {
+    return this.mutate(async () => {
+      const prior = this.operationOutcome(operation);
+      if (prior) { await this.finishConfigurationDeletion(operation.operationId); if (prior.status === "applied") this.sync(); return prior; }
+      if (!/^custom-[a-f0-9]{12}$/u.test(serverId) || !this.configs[serverId]) return this.recordConfigurationOutcome({ ...operation, status: "rejected", code: "CONFIGURATION_RESOURCE_UNAVAILABLE" });
+      if (this.configurationMetadataRevision(serverId) !== expectedVersion) return this.recordConfigurationOutcome({ ...operation, status: "rejected", code: "RESOURCE_VERSION_CONFLICT" });
+      const capacityRejection = this.configurationJournalRejection(operation);
+      if (capacityRejection) return capacityRejection;
+      const outcome: ConfigurationExternalOutcome = { ...operation, status: "applied", resourceVersions: { mcpMetadata: this.deletedConfigurationRevision(serverId) } };
+      const next = { ...this.configs }; delete next[serverId];
+      await this.persist(next, { ...this.configurationOperations, [operation.operationId]: outcome }, [serverId], { ...this.pendingConfigurationDeletions, [operation.operationId]: serverId });
+      await this.finishConfigurationDeletion(operation.operationId);
+      return structuredClone(outcome);
+    });
+  }
+
+
+  /** Finite safe catalog; transport values and credentials never leave this service. */
+  configurationMetadata(serverId?: string) {
+    const items = Object.entries(this.configs).map(([id, config]) => ({ id, name: config.name, description: config.description, transport: config.transport, enabled: config.enabled }));
+    return { items, current: items.find(item => item.id === serverId), version: serverId ? this.configurationMetadataRevision(serverId) : undefined };
+  }
+
+  configurationTimeout(serverId?: string) {
+    const source = this.configurationMetadata(serverId);
+    const items = source.items.map(item => ({ ...item, timeoutSeconds: this.configs[item.id]?.timeoutSeconds ?? 60 }));
+    return { items, current: items.find(item => item.id === serverId), version: source.version };
+  }
+
+  /** Header names/counts only. Values and endpoint/execution details never leave the authority. */
+  configurationHeaderRemoval(target = "") {
+    let serverId = "", headerName = "";
+    if (target) {
+      try { const parsed: unknown = JSON.parse(target); if (Array.isArray(parsed) && parsed.length === 2 && parsed.every(value => typeof value === "string")) { serverId = String(parsed[0]); headerName = String(parsed[1]).toLowerCase(); } } catch { /* Unbound discovery has no selected header. */ }
+    }
+    const items = Object.entries(this.configs).filter(([, config]) => config.transport !== "stdio").map(([id, config]) => {
+      const counts = new Map<string, number>(); for (const name of Object.keys(config.headers)) { counts.set(name.toLowerCase(), (counts.get(name.toLowerCase()) ?? 0) + 1); }
+      return { id, name: config.name, transport: config.transport, enabled: config.enabled, headers: [...counts].filter(([name]) => name.length <= 256 && !/[\u0000-\u001f\u007f]/u.test(name)).map(([name, aliases]) => ({ name, aliases })).sort((a, b) => a.name.localeCompare(b.name)) };
+    });
+    const current = items.find(item => item.id === serverId);
+    return { items, current, header: current?.headers.find(item => item.name === headerName), version: serverId ? this.configurationMetadataRevision(serverId) : undefined };
+  }
+
+  submitConfigurationHeaderRemoval(operation: ConfigurationExternalOperation, target: string, expectedVersion: string): Promise<ConfigurationExternalOutcome> {
+    return this.mutate(async () => {
+      const prior = this.operationOutcome(operation); if (prior) { if (prior.status === "applied") this.sync(); return prior; }
+      const reject = (code: string) => this.recordConfigurationOutcome({ ...operation, status: "rejected", code });
+      const source = this.configurationHeaderRemoval(target), selected = source.current;
+      if (!selected || !source.header) return reject("CONFIGURATION_RESOURCE_UNAVAILABLE");
+      if (source.version !== expectedVersion) return reject("RESOURCE_VERSION_CONFLICT");
+      const previous = this.configs[selected.id]; if (!previous) return reject("CONFIGURATION_RESOURCE_UNAVAILABLE");
+      const selectedName = source.header.name;
+      const candidate = normalizeCustomMcpConfig({ ...previous, headers: Object.fromEntries(Object.entries(previous.headers).filter(([name]) => name.toLowerCase() !== selectedName)) }, previous);
+      return this.recordConfigurationOutcome({ ...operation, status: "applied", resourceVersions: { mcpMetadata: this.configurationMetadataRevision(selected.id, candidate) } }, { ...this.configs, [selected.id]: candidate }, [selected.id]);
+    });
+  }
+
+  /** Safe recipient identity only: a saved path/query may itself contain secrets. */
+  configurationHeaderCredential(target = "") {
+    let serverId = "", headerName = "";
+    try { const parsed: unknown = JSON.parse(target); if (Array.isArray(parsed) && parsed.length >= 2 && parsed.slice(0, 2).every(value => typeof value === "string")) { serverId = String(parsed[0]); headerName = String(parsed[1]).toLowerCase(); } } catch { /* Unbound collection has no recipient. */ }
+    const source = this.configurationHeaderRemoval(JSON.stringify([serverId, headerName]));
+    const items = source.items.filter(item => this.configs[item.id]?.authMode === "headers").map(item => ({ ...item, headers: item.headers.filter(header => isMcpCredentialHeader(header.name)) })).filter(item => item.headers.length > 0);
+    const current = items.find(item => item.id === serverId), header = current?.headers.find(item => item.name === headerName);
+    const binding = JSON.stringify([serverId, headerName, source.version ?? ""]);
+    let destination: { endpointTarget: string; host: string; origin: string; classification: "loopback" | "private_network" | "public_https" | "public_http" } | undefined;
+    const selectedConfig = current ? this.configs[current.id] : undefined;
+    if (current && header && selectedConfig && this.key) {
+      const url = new URL(selectedConfig.url), host = url.hostname.toLowerCase().replace(/^\[|\]$/gu, ""), octets = host.split(".").map(Number);
+      const ipv4 = /^\d+\.\d+\.\d+\.\d+$/u.test(host) && octets.every(value => value >= 0 && value <= 255), first = octets[0] ?? -1, second = octets[1] ?? -1;
+      const loopback = host === "localhost" || host.endsWith(".localhost") || host === "::1" || ipv4 && first === 127 || /^::ffff:7f[0-9a-f]{2}:/iu.test(host);
+      const privateNetwork = ipv4 && (first === 10 || first === 172 && second >= 16 && second <= 31 || first === 192 && second === 168 || first === 169 && second === 254 || first === 0) || /^(?:f[cd][0-9a-f]{2}:|fe[89ab][0-9a-f]:)/iu.test(host);
+      destination = { endpointTarget: createHmac("sha256", this.key).update(JSON.stringify(["mcp-header-credential-v1", binding])).digest("hex"), host: url.host, origin: url.origin,
+        classification: loopback ? "loopback" : privateNetwork ? "private_network" : url.protocol === "https:" ? "public_https" : "public_http" };
+    }
+    return { items, current, header, version: source.version, target: binding, destination };
+  }
+
+  submitConfigurationHeaderCredential(operation: ConfigurationExternalOperation, target: string, expectedVersion: string, secret: unknown): Promise<ConfigurationExternalOutcome> {
+    return this.mutate(async () => {
+      const prior = this.operationOutcome(operation); if (prior) { if (prior.status === "applied") { this.sync(); } return prior; }
+      const reject = (code: string) => this.recordConfigurationOutcome({ ...operation, status: "rejected", code }), source = this.configurationHeaderCredential(target), selected = source.current;
+      if (!selected || !source.header || !source.destination) { return reject("CONFIGURATION_RESOURCE_UNAVAILABLE"); }
+      if (source.version !== expectedVersion || source.target !== target) { return reject("RESOURCE_VERSION_CONFLICT"); }
+      if (source.destination.classification === "public_http") { return reject("ENDPOINT_CREDENTIAL_INSECURE"); }
+      if (!isMcpHeaderCredentialValue(secret)) { return reject("INVALID_CONFIGURATION_CREDENTIAL"); }
+      const previous = this.configs[selected.id]; if (!previous) { return reject("CONFIGURATION_RESOURCE_UNAVAILABLE"); }
+      const selectedName = source.header.name, headers = { ...Object.fromEntries(Object.entries(previous.headers).filter(([name]) => name.toLowerCase() !== selectedName)), [selectedName]: secret };
+      const candidate = normalizeCustomMcpConfig({ ...previous, headers }, previous);
+      return this.recordConfigurationOutcome({ ...operation, status: "applied", resourceVersions: { mcpMetadata: this.configurationMetadataRevision(selected.id, candidate) } }, { ...this.configs, [selected.id]: candidate }, [selected.id]);
+    });
+  }
+
+  configurationEnvironmentRemoval(target = "") {
+    let serverId = "", envName = "";
+    if (target) {
+      try { const parsed: unknown = JSON.parse(target); if (Array.isArray(parsed) && parsed.length === 2 && parsed.every(value => typeof value === "string")) { serverId = String(parsed[0]); envName = canonicalMcpEnvironmentName(String(parsed[1])); } } catch { /* No selected stored variable. */ }
+    }
+    const items = Object.entries(this.configs).filter(([, config]) => config.transport === "stdio").map(([id, config]) => {
+      const counts = new Map<string, number>(); for (const key of Object.keys(config.env)) { if (/^[A-Za-z_][A-Za-z0-9_]{0,255}$/u.test(key)) { const name = canonicalMcpEnvironmentName(key); counts.set(name, (counts.get(name) ?? 0) + 1); } }
+      return { id, name: config.name, transport: config.transport, enabled: config.enabled, variables: [...counts].map(([name, aliases]) => ({ name, aliases, effect: mcpEnvironmentRemovalEffect(name) })).sort((a, b) => a.name.localeCompare(b.name)) };
+    });
+    const current = items.find(item => item.id === serverId);
+    return { items, current, variable: current?.variables.find(item => item.name === envName), caseSensitive: process.platform !== "win32", version: serverId ? this.configurationEnvironmentRevision(serverId) : undefined };
+  }
+
+  private configurationEnvironmentRevision(serverId: string, config = this.configs[serverId]): string {
+    if (!this.key) throw new Error("MCP storage is not initialized");
+    return createHmac("sha256", this.key).update(JSON.stringify(["mcp-env-removal-v1", process.platform, this.configurationMetadataRevision(serverId, config)])).digest("hex");
+  }
+
+  submitConfigurationEnvironmentRemoval(operation: ConfigurationExternalOperation, target: string, expectedVersion: string): Promise<ConfigurationExternalOutcome> {
+    return this.mutate(async () => {
+      const prior = this.operationOutcome(operation); if (prior) { if (prior.status === "applied") this.sync(); return prior; }
+      const reject = (code: string) => this.recordConfigurationOutcome({ ...operation, status: "rejected", code }), source = this.configurationEnvironmentRemoval(target), selected = source.current;
+      if (!selected || !source.variable) return reject("CONFIGURATION_RESOURCE_UNAVAILABLE");
+      if (source.version !== expectedVersion) return reject("RESOURCE_VERSION_CONFLICT");
+      const previous = this.configs[selected.id]; if (!previous) return reject("CONFIGURATION_RESOURCE_UNAVAILABLE");
+      const selectedName = source.variable.name;
+      const candidate = normalizeCustomMcpConfig({ ...previous, env: Object.fromEntries(Object.entries(previous.env).filter(([name]) => canonicalMcpEnvironmentName(name) !== selectedName)) }, previous);
+      return this.recordConfigurationOutcome({ ...operation, status: "applied", resourceVersions: { mcpMetadata: this.configurationEnvironmentRevision(selected.id, candidate) } }, { ...this.configs, [selected.id]: candidate }, [selected.id]);
+    });
+  }
+
+  private configurationMetadataRevision(serverId: string, config = this.configs[serverId]): string {
+    if (!this.key) throw new Error("MCP storage is not initialized");
+    return createHmac("sha256", this.key).update(JSON.stringify([serverId, config ?? null, this.oauth.configurationRevision([serverId])])).digest("hex");
+  }
+
+  /** A journal row is an idempotency fence, not the server list. One unreadable
+   * row must not block startup. A readable identity stays rejected so the same
+   * operation cannot be applied again; an identity this build cannot name is
+   * dropped because nothing here can replay it. */
+  private configurationOperationFromSaved(operationId: string, value: unknown): ConfigurationExternalOutcome | undefined {
+    if (!object(value)) {
+      console.warn(`mcp_configuration_journal_row_skipped: ${journalRowLabel(operationId)}`);
+      return undefined;
+    }
+    const bindingDigest = typeof value.bindingDigest === "string" ? value.bindingDigest : "";
+    try { this.validateConfigurationOperation({ operationId, bindingDigest }); } catch {
+      console.warn(`mcp_configuration_journal_row_skipped: ${journalRowLabel(operationId)}`);
+      return undefined;
+    }
+    if (value.operationId !== operationId) {
+      console.warn(`mcp_configuration_journal_row_skipped: ${operationId}`);
+      return undefined;
+    }
+    if (value.status === "rejected" && typeof value.code === "string" && /^[A-Z][A-Z0-9_]{2,99}$/.test(value.code)) {
+      return { operationId, bindingDigest, status: "rejected", code: value.code };
+    }
+    const versions = value.resourceVersions;
+    if (value.status === "applied" && object(versions) && Object.keys(versions).length === 1 && typeof versions.mcpMetadata === "string" && /^[a-f0-9]{64}$/.test(versions.mcpMetadata)) {
+      return { operationId, bindingDigest, status: "applied", resourceVersions: { mcpMetadata: versions.mcpMetadata } };
+    }
+    console.warn(`mcp_configuration_journal_row_unreadable: ${operationId}`);
+    return { operationId, bindingDigest, status: "rejected", code: UNREADABLE_CONFIGURATION_JOURNAL_ROW };
+  }
+
+  private validateConfigurationOperation(operation: ConfigurationExternalOperation): void {
+    if (!/^[a-f0-9-]{36}:[1-9][0-9]{0,15}:external_submit$/.test(operation.operationId) || !/^sha256:[a-f0-9]{64}$/.test(operation.bindingDigest)) throw new Error("Invalid MCP configuration operation identity");
+  }
+
+  private operationOutcome(operation: ConfigurationExternalOperation): ConfigurationExternalOutcome | undefined {
+    this.validateConfigurationOperation(operation);
+    const prior = this.configurationOperations[operation.operationId];
+    if (prior && prior.bindingDigest !== operation.bindingDigest) throw new Error("MCP configuration operation binding mismatch");
+    return prior ? structuredClone(prior) : undefined;
+  }
+
+  private configurationJournalRejection(operation: ConfigurationExternalOperation): ConfigurationExternalOutcome | undefined {
+    if (Object.keys(this.configurationOperations).length < CONFIGURATION_JOURNAL_CAPACITY) return undefined;
+    // Receipts are never evicted, so an unknown operation stays fenced at capacity across restarts.
+    return { operationId: operation.operationId, bindingDigest: operation.bindingDigest, status: "rejected", code: "MCP_CONFIGURATION_JOURNAL_FULL" };
+  }
+
+  private async recordConfigurationOutcome(outcome: ConfigurationExternalOutcome, configs = this.configs, invalidateChecks: readonly string[] = []): Promise<ConfigurationExternalOutcome> {
+    const capacityRejection = this.configurationJournalRejection(outcome);
+    if (capacityRejection) return capacityRejection;
+    await this.persist(configs, { ...this.configurationOperations, [outcome.operationId]: outcome }, invalidateChecks);
+    return structuredClone(outcome);
+  }
+
+  submitConfigurationMetadata(operation: ConfigurationExternalOperation, serverId: string, expectedVersion: string, values: unknown): Promise<ConfigurationExternalOutcome> {
+    return this.submitConfigurationFields(operation, serverId, expectedVersion, values, ["name", "description"]);
+  }
+
+  submitConfigurationTimeout(operation: ConfigurationExternalOperation, serverId: string, expectedVersion: string, values: unknown): Promise<ConfigurationExternalOutcome> {
+    return this.submitConfigurationFields(operation, serverId, expectedVersion, values, ["timeoutSeconds"]);
+  }
+
+  submitConfigurationAvailability(operation: ConfigurationExternalOperation, serverId: string, expectedVersion: string, values: unknown): Promise<ConfigurationExternalOutcome> {
+    return this.submitConfigurationFields(operation, serverId, expectedVersion, values, ["enabled"]);
+  }
+
+  private submitConfigurationFields(operation: ConfigurationExternalOperation, serverId: string, expectedVersion: string, values: unknown, fields: readonly string[]): Promise<ConfigurationExternalOutcome> {
+    return this.mutate(async () => {
+      const prior = this.operationOutcome(operation); if (prior) { if (prior.status === "applied") this.sync(); return prior; }
+      const reject = (code: string) => this.recordConfigurationOutcome({ ...operation, status: "rejected", code });
+      const previous = /^custom-[a-f0-9]{12}$/.test(serverId) && Object.hasOwn(this.configs, serverId) ? this.configs[serverId] : undefined;
+      if (!previous) return reject("CONFIGURATION_RESOURCE_UNAVAILABLE");
+      if (this.configurationMetadataRevision(serverId) !== expectedVersion) return reject("RESOURCE_VERSION_CONFLICT");
+      if (!object(values) || !Object.keys(values).length || Object.keys(values).some(key => !fields.includes(key))) return reject("INVALID_CONFIGURATION_INPUT");
+      if (fields.includes("timeoutSeconds") && (typeof values.timeoutSeconds !== "number" || !Number.isInteger(values.timeoutSeconds) || values.timeoutSeconds < 1 || values.timeoutSeconds > 600)) return reject("INVALID_CONFIGURATION_INPUT");
+      if (fields.includes("enabled") && typeof values.enabled !== "boolean") return reject("INVALID_CONFIGURATION_INPUT");
+      let candidate: CustomMcpServerConfig;
+      try { candidate = normalizeCustomMcpConfig({ ...previous, ...values }, previous); } catch { return reject("INVALID_CONFIGURATION_INPUT"); }
+      if (Object.entries(this.configs).some(([id, item]) => id !== serverId && item.name.toLowerCase() === candidate.name.toLowerCase())) return reject("MCP_METADATA_NAME_CONFLICT");
+      const next = { ...this.configs, [serverId]: candidate };
+      return this.recordConfigurationOutcome({ ...operation, status: "applied", resourceVersions: { mcpMetadata: this.configurationMetadataRevision(serverId, candidate) } }, next);
+    });
+  }
+
+  /** Absence becomes a durable tombstone, fencing a delayed old submit. */
+  resolveConfigurationMetadata(operation: ConfigurationExternalOperation): Promise<ConfigurationExternalOutcome> {
+    return this.mutate(async () => {
+      const prior = this.operationOutcome(operation);
+      if (prior) { await this.finishConfigurationDeletion(operation.operationId); if (prior.status === "applied") this.sync(); return prior; }
+      return this.recordConfigurationOutcome({ ...operation, status: "rejected", code: "EXTERNAL_OPERATION_NOT_SAVED" });
+    });
   }
 
   save(value: unknown, id?: string): Promise<CustomMcpServerDetails> {
@@ -244,7 +590,7 @@ export class CustomMcpServers {
       this.checks.delete(serverId);
       await this.persist({ ...this.configs, [serverId]: config });
       if (previous && JSON.stringify([previous.url, previous.transport, previous.authMode, previous.oauth]) !== JSON.stringify([config.url, config.transport, config.authMode, config.oauth])) await this.oauth.clear(serverId);
-      await this.refresh();
+      this.scheduleRefresh("save");
       return this.list().find((item) => item.id === serverId)!;
     });
   }
@@ -259,7 +605,7 @@ export class CustomMcpServers {
       this.registry.remove(id);
       this.checks.delete(id);
       await this.onRemoved(id);
-      await this.refresh();
+      this.scheduleRefresh("remove");
     });
   }
 
@@ -281,27 +627,33 @@ export class CustomMcpServers {
     });
   }
 
+  private async probe(id: string): Promise<CustomMcpServerDetails> {
+    const config = this.configs[id];
+    if (!config) throw new Error("MCP server not found");
+    // A separate client can probe a disabled server without enabling it for any Agent.
+    const { McpNodeClient } = await import("./node-client.js");
+    const probe = new McpNodeClient(() => ({ path: undefined, signature: id, servers: { [id]: { ...entry(config), enabled: true } } }), this.oauth);
+    const started = Date.now();
+    try {
+      const proxy = this.probeProxy(id);
+      const catalog = proxy ? await probe.reload({ [id]: proxy }) : await probe.catalog();
+      const server = catalog.servers[0]!;
+      let error = server.error ? this.cleanError(config, server.error) : undefined;
+      let tools = error ? [] : server.tools;
+      try { customMcpAdapter(id, config, tools); } catch { error = "The server returned an unsupported tool input schema"; tools = []; }
+      this.checks.set(id, { checkedAt: catalog.loadedAt, durationMs: Date.now() - started, tools, ...(error ? { error } : {}) });
+      this.sync();
+      const check = this.checks.get(id);
+      if (check) check.durationMs = Date.now() - started;
+      return this.list().find((item) => item.id === id)!;
+    } finally { await probe.close(); }
+  }
+
   test(id: string): Promise<CustomMcpServerDetails> {
     return this.mutate(async () => {
-      const config = this.configs[id];
-      if (!config) throw new Error("MCP server not found");
-      // A separate client can probe a disabled server without enabling it for any Agent.
-      const { McpNodeClient } = await import("./node-client.js");
-      const probe = new McpNodeClient(() => ({ path: undefined, signature: id, servers: { [id]: { ...entry(config), enabled: true } } }), this.oauth);
-      const started = Date.now();
-      try {
-        const catalog = await probe.catalog();
-        const server = catalog.servers[0]!;
-        let error = server.error ? this.cleanError(config, server.error) : undefined;
-        let tools = error ? [] : server.tools;
-        try { customMcpAdapter(id, config, tools); } catch { error = "The server returned an unsupported tool input schema"; tools = []; }
-        this.checks.set(id, { checkedAt: catalog.loadedAt, durationMs: Date.now() - started, tools, ...(error ? { error } : {}) });
-        this.sync();
-        if (config.enabled) await this.refresh();
-        const check = this.checks.get(id);
-        if (check) check.durationMs = Date.now() - started;
-        return this.list().find((item) => item.id === id)!;
-      } finally { await probe.close(); }
+      const result = await this.probe(id);
+      if (this.configs[id]?.enabled) this.scheduleRefresh("test");
+      return result;
     });
   }
 }

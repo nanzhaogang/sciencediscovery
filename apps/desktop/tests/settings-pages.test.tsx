@@ -42,7 +42,8 @@ import { RunnerSection } from "../src/views/settings/RemoteHosts.js";
 import { NetworkSettings } from "../src/views/settings/NetworkSettings.js";
 import { RuntimeSettings } from "../src/views/settings/RuntimeSettings.js";
 import { SkillForm } from "../src/views/settings/SkillForm.js";
-import { skillMeta, SkillsSettings } from "../src/views/settings/SkillsSettings.js";
+import { SkillsSettings } from "../src/views/settings/SkillsSettings.js";
+import { skillMeta } from "../src/views/settings/skill-meta.js";
 import { AbilityPicker } from "../src/views/settings/system/AbilityPicker.js";
 import { McpServers } from "../src/views/settings/system/McpServers.js";
 import { MemorySettings } from "../src/views/settings/system/MemorySettings.js";
@@ -78,11 +79,11 @@ const noConfirm = () => {};
 const loading = "正在读取…";
 
 describe("the settings tree", () => {
-  it("keeps the original desktop groups, plus 科学记忆, MCP, 专家 and 超时", () => {
+  it("includes the desktop groups and migrated Runner, quota, search, proxy and Idea Tree pages", () => {
     assert.deepEqual(Object.values(TEXT.settings.system.categories), ["系统", "智能", "连接", "工作区"]);
     assert.deepEqual(
       Object.values(TEXT.settings.system.groups).map((group) => group.label),
-      ["通用", "科学记忆", "模型", "技能", "MCP 服务器", "专家", "网络", "远程", "超时"],
+      ["通用", "科学记忆", "模型", "模型用量", "技能", "MCP 服务器", "专家", "沙箱网络", "运行环境", "运行配额", "联网搜索", "网络代理", "超时", "导出记录", "Idea Tree"],
     );
   });
 });
@@ -149,7 +150,7 @@ describe("the add-model form", () => {
     assert.ok(!markup.includes("预设覆盖常见的国内外提供方"), "the preset hint is back");
   });
 
-  it("puts 测试连接, 保存 and 取消 side by side, in that order", () => {
+  it("puts 取消 on the far side, with 测试连接 and 保存 together on the right", () => {
     const markup = form(noConfirm);
     const test = markup.indexOf(`>${TEXT.settings.model.test}</button>`);
     const save = markup.indexOf(`>${TEXT.settings.model.save}</button>`);
@@ -157,7 +158,9 @@ describe("the add-model form", () => {
     assert.ok(test >= 0, "no 测试连接 button");
     assert.ok(save >= 0, "no 保存 button");
     assert.ok(cancel >= 0, "no 取消 button");
-    assert.ok(test < save && save < cancel, "the buttons are out of order");
+    // 取消 is the way out, so it does not sit between the two actions that
+    // commit the form; the primary stays rightmost.
+    assert.ok(cancel < test && test < save, "the buttons are out of order");
   });
 
   it("omits 取消 where the caller has its own way back", () => {
@@ -237,10 +240,17 @@ describe("the settings directory", () => {
 
   it("has no footer: every page writes on the press", () => {
     // 通用, 模型, 技能, MCP, 专家, 网络 and 远程 all write as they are changed,
-    // and 超时 now commits its own fields; a shared save bar would only ever
-    // have been disabled. 设置 is left through the rail's 会话 or Escape.
+    // 超时 now commits its own fields, and 导出记录 only reveals or forgets a
+    // row; a shared save bar would only ever have been disabled. 设置 is left
+    // through the rail's 会话 or Escape.
     assert.ok(!markup.includes("system-config-footer"), "the footer is back");
-    assert.ok(!markup.includes(TEXT.settings.system.save), "a footer save button is back");
+    // The word 保存 is no longer a reliable proxy: the directory's tooltips
+    // carry "本机保存过的研究包". What must not come back is a button whose
+    // label is the save action.
+    const labelled = [...markup.matchAll(/<button[^>]*>(.*?)<\/button>/gs)]
+      .map((match) => match[1]!.replace(/<[^>]*>/g, "").trim())
+      .filter((text) => text === TEXT.settings.system.save);
+    assert.deepEqual(labelled, [], "a footer save button is back");
     assert.ok(!markup.includes("保存并关闭"), "a save-and-close button is back");
   });
 });
@@ -527,7 +537,7 @@ describe("the specialist form", () => {
 describe("the add-skill form", () => {
   const form = () =>
     renderToStaticMarkup(
-      <SkillForm client={client} onCancel={noConfirm} onSaved={noConfirm} />,
+      <SkillForm client={client} onSaved={noConfirm} />,
     );
 
   it("asks for the authored fields and starts with 创建 disabled", () => {
@@ -554,12 +564,16 @@ describe("the add-skill form", () => {
     assert.match(markup, /disabled=""[^>]*>创建<\/button>/, "创建 is enabled with an empty form");
   });
 
-  it("is what 新增技能 opens", () => {
-    const markup = renderToStaticMarkup(
-      <SkillsSettings adding client={client} onAddingChange={noConfirm} />,
+  it("is offered by the list's 添加技能 menu, not opened by it", () => {
+    // The menu's entries are drawn on press, so the static page carries the
+    // one control; that pressing 从零开始写 lands on this form is the dynamic
+    // check in skills-import-edit.test.tsx.
+    const markup = renderToStaticMarkup(<SkillsSettings client={client} />);
+    assert.ok(markup.includes(TEXT.settings.skills.addMenu.label), "the list has no 添加技能");
+    assert.ok(
+      !markup.includes(TEXT.settings.skills.namePlaceholder),
+      "the authoring form is on the page before 从零开始写 was chosen",
     );
-    assert.ok(markup.includes(TEXT.settings.skills.add), "the modal is not labelled 新增技能");
-    assert.ok(markup.includes(TEXT.settings.skills.namePlaceholder), "the authoring form is not open");
   });
 });
 
@@ -588,7 +602,7 @@ describe("the skill card", () => {
       jiuwenSwarmSkills: [{ name: "xlsx", description: "Read spreadsheets", enabled: true, source: "builtin" }],
     });
     const markup = renderToStaticMarkup(
-      <SkillsSettings adding={false} client={sourceClient} onAddingChange={noConfirm} />,
+      <SkillsSettings client={sourceClient} />,
     );
     for (const label of ["SD 内置", "JiuwenSwarm 内置", "自建"]) {
       assert.ok(markup.includes(label), `The collapsed list does not identify ${label}`);
@@ -607,7 +621,7 @@ describe("the skill card", () => {
     try {
       for (const language of ["en", "zh-CN"] as const) {
         setLanguage(language);
-        const markup = renderToStaticMarkup(<SkillsSettings adding={false} client={sourceClient} onAddingChange={noConfirm} />);
+        const markup = renderToStaticMarkup(<SkillsSettings client={sourceClient} />);
         assert.ok(markup.includes(TEXT.settings.skills.source.builtIn));
         assert.ok(markup.includes(TEXT.settings.skills.source.managed));
       }
@@ -688,7 +702,7 @@ describe("each settings page", () => {
   it("技能 renders and asks for its data", () => {
     asksForItsData(
       "技能",
-      <SkillsSettings adding={false} client={client} onAddingChange={noConfirm} />,
+      <SkillsSettings client={client} />,
     );
   });
 
@@ -697,7 +711,7 @@ describe("each settings page", () => {
   });
 
   it("远程 renders and asks for its data", () => {
-    asksForItsData("远程", <RuntimeSettings client={client} onConfirm={noConfirm} />);
+    asksForItsData("运行环境", <RuntimeSettings client={client} onConfirm={noConfirm} />);
   });
 
   it("专家 renders and asks for its data", () => {
@@ -715,7 +729,7 @@ describe("each settings page", () => {
 
   it("技能 loads global switches without requiring a project", () => {
     const markup = renderToStaticMarkup(
-      <SkillsSettings adding={false} client={client} onAddingChange={noConfirm} />,
+      <SkillsSettings client={client} />,
     );
     assert.ok(markup.includes(loading));
   });

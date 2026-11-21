@@ -14,6 +14,16 @@
 
 import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
+import { ConfigurationRequestCard, genericConfigurationPresentation, type ConfigurationProcessRecordProps } from "@sciencediscovery/configuration-ui";
+import type { ConfigurationRequestView, ConnectorConfigurationRequest } from "@sciencediscovery/schema";
+import type { useConfigurationRequests } from "../app/use-configuration-requests.js";
+import { useLanguage } from "../app/use-language.js";
+import { configurationRequestActions, decideLegacyConnectorConfiguration, type DesktopConfigurationRequest } from "../api/configuration.js";
+import { legacyConfigurationPresentation } from "../app/legacy-configuration.js";
+import { LegacyConnectorConfigurationCard } from "./LegacyConnectorConfigurationCard.js";
+import { cancelRun } from "../api/sessions.js";
+import { ApiRequestError } from "../api/client.js";
+
 import type { PendingMessage } from "../app/use-workspace.js";
 import type { ToolDetail } from "../app/tool-io.js";
 import type { ApiClient } from "../api/client.js";
@@ -22,20 +32,32 @@ import type {
   ComposerReference,
   PermissionDecision,
   PermissionRequest,
+  SessionArtifactOutput,
   SessionDetail,
   WorkspaceFile,
 } from "../api/types.js";
 import type { RunStreamState } from "../run-stream/model.js";
 import { hasReplayContent, placeReplays, type RunReplay } from "../run-stream/replay.js";
+import { allSubagents } from "../run-stream/model.js";
 import { TEXT } from "../text.js";
 import { coalesceTimeoutNotices } from "../run-failure.js";
 import { RunFailureCard } from "./RunFailureCard.js";
 import { AnswerBlock, AssistantAvatar, AssistantTurns } from "./AssistantTurn.js";
 import { UploadCards } from "./UploadCards.js";
+import { useTurnUsage } from "../app/use-turn-usage.js";
+import { TurnUsage } from "./TurnUsage.js";
 import { placeUploads, type UploadedFile } from "./uploads.js";
+import { turnArtifactsByRun, turnLineage, type TurnArtifact } from "../app/turn-artifacts.js";
+
+import { desktopConfigurationPresentation } from "../app/configuration-presentation.js";
+import type { SettingsGroup } from "./SystemSettingsDialog.js";
 
 interface Props {
+  onOpenConfigurationSettings?: (group: SettingsGroup) => void;
   onBranch?: (messageId: string) => void;
+  onConfigurationChange?: (request: DesktopConfigurationRequest) => void;
+  configurationReadOnly?: boolean;
+  configuration?: ReturnType<typeof useConfigurationRequests>;
   client: ApiClient;
   detail?: SessionDetail;
   loading: boolean;
@@ -46,6 +68,14 @@ interface Props {
   /** Open one tool's input or result in the workspace panel. The card shows a
    *  clipped preview of both. */
   onOpenTool?: (detail: ToolDetail) => void;
+  /** Open the right panel's artifact group from a turn strip's overflow card. */
+  onOpenArtifactPanel?: () => void;
+  /** Show one of a turn's artifacts in the right panel, at the version its card
+   *  names. The strip is a door into the panel, not the dialog. */
+  onPreviewArtifact?: (row: TurnArtifact) => void;
+  /** Every artifact version this Session holds; each turn's strip is selected
+   *  from it by run id (#1252). The right panel reads the same list. */
+  outputs?: readonly SessionArtifactOutput[];
   /** Opens the memory card behind a `[alias]` chip in an answer. The report
    *  preview and the conversation point at the same card. */
   onReferenceClick?: (reference: ComposerReference, sessionId?: string) => void;
@@ -62,6 +92,13 @@ interface Props {
    *  drawn after the last turn. */
   evolve?: ReactNode;
 }
+
+const NO_OUTPUTS: readonly SessionArtifactOutput[] = [];
+
+const EMPTY_CONFIGURATION: ReturnType<typeof useConfigurationRequests> = {
+  requests: [], legacyRequests: [], loading: false, error: false,
+  refresh: async () => {}, update: () => {}, remove: () => {},
+};
 
 /**
  * Notices the desktop transcript does not draw.
@@ -131,12 +168,14 @@ function UserRow({ content, files }: { content: string; files?: readonly Uploade
 }
 
 function MessageRow({
+  usage,
   answered,
   message,
   onBranch,
   onReferenceClick,
   uploads,
 }: {
+  usage?: ReactNode;
   answered?: boolean;
   message: ChatMessage;
   onBranch?: () => void;
@@ -176,6 +215,7 @@ function MessageRow({
           actions
           answered={answered}
           content={message.content}
+          usage={usage}
           onBranch={onBranch}
           onReferenceClick={onReferenceClick}
           references={message.references}
@@ -221,20 +261,88 @@ function useAfter(flag: boolean, delayMs: number): boolean {
  * per turn, and the run still streaming has none yet, so it goes at the end.
  */
 export function Conversation({
+  onOpenConfigurationSettings,
   onBranch,
+  onConfigurationChange,
+  configurationReadOnly = false,
+  configuration = EMPTY_CONFIGURATION,
   client,
   detail,
   loading,
   onDecidePermission,
   onOpenSubagent,
   onOpenTool,
+  onOpenArtifactPanel,
+  onPreviewArtifact,
   onReferenceClick,
+  outputs,
   pending,
   replays,
   run,
   evolve,
   workspaceFiles,
 }: Props) {
+  const language = useLanguage();
+  const usageRevision = `${run.runId ?? ""}:${run.terminal}:${detail?.messages.length ?? 0}:${replays.map(item => `${item.runId}:${item.state.terminal}`).join(",")}`;
+  const usage = useTurnUsage(client, detail?.id, usageRevision);
+  const usageNodes = useMemo(() => {
+    const nodes = new Map<string, ReactNode>();
+    for (const [id, data] of usage.index.byRun) nodes.set(`run:${id}`, <TurnUsage data={data}
+      loading={usage.loading} failed={usage.failed} onRefresh={usage.refresh} />);
+    for (const [id, data] of usage.index.byMessage) nodes.set(`message:${id}`, <TurnUsage data={data}
+      loading={usage.loading} failed={usage.failed} onRefresh={usage.refresh} />);
+    return nodes;
+  }, [usage.index, usage.loading, usage.failed, usage.refresh]);
+  const usageFallback = useMemo(() => usage.loading || usage.failed
+    ? <TurnUsage loading={usage.loading} failed={usage.failed} onRefresh={usage.refresh} /> : undefined,
+    [usage.loading, usage.failed, usage.refresh]);
+  const usageFor = (runId?: string, messageId?: string) => usageNodes.get(runId ? `run:${runId}` : `message:${messageId}`) ?? usageFallback;
+  const presentation = genericConfigurationPresentation(configuration.requests, detail?.messages ?? [], new Map(), detail?.id);
+  const legacyPresentation = legacyConfigurationPresentation(configuration.legacyRequests, detail?.messages ?? [], replays, detail?.id);
+  function renderLegacyConfiguration(request: ConnectorConfigurationRequest) {
+    return <div className="desktop-configuration" key={request.id}>
+      <LegacyConnectorConfigurationCard
+        key={`${request.sessionId}:${request.id}`}
+        request={request}
+        ProcessRecord={ConfigurationRecord}
+        readOnly={configurationReadOnly || configuration.error}
+        runActive={Boolean(run.runId) && !run.terminal
+          && !(run.runId === request.runId && run.status === "blocked")}
+        onRefresh={configuration.refresh}
+        onDecision={async decision => {
+          configuration.update(await decideLegacyConnectorConfiguration(client, request, decision));
+          await configuration.refresh();
+        }}
+      />
+    </div>;
+  }
+  function renderConfiguration(request: ConfigurationRequestView) {
+    const presentation = desktopConfigurationPresentation(request);
+    return <div className="desktop-configuration" key={request.id}>
+      <ConfigurationRequestCard
+        key={`${request.sessionId}:${request.id}`}
+        request={request}
+        compact={{ connectorRestoration: presentation.connectorRestoration, connectorAddition: presentation.connectorAddition, destructive: presentation.destructive, fieldIds: presentation.fieldIds, targetLabel: presentation.targetLabel,
+          unsupported: presentation.unsupported || Boolean(presentation.settingsGroup && !onOpenConfigurationSettings),
+          settingsDestination: presentation.settingsGroup as "models" | "timeouts" | "mcp" | "proxy" | undefined,
+          onOpenSettings: presentation.settingsGroup && onOpenConfigurationSettings
+            ? () => onOpenConfigurationSettings(presentation.settingsGroup!) : undefined }}
+        locale={language}
+        ProcessRecord={ConfigurationRecord}
+        ApiRequestError={ApiRequestError}
+        actions={configurationRequestActions(client, request)}
+        readOnly={configurationReadOnly || configuration.error}
+        runActive={Boolean(request.runId) && run.runId === request.runId && !run.terminal && run.status !== "blocked"}
+        onUpdate={configuration.update}
+        onUnavailable={() => configuration.remove(request.id)}
+        onStopTask={request.runId ? async () => {
+          await cancelRun(client, request.sessionId, request.runId!);
+          await configuration.refresh();
+          onConfigurationChange?.(request);
+        } : undefined}
+      />
+    </div>;
+  }
   const scroller = useRef<HTMLElement>(null);
   /** The transcript itself, watched for growth after the pin. */
   const content = useRef<HTMLDivElement>(null);
@@ -254,6 +362,27 @@ export function Conversation({
    *  own, so the id is not a per-row value. Stable so the memoised turns under
    *  it are not re-rendered — and their Markdown re-parsed — by a press that
    *  merely opens the dialog. */
+  /** Which Run a version belongs to: the transcript's own runs, and the children
+   *  whose versions name them instead. A version with neither is left out rather
+   *  than guessed at by timestamp. */
+  const lineage = useMemo(
+    () => turnLineage(
+      [
+        ...(run.runId === undefined ? [] : [run.runId]),
+        ...replays.map((replay) => replay.runId),
+      ],
+      [...allSubagents(run), ...replays.flatMap((replay) => allSubagents(replay.state))],
+    ),
+    [run, replays],
+  );
+  /** One selection per run, made once per `outputs`/`lineage` pair: the
+   *  conversation draws a strip under every turn, and walking the whole output
+   *  list in each of them would make typing in the composer cost
+   *  O(turns × outputs). */
+  const artifactsByRun = useMemo(
+    () => turnArtifactsByRun(outputs ?? NO_OUTPUTS, lineage),
+    [lineage, outputs],
+  );
   const referenceClick = useMemo(
     () => onReferenceClick === undefined
       ? undefined
@@ -334,12 +463,20 @@ export function Conversation({
     <section className="conversation" onScroll={onScroll} ref={scroller}>
       <div className="messages" ref={content}>
         {messages.map((message, index) => {
-          if (failures.hiddenNoticeIds.has(message.id)) return null;
+          if (failures.hiddenNoticeIds.has(message.id) || presentation.suppressedNoticeIds.has(message.id)
+            || legacyPresentation.suppressedNoticeIds.has(message.id)) return null;
+          const configurationAtNotice = presentation.byNoticeId.get(message.id);
+          const legacyAtNotice = legacyPresentation.byNoticeId.get(message.id);
+          // The API's empty request anchor is represented by the pending card
+          // below. Keep meaningful continuation messages and unknown notices.
+          if (!configurationAtNotice && message.kind === "configuration_notice" && !message.content.trim()
+            && configuration.requests.some(request => request.sessionId === detail?.id && request.id === message.configurationRequestId)) return null;
           const replacement = replacing.get(message.id);
           return (
             <Fragment key={message.id}>
-              {replacement === undefined ? (
+              {configurationAtNotice ? renderConfiguration(configurationAtNotice) : legacyAtNotice ? renderLegacyConfiguration(legacyAtNotice) : replacement === undefined ? (
                 <MessageRow
+                  usage={usageFor(undefined, message.id)}
                   answered={answeredAfter[index]}
                   message={message}
                   onBranch={onBranch && message.role === "assistant" ? () => onBranch(message.id) : undefined}
@@ -348,9 +485,13 @@ export function Conversation({
                 />
               ) : (
                 <AssistantTurns
+                  usage={usageFor(replacement.runId)}
                   answered={answeredAfter[index]}
+                  artifacts={artifactsByRun.get(replacement.runId ?? "")}
                   client={client}
                   onDecide={onDecidePermission}
+                  onOpenArtifactPanel={onOpenArtifactPanel}
+                  onPreviewArtifact={onPreviewArtifact}
                   onOpenSubagent={onOpenSubagent}
                   onOpenTool={onOpenTool}
                   onReferenceClick={referenceClick}
@@ -368,10 +509,14 @@ export function Conversation({
                   conversation it did not come last in. */}
               {(following.get(message.id) ?? []).map((replay) => (
                 <AssistantTurns
+                  usage={usageFor(replay.runId)}
                   answered={answeredAfter[index]}
+                  artifacts={artifactsByRun.get(replay.runId)}
                   client={client}
                   key={replay.runId}
                   onDecide={onDecidePermission}
+                  onOpenArtifactPanel={onOpenArtifactPanel}
+                  onPreviewArtifact={onPreviewArtifact}
                   onOpenSubagent={onOpenSubagent}
                   onOpenTool={onOpenTool}
                   onReferenceClick={referenceClick}
@@ -384,10 +529,14 @@ export function Conversation({
         })}
         {trailing.map((replay) => (
           <AssistantTurns
+            usage={usageFor(replay.runId)}
             answered={pending !== undefined}
+            artifacts={artifactsByRun.get(replay.runId)}
             client={client}
             key={replay.runId}
             onDecide={onDecidePermission}
+            onOpenArtifactPanel={onOpenArtifactPanel}
+            onPreviewArtifact={onPreviewArtifact}
             onOpenSubagent={onOpenSubagent}
             onOpenTool={onOpenTool}
             onReferenceClick={referenceClick}
@@ -401,8 +550,12 @@ export function Conversation({
             never here: it is in `replays`, anchored to its own answer. */}
         {liveRun ? (
           <AssistantTurns
+            usage={usageFor(visibleRun.runId)}
+            artifacts={artifactsByRun.get(visibleRun.runId ?? "")}
             client={client}
             onDecide={onDecidePermission}
+            onOpenArtifactPanel={onOpenArtifactPanel}
+            onPreviewArtifact={onPreviewArtifact}
             onOpenSubagent={onOpenSubagent}
             onOpenTool={onOpenTool}
             onReferenceClick={referenceClick}
@@ -410,9 +563,29 @@ export function Conversation({
             sessionId={detail?.id}
           />
         ) : null}
+        {presentation.visibleRequests.map(renderConfiguration)}
+        {legacyPresentation.visibleRequests.map(renderLegacyConfiguration)}
+        {configuration.loading && !configuration.requests.length && !configuration.legacyRequests.length ? <div className="status-strip">{TEXT.boot.checking}</div> : null}
+        {configuration.error ? <div className="desktop-configuration configuration-load-error" role="alert">
+          <span>{TEXT.conversation.configurationRefreshFailed}</span>
+          <button type="button" onClick={() => void configuration.refresh()}>{TEXT.conversation.retryConfiguration}</button>
+        </div> : null}
         {evolve}
         {loading ? <div className="status-strip">{TEXT.boot.checking}</div> : null}
       </div>
     </section>
   );
+}
+
+/** Terminal receipts use the new transcript's compact disclosure, while pending
+ * decisions retain their complete destination, impact and action controls. */
+export function ConfigurationRecord({ children, label, failed, className = "" }: ConfigurationProcessRecordProps) {
+  return <details className={`msg-collapse tool-card desktop-configuration-record ${className}${failed ? " failed" : ""}`}>
+    <summary>
+      <span className="collapse-title">{label}</span>
+      {failed ? <span className="configuration-failed">!</span> : null}
+      <span aria-hidden="true" className="collapse-chev">›</span>
+    </summary>
+    <div className="configuration-record-body">{children}</div>
+  </details>;
 }

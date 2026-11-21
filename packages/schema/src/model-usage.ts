@@ -187,6 +187,12 @@ export interface ModelInvocationUsage {
   sessionId: string;
   startedAt: string;
   totalTokens: number | null;
+  /**
+   * How many model turns this row's token figures sum. Present on rows written
+   * after #1109, where one row per invocation carries the invocation's total
+   * instead of one turn's figure; absent on older rows, which describe one turn.
+   */
+  turnsRecorded?: number;
   usageStatus: ModelUsageStatus;
 }
 
@@ -264,6 +270,14 @@ export interface ModelUsageExchangeRate {
   stale: boolean;
 }
 
+/** Counts of records that actually reported each field; zero tokens can still be reported. */
+export interface ModelUsageReporting {
+  invocationCount: number;
+  reportedInputCount: number;
+  reportedOutputCount: number;
+  reportedTotalCount: number;
+}
+
 export interface DailyModelUsageSummary {
   cacheReadTokens: number;
   cacheWriteTokens: number;
@@ -276,6 +290,8 @@ export interface DailyModelUsageSummary {
   modelProfileName: string;
   outputTokens: number;
   totalTokens: number;
+  /** Absent on older servers. */
+  reporting?: ModelUsageReporting;
 }
 
 export interface ModelUsageAnalyticsFilters {
@@ -293,6 +309,8 @@ export interface ModelUsageAnalyticsOverview {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  /** Absent on older servers. */
+  reporting?: ModelUsageReporting;
 }
 
 export interface ModelUsageAnalyticsSummary {

@@ -33,6 +33,8 @@ import { CheckpointAnsweredProvider } from "./CheckpointCard.js";
 import { collapseHint } from "./collapse-hint.js";
 import { PermissionCard } from "./PermissionCard.js";
 import { ThinkingBlock } from "./ThinkingBlock.js";
+import { TurnArtifactStrip } from "./TurnArtifactStrip.js";
+import type { TurnArtifact, TurnArtifacts } from "../app/turn-artifacts.js";
 import { ToolCard } from "./ToolCard.js";
 import { RowMenu, type MenuState } from "./RowMenu.js";
 
@@ -51,7 +53,7 @@ export function AssistantAvatar() {
 }
 
 /** Actions belong to the completed reply they act on. */
-function AnswerTools({ content, onBranch }: { content: string; onBranch?: () => void }) {
+function AnswerTools({ content, onBranch, usage }: { content: string; onBranch?: () => void; usage?: ReactNode }) {
   const [copied, setCopied] = useState(false);
   const [menu, setMenu] = useState<MenuState>();
 
@@ -80,6 +82,7 @@ function AnswerTools({ content, onBranch }: { content: string; onBranch?: () => 
         )}
       </button>
       {onBranch ? <button className="answer-tool" aria-label={TEXT.researchPackage.messageMenu} aria-haspopup="menu" type="button" onClick={event => setMenu({ x: event.clientX, y: event.clientY, items: [{ label: TEXT.researchPackage.branch, onSelect: onBranch }] })}>⋯</button> : null}
+      {usage}
       <RowMenu menu={menu} onClose={() => setMenu(undefined)} />
     </div>
   );
@@ -102,7 +105,9 @@ export function AnswerBlock({
   onReferenceClick,
   references,
   truncated,
+  usage,
 }: {
+  usage?: ReactNode;
   onBranch?: () => void;
   /** The copy/feedback row belongs under a finished answer, not under the
    *  prose a folded run wrote on its way to one. */
@@ -127,7 +132,7 @@ export function AnswerBlock({
         <div className="workspace-empty">{TEXT.conversation.truncatedBody}</div>
       ) : null}
       {live ? <span className="spinner" /> : null}
-      {actions === true && !live ? <AnswerTools content={content} onBranch={onBranch} /> : null}
+      {actions === true && !live ? <AnswerTools content={content} onBranch={onBranch} usage={usage} /> : null}
     </div>
   );
 }
@@ -506,17 +511,22 @@ function foldLabel(run: RunStreamState): { icon: string; title: string; working:
  * reason.
  */
 export const AssistantTurns = memo(function AssistantTurns({
+  usage,
+  artifacts,
   onBranch,
   answered,
   client,
   onDecide,
+  onOpenArtifactPanel,
   onOpenSubagent,
   onOpenTool,
+  onPreviewArtifact,
   onReferenceClick,
   references,
   run,
   sessionId,
 }: {
+  usage?: ReactNode;
   onBranch?: () => void;
   /** A later turn exists in the transcript, so this run's checkpoint cards
    *  fold. The conversation is the only place that knows this. */
@@ -534,6 +544,13 @@ export const AssistantTurns = memo(function AssistantTurns({
    *  (from `run.completed`); this is the stored message's copy, which is what
    *  survives a record whose completion event was pruned. */
   references?: ComposerReference[];
+  /** The artifacts this turn wrote, already selected per run (#1252). The
+   *  strip is only drawn once the run is terminal. */
+  artifacts?: TurnArtifacts;
+  /** Show one artifact in the right panel, at the version its card names. */
+  onPreviewArtifact?: (row: TurnArtifact) => void;
+  /** Open the right panel's artifact group — the strip's route to the rest. */
+  onOpenArtifactPanel?: () => void;
   run: RunStreamState;
   sessionId?: string;
 }) {
@@ -595,6 +612,14 @@ export const AssistantTurns = memo(function AssistantTurns({
     return (
       <>
         <RunStatusLine run={run} />
+        {!live && usage ? <div className="answer-tools">{usage}</div> : null}
+        {run.terminal ? (
+          <TurnArtifactStrip
+            artifacts={artifacts}
+            onPreviewArtifact={onPreviewArtifact}
+            onOpenArtifactPanel={onOpenArtifactPanel}
+          />
+        ) : null}
         <PendingCards context={tools} requests={pending} />
       </>
     );
@@ -651,6 +676,7 @@ export const AssistantTurns = memo(function AssistantTurns({
               onReferenceClick={onReferenceClick}
               references={citations}
               truncated={shown.truncated}
+              usage={usage}
             />
           )}
           {showFinal ? (
@@ -658,6 +684,7 @@ export const AssistantTurns = memo(function AssistantTurns({
               actions
               answered={answered}
               content={finalBody}
+              usage={usage}
               onBranch={onBranch}
               onReferenceClick={onReferenceClick}
               references={citations}
@@ -666,6 +693,14 @@ export const AssistantTurns = memo(function AssistantTurns({
         </div>
       </div>
       <RunStatusLine run={run} />
+      {!live && shown === undefined && !showFinal && usage ? <div className="answer-tools">{usage}</div> : null}
+      {run.terminal ? (
+        <TurnArtifactStrip
+          artifacts={artifacts}
+          onPreviewArtifact={onPreviewArtifact}
+          onOpenArtifactPanel={onOpenArtifactPanel}
+        />
+      ) : null}
       <PendingCards context={tools} requests={pending} />
     </>
   );

@@ -54,6 +54,9 @@ FROM --platform=$BUILDPLATFORM ${NODE_RUNTIME_IMAGE} AS micromamba
 ARG TARGETARCH
 WORKDIR /source
 COPY services/runner/src/micromamba-releases.json services/runner/src/micromamba-releases.json
+# The downloader imports the dependency-free network module (proxy-aware fetch
+# and error redaction); it must land in this stage with it.
+COPY packages/network/src/index.mjs packages/network/src/index.mjs
 COPY scripts/fetch-managed-micromamba.mjs scripts/fetch-managed-micromamba.mjs
 RUN test -n "$TARGETARCH" \
  || { echo "TARGETARCH is required to select the managed micromamba release (use Docker BuildKit/buildx)." >&2; exit 1; }
@@ -198,6 +201,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       "workswarm==${jiuwenswarm_pypi_version}"
 
 COPY . .
+
+# Account service the web bundle talks to. Baked at build time (Vite reads
+# VITE_* from the environment); override with --build-arg for another deployment.
+ARG VITE_ACCOUNTS_API=https://sciencediscovery.openjiuwen.com/accounts
+ENV VITE_ACCOUNTS_API=$VITE_ACCOUNTS_API
 
 RUN pnpm build && pnpm runner:binary
 

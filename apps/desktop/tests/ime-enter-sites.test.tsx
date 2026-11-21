@@ -185,6 +185,21 @@ describe("model-name combobox", () => {
     };
   }
 
+  /** The 刷新列表 button: its icon is a child element, so only the string
+   *  children spell the label. One helper so both Enter cases find the same
+   *  control. */
+  function fetchButton(view: {
+    root: {
+      findAllByType(type: string): Array<{ children: unknown[]; props: Record<string, unknown> }>;
+    };
+  }) {
+    return view.root.findAllByType("button").find((button) =>
+      (button.children as Array<unknown>)
+        .filter((child): child is string => typeof child === "string")
+        .join("") === TEXT.wizard.provider.fetch,
+    )!;
+  }
+
   it("does not pick the highlighted model for the Enter that accepts a candidate", async () => {
     const { view } = await mount();
     try {
@@ -193,15 +208,10 @@ describe("model-name combobox", () => {
         before.baseUrl.props.onChange({ target: { value: "https://api.example.test" } });
         before.apiKey.props.onChange({ target: { value: "sk-test" } });
       });
-      const fetchModels = view.root
-        .findAllByType("button")
-        .find((button) => (button.children as Array<string>).join("") === TEXT.wizard.provider.fetch)!;
+      const fetchModels = fetchButton(view);
       await act(async () => { fetchModels.props.onClick(); });
-      const combobox = field(view).combobox;
-      const arrowDown = { key: "ArrowDown", preventDefault: () => {}, stopPropagation: () => {} };
-      // First ArrowDown opens the listing, second highlights its first entry.
-      await act(async () => { combobox.props.onKeyDown(arrowDown); });
-      await act(async () => { field(view).combobox.props.onKeyDown(arrowDown); });
+      // The fetch opens the listing with its first entry highlighted, so the
+      // candidate-confirming Enter already sits over an entry.
       const { event } = enter({ isComposing: true, nativeEvent: { isComposing: true } });
       await act(async () => { field(view).combobox.props.onKeyDown(event); });
       // The field still holds what the user typed, not the first listing entry
@@ -220,14 +230,10 @@ describe("model-name combobox", () => {
         before.baseUrl.props.onChange({ target: { value: "https://api.example.test" } });
         before.apiKey.props.onChange({ target: { value: "sk-test" } });
       });
-      const fetchModels = view.root
-        .findAllByType("button")
-        .find((button) => (button.children as Array<string>).join("") === TEXT.wizard.provider.fetch)!;
+      const fetchModels = fetchButton(view);
       await act(async () => { fetchModels.props.onClick(); });
-      const combobox = field(view).combobox;
-      const arrowDown = { key: "ArrowDown", preventDefault: () => {}, stopPropagation: () => {} };
-      await act(async () => { combobox.props.onKeyDown(arrowDown); });
-      await act(async () => { field(view).combobox.props.onKeyDown(arrowDown); });
+      // The listing is open with its first entry highlighted; Enter after the
+      // composition ends picks it.
       const { event } = enter({ isComposing: false, nativeEvent: { isComposing: false } });
       await act(async () => { field(view).combobox.props.onKeyDown(event); });
       assert.equal(field(view).combobox.props.value, "gpt-4o-mini");

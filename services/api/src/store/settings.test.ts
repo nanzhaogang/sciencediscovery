@@ -98,12 +98,24 @@ test("unknown engines and non-boolean switches are rejected rather than coerced"
   assert.throws(() => normalizeWebSettings({ ...base, searchEngine: "bing" }), /Unknown web setting/);
 });
 
+test("an unknown free search engine is tagged as client input so the route answers 400", () => {
+  assert.throws(
+    () => normalizeWebSettings({ ...base, freeSearchEngines: { google: true } }),
+    (error: unknown) => (error as { code?: string }).code === "INVALID_WEB_SETTINGS",
+    "the status follows the code, not the wording of a message a later edit could reword",
+  );
+  assert.throws(
+    () => normalizeWebSettings({ ...base, freeSearchEngines: { google: true } }),
+    /Unknown free search engine: google/,
+    "the message the client already shows is unchanged",
+  );
+});
+
 
 test("Idea Tree settings reject template-owned fields and discard their legacy catalog values", () => {
-  const updated = normalizeIdeaTreeSettings({templateId: "water-treatment-materials/v1", explorationIntensity: "deep", maxTokens: 120000, maxTokensPerCall: 6000}, DEFAULT_IDEA_TREE_SETTINGS);
+  const updated = normalizeIdeaTreeSettings({templateId: "water-treatment-materials/v1", explorationIntensity: "deep", maxTokens: 120000}, DEFAULT_IDEA_TREE_SETTINGS);
   const restored = resolveIdeaTreeSettings(JSON.parse(JSON.stringify(updated)));
   assert.equal(restored.maxTokens, 120000);
-  assert.equal(restored.maxTokensPerCall, 6000);
   assert.equal(restored.templateId, "water-treatment-materials/v1");
   assert.equal(restored.explorationIntensity, "deep");
   assert.equal(normalizeIdeaTreeSettings({maxTokens: null}, restored).maxTokens, null);
@@ -113,31 +125,35 @@ test("Idea Tree settings reject template-owned fields and discard their legacy c
   const legacy = resolveIdeaTreeSettings({maxRounds: 6, candidatesPerRound: 2, maxSearchRounds: 10, assessorActivity: {weight: 1}});
   assert.equal("maxRounds" in legacy, false);
   assert.equal("assessorActivity" in legacy, false);
-  for (const input of [{maxTokens: -1}, {maxTokensPerCall: 255}]) {
+  for (const input of [{maxTokens: -1}]) {
     assert.throws(() => normalizeIdeaTreeSettings(input, restored));
   }
 });
 
 
-test("Idea Tree accepts the server Lead Agent output ceiling", () => {
-  assert.equal(DEFAULT_IDEA_TREE_SETTINGS.maxTokensPerCall, 32768);
-  assert.equal(normalizeIdeaTreeSettings({maxTokensPerCall: 32768}, DEFAULT_IDEA_TREE_SETTINGS).maxTokensPerCall, 32768);
-  assert.throws(() => normalizeIdeaTreeSettings({maxTokensPerCall: 32769}, DEFAULT_IDEA_TREE_SETTINGS));
+test("a stored Idea Tree row that still carries the removed per-call cap loads without it", () => {
+  // #1281 removed maxTokensPerCall. An upgraded deployment still has it in its
+  // catalog row: reading must not throw, and the value must not come back.
+  assert.equal("maxTokensPerCall" in DEFAULT_IDEA_TREE_SETTINGS, false);
+  const stored = { ...DEFAULT_IDEA_TREE_SETTINGS, maxTokensPerCall: 8192, templateId: "water-treatment-materials/v1" as const };
+  const resolved = resolveIdeaTreeSettings(stored);
+  assert.equal("maxTokensPerCall" in resolved, false);
+  assert.equal(resolved.templateId, "water-treatment-materials/v1");
+  // A stale client sending it is ignored the same way, whatever the value.
+  for (const stale of [255, 8192, 32769]) {
+    const updated = normalizeIdeaTreeSettings({ maxTokensPerCall: stale, maxDepth: 6 } as never, DEFAULT_IDEA_TREE_SETTINGS);
+    assert.equal("maxTokensPerCall" in updated, false);
+    assert.equal(updated.maxDepth, 6);
+  }
 });
 
-test("Idea Tree stages inherit unless given their own effort, and the map survives storage", () => {
-  // Nothing set: the stored settings carry no map at all, so unset users see no change.
-  assert.equal("roleThinkingEfforts" in normalizeIdeaTreeSettings({}, DEFAULT_IDEA_TREE_SETTINGS), false);
-  const updated = normalizeIdeaTreeSettings({ roleThinkingEfforts: { aggregate: "max", assess: "high", design: null as never } }, DEFAULT_IDEA_TREE_SETTINGS);
-  assert.deepEqual(updated.roleThinkingEfforts, { assess: "high", aggregate: "max" });
-  const restored = resolveIdeaTreeSettings(JSON.parse(JSON.stringify(updated)));
-  assert.deepEqual(restored.roleThinkingEfforts, { assess: "high", aggregate: "max" });
-  // Omitted keeps the map; null or an empty map returns every stage to inherit.
-  assert.deepEqual(normalizeIdeaTreeSettings({ maxDepth: 3 }, restored).roleThinkingEfforts, { assess: "high", aggregate: "max" });
-  assert.equal(normalizeIdeaTreeSettings({ roleThinkingEfforts: null }, restored).roleThinkingEfforts, undefined);
-  assert.equal(normalizeIdeaTreeSettings({ roleThinkingEfforts: {} }, restored).roleThinkingEfforts, undefined);
-  assert.throws(() => normalizeIdeaTreeSettings({ roleThinkingEfforts: { review: "high" } as never }, restored), /unknown stage: review/);
-  assert.throws(() => normalizeIdeaTreeSettings({ roleThinkingEfforts: { design: "ultra" } as never }, restored), /roleThinkingEfforts.design must be/);
-  // A stale stored value never wedges loading: the bad entries are dropped.
-  assert.deepEqual(resolveIdeaTreeSettings({ roleThinkingEfforts: { design: "ultra", ideate: "low", old: "max" } }).roleThinkingEfforts, { ideate: "low" });
+test("Idea Tree has no per-stage thinking effort: the retired field is ignored, not stored", () => {
+  // A stale client may still send the retired map; the save must still work and
+  // must not bring the overrides back, because every stage now follows the model.
+  const updated = normalizeIdeaTreeSettings({ maxDepth: 3, roleThinkingEfforts: { assess: "high" } } as never, DEFAULT_IDEA_TREE_SETTINGS);
+  assert.equal("roleThinkingEfforts" in updated, false);
+  assert.equal(updated.maxDepth, 3);
+  // A catalog row written before the removal drops the map when it loads.
+  const restored = resolveIdeaTreeSettings({ ...DEFAULT_IDEA_TREE_SETTINGS, roleThinkingEfforts: { design: "max" } });
+  assert.deepEqual(restored, DEFAULT_IDEA_TREE_SETTINGS);
 });

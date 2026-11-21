@@ -28,6 +28,7 @@ import {
   type ModelClientPolicy,
   type ModelEndpoint,
   type ModelTurn,
+  type ModelUsage,
   type ModelWireDiagnostics,
   type ModelWireErrorClass,
   type WireToolSpec,
@@ -158,6 +159,7 @@ function usageOf(turn: ModelTurn) {
   return {
     prompt_tokens: usage.inputTokens, completion_tokens: usage.outputTokens, total_tokens: usage.totalTokens,
     ...(usage.cacheReadTokens ? { prompt_tokens_details: { cached_tokens: usage.cacheReadTokens } } : {}),
+    ...(usage.reasoningTokens == null ? {} : { completion_tokens_details: { reasoning_tokens: usage.reasoningTokens } }),
   };
 }
 
@@ -178,6 +180,14 @@ const INVALID_TOOLS = `${INVALID_ARGUMENTS_MARKER} ${NOT_EXECUTED}`;
 const RECOVERY_PROMPT = /^\[(?:Output limit|Tool argument) recovery ([12])\/2;/;
 /** How many times the boundary asks the model to re-issue a withheld response. */
 const MAX_RECOVERY_ATTEMPTS = 2;
+/**
+ * A provider can close an otherwise healthy SSE response after emitting only
+ * hidden reasoning.  Replay the complete model turn a small, fixed number of
+ * times.  This is deliberately separate from the HTTP pre-stream retry
+ * budget: a mid-stream replay is safe only before any text or tool call has
+ * been exposed to Swarm, and must never turn a tool round into a duplicate.
+ */
+const MAX_STREAM_RETRIES = 4;
 const finishReason = (turn: ModelTurn) => turn.truncated ? "length" : turn.toolCalls.length ? "tool_calls" : "stop";
 /** Which recovery attempt a request is, from the feedback Swarm's recovery boundary appended last. */
 const recoveryAttemptOf = (body: ChatRequest) => {
@@ -210,17 +220,31 @@ const toolCallsOf = (turn: ModelTurn) => turn.toolCalls.map((call, index) => ({
 }));
 
 /**
+ * The identity of one model call, minted here before the request leaves and carried through to the
+ * record that call produces. It is an object, not a value, so two calls in flight cannot be confused
+ * whichever order they finish in (#1133).
+ */
+export interface ModelCallIdentity {
+  responseId: string;
+}
+
+/**
  * Told about each task model call of the run (not Swarm housekeeping or compaction):
  * its exact input before it is made, the answer after. The run's trajectory is recorded from these.
  */
 export interface ModelCallObserver {
-  request(input: { history: unknown[]; systemPrompt: string; tools: WireToolSpec[] }): Promise<void>;
-  completed(turn: ModelTurn, history: unknown[]): Promise<void>;
+  request(input: { history: unknown[]; systemPrompt: string; tools: WireToolSpec[]; call?: ModelCallIdentity }): Promise<void>;
+  completed(turn: ModelTurn, history: unknown[], call?: ModelCallIdentity): Promise<void>;
 }
+
+/** Header carrying the call's response id back to the adapter that proxies the request (#1133). */
+export const MODEL_RESPONSE_ID_HEADER = "x-sciencediscovery-response-id";
 
 /** Run control is independent of optional, best-effort trajectory logging. */
 export interface ModelGatewayLifecycle {
   progress(): void;
+  /** Original provider usage, before Swarm can replace unreported fields with zero. Task calls only. */
+  onUsage?(usage: ModelUsage | undefined): void;
   /** Synchronous admission, before sending a task model request upstream. */
   beforeTurn?(): void;
   /**
@@ -355,6 +379,11 @@ export async function startModelGateway(
     if (signal.aborted) abort();
     response.on("close", () => { if (!response.writableEnded) controller.abort(); });
     const id = `chatcmpl-${randomUUID()}`;
+    // The call's identity, minted by the side that writes the completion record — not by the
+    // adapter, whose `assistant.response.started` can only be emitted once the answer has produced
+    // something to show. A tool-only call reaches its record first, which is how #1133 lost 54 of
+    // 303 ids. Housekeeping is not recorded, so it gets no identity.
+    const call: ModelCallIdentity | undefined = auxiliary ? undefined : { responseId: randomUUID() };
     if (!auxiliary) lastFailure = undefined;
     // One line per model request into the API log (and so the real-E2E
     // stack.log evidence). It is counts, timings and classifications only:
@@ -362,6 +391,7 @@ export async function startModelGateway(
     let wireReported = false;
     let pendingWire: ModelWireDiagnostics | undefined;
     const purpose = auxiliary ? "auxiliary" : "task";
+    const streamRetryErrors: ModelWireErrorClass[] = [];
     // The transport reports its wire record on the success path, but the turn it
     // returned can still fail here (empty terminal turn, unusable tool call). The
     // record is held until the outcome is known, so the one line a request writes
@@ -372,10 +402,12 @@ export async function startModelGateway(
       const classification = pendingWire?.error?.classification ?? errorClass;
       if (!pendingWire && classification === undefined) return;
       wireReported = true;
+      const retryErrors = [...(pendingWire?.retryErrors ?? []), ...streamRetryErrors];
       const record = {
         ...(pendingWire ?? { endpoint: modelEndpointIdentity(endpoint), model: endpoint.model }),
         gatewayRequestId: id,
         purpose,
+        ...(retryErrors.length ? { retryErrors, retries: retryErrors.length } : {}),
         // The transport's own classified record already carries its status;
         // a local rejection only adds the class to the record it reported.
         ...(classification === undefined ? {} : { error: pendingWire?.error ?? { classification } }),
@@ -462,13 +494,41 @@ export async function startModelGateway(
       controller.signal.throwIfAborted();
     };
     const prepare = async () => {
-      if (observed) await observe("input", () => observed.request({ history, systemPrompt, tools }));
+      // The identity goes with the input, so the trajectory binds it to the turn this call opens
+      // rather than to a field a later call could overwrite.
+      if (observed) await observe("input", () => observed.request({ history, systemPrompt, tools, ...(call ? { call } : {}) }));
       controller.signal.throwIfAborted();
       phase = "upstream_dispatched";
       trace("upstream_dispatched", true);
     };
     const record = async (turn: ModelTurn) => {
-      if (observed) await observe("completion", () => observed.completed(turn, history));
+      if (!auxiliary) lifecycle?.onUsage?.(turn.usage);
+      if (observed) await observe("completion", () => observed.completed(turn, history, call));
+    };
+    const streamTurn = async (
+      makeCallbacks: (attempt: number) => NonNullable<Parameters<Streamer>[6]>,
+      state: { text: boolean },
+    ): Promise<ModelTurn> => {
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          return await streamer(requestEndpoint, systemPrompt, history, tools, requestPolicy, controller.signal, makeCallbacks(attempt));
+        } catch (error) {
+          const classification = classifyModelWireError(error);
+          // A model stream can fail after sending hidden reasoning or partial
+          // tool arguments. Tool calls are withheld until the stream reaches a
+          // completion boundary below, so a turn with no visible text has not
+          // committed a tool yet and can be replayed safely. Never replay a
+          // turn that exposed text, and never retry auxiliary housekeeping.
+          if (attempt >= MAX_STREAM_RETRIES || auxiliary || !["network", "timeout"].includes(classification) || state.text) throw error;
+          streamRetryErrors.push(classification);
+          const delayMs = 250 * 2 ** attempt;
+          console.warn(`[model-gateway] retrying an interrupted model stream request=${id} attempt=${attempt + 1}/${MAX_STREAM_RETRIES} delayMs=${delayMs}`);
+          await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(resolve, delayMs);
+            controller.signal.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("aborted")); }, { once: true });
+          });
+        }
+      }
     };
     try {
       controller.signal.throwIfAborted();
@@ -481,7 +541,10 @@ export async function startModelGateway(
         const start = () => {
           if (started) return;
           started = true;
-          response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+          response.writeHead(200, {
+            "content-type": "text/event-stream", "cache-control": "no-cache",
+            ...(call ? { [MODEL_RESPONSE_ID_HEADER]: call.responseId } : {}),
+          });
           response.write(chunk({ role: "assistant" }));
         };
         const writeDelta = (delta: Record<string, unknown>) => {
@@ -496,10 +559,11 @@ export async function startModelGateway(
         trace("start", true);
         await prepare();
         controller.signal.throwIfAborted();
-        const turn = await streamer(requestEndpoint, systemPrompt, history, tools, requestPolicy, controller.signal, {
+        const visible = { text: false };
+        const turn = await streamTurn((attempt) => ({
           onProgress: () => { upstream(); trace("receive"); },
-          onTextDelta: (delta) => writeDelta({ content: delta }),
-          onThinkingDelta: (delta) => writeDelta({ reasoning_content: delta }),
+          onTextDelta: (delta) => { if (delta.length > 0) visible.text = true; writeDelta({ content: delta }); },
+          onThinkingDelta: (delta) => { if (attempt === 0) writeDelta({ reasoning_content: delta }); },
           onToolCallDelta: (delta) => {
             // Keep tool arguments behind the finish boundary: even valid JSON
             // can be semantically incomplete when the response hits its cap.
@@ -514,7 +578,7 @@ export async function startModelGateway(
           // the run, so the transport classifies its one record accordingly.
           rejectEmptyTerminalTurn: !auxiliary,
           onWireDiagnostics: logWire,
-        });
+        }), visible);
         controller.signal.throwIfAborted();
         await recordInvalidArguments(turn, id);
         const invalid = invalidCalls(turn);
@@ -537,14 +601,15 @@ export async function startModelGateway(
       }
       await prepare();
       controller.signal.throwIfAborted();
-      const turn = await streamer(requestEndpoint, systemPrompt, history, tools, requestPolicy, controller.signal, {
+      const visible = { text: false };
+      const turn = await streamTurn(() => ({
         onProgress: upstream,
-        onTextDelta: progress,
+        onTextDelta: (delta) => { if (delta.length > 0) visible.text = true; progress(); },
         onThinkingDelta: progress,
-        onToolCallDelta: progress,
+        onToolCallDelta: () => { progress(); },
         rejectEmptyTerminalTurn: !auxiliary,
         onWireDiagnostics: logWire,
-      });
+      }), visible);
       controller.signal.throwIfAborted();
       await recordInvalidArguments(turn, id);
       const invalid = invalidCalls(turn);
@@ -554,7 +619,10 @@ export async function startModelGateway(
       const withheld = turn.truncated && turn.toolCalls.length ? WITHHELD_TOOLS : invalid.length ? withheldNotice(turn, invalid) : "";
       const usage = usageOf(turn);
       reportWire();
-      response.writeHead(200, { "content-type": "application/json" });
+      response.writeHead(200, {
+        "content-type": "application/json",
+        ...(call ? { [MODEL_RESPONSE_ID_HEADER]: call.responseId } : {}),
+      });
       response.end(JSON.stringify({
         id, object: "chat.completion", created: Math.floor(Date.now() / 1000), model: endpoint.model,
         choices: [{ index: 0, finish_reason: invalid.length ? "length" : finishReason(turn), message: { role: "assistant", content: content + withheld, ...(!turn.truncated && !invalid.length && turn.toolCalls.length ? { tool_calls: toolCallsOf(turn).map(({ index: _index, ...call }) => call) } : {}) } }],

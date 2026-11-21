@@ -18,7 +18,7 @@ import type { AddressInfo } from "node:net";
 import { createTest } from "../../../../test/support/tagged/compat.mjs";
 const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:linux", "arch:amd64", "arch:arm64"] });
 import { setTimeout as delay } from "node:timers/promises";
-import type { streamModelTurn } from "@sciencediscovery/model";
+import type { ModelUsage, streamModelTurn } from "@sciencediscovery/model";
 
 import type { AgentEvent } from "@sciencediscovery/orchestration";
 import { Type } from "typebox";
@@ -203,6 +203,8 @@ test("sends the prompt, model and the run's tools to the adapter and returns the
     assert.equal(body.cwd, "/workspace");
     assert.equal(typeof body.systemPrompt, "string");
     assert.ok(body.systemPrompt.length > 200, "the run gets the workspace system prompt, not an empty one");
+    assert.match(body.systemPrompt, /Ask clarification questions in a regular assistant message/);
+    assert.ok(body.hiddenJiuwenSwarmTools.includes("ask_user"));
     assert.equal(body.model.model, "gpt-x");
     assert.match(body.model.baseUrl, /^http:\/\/127\.0\.0\.1:\d+\/v1$/, "the adapter is pointed at the run's loopback model gateway, not the provider");
     assert.notEqual(body.model.apiKey, "sk-test", "the provider's key never leaves this process");
@@ -306,23 +308,38 @@ test("plugin-contributed tools (update_plan) are offered to the adapter and run 
   }
 });
 
-test("reported token usage becomes model_usage events and one summed usage event at the end", async () => {
-  const adapter = await fakeAdapter((_request, response) => {
+test("gateway usage is recorded once and SDK defaults cannot replace missing provider reasoning", async () => {
+  const usages: ModelUsage[] = [
+    { inputTokens: 700, outputTokens: 80, totalTokens: 780, cacheReadTokens: 0, cacheWriteTokens: null, reasoningTokens: 71 },
+    { inputTokens: 31, outputTokens: 7, totalTokens: 38, cacheReadTokens: 10, cacheWriteTokens: null },
+  ];
+  const adapter = await fakeAdapter(async ({ body }, response) => {
     response.writeHead(200);
-    response.write(line({ event: { type: "model.usage", usage: { inputTokens: 700, outputTokens: 80, totalTokens: 780, cacheReadTokens: 0, cacheWriteTokens: null }, reasoningTokens: 71 } }));
-    response.write(line({ event: { type: "model.usage", usage: { inputTokens: 31, outputTokens: 7, totalTokens: 38, cacheReadTokens: 10, cacheWriteTokens: null } } }));
+    for (const usage of usages) {
+      const result = await fetch(`${body.model.baseUrl}/chat/completions`, {
+        method: "POST", headers: { authorization: `Bearer ${body.model.apiKey}` }, body: JSON.stringify({ messages: [] }),
+      });
+      assert.equal(result.status, 200); await result.text();
+      response.write(line({ event: { type: "model.usage", usage, reasoningTokens: 0 } }));
+    }
+    response.write(line({ event: { type: "model.usage", usage: usages[0], reasoningTokens: 0 } }));
     response.end(line({ done: { finalText: "" } }));
   });
   try {
-    const agent = createJiuwenSwarmAgentFactory({ adapterUrl: adapter.url })(options());
+    let call = 0;
+    const agent = createJiuwenSwarmAgentFactory({ adapterUrl: adapter.url, modelStreamer: async () => ({
+      assistantMessage: { role: "assistant", content: "ok" }, toolCalls: [], usage: usages[call++],
+    }) })(options());
     const events = collect(agent);
     await agent.execute("go");
-    assert.deepEqual(events.map((event) => event.type), ["model_usage", "model_usage", "usage"]);
-    assert.deepEqual(events[0], {
+    const accounting = events.filter(event => event.type === "model_usage" || event.type === "usage");
+    assert.deepEqual(accounting.map(event => event.type), ["model_usage", "model_usage", "usage"]);
+    assert.deepEqual(accounting[0], {
       type: "model_usage", usageReported: true,
       usage: { inputTokens: 700, outputTokens: 80, totalTokens: 780, cacheReadTokens: 0, cacheWriteTokens: null, reasoningTokens: 71 },
     });
-    const summary = (events[2] as { usage: unknown }).usage;
+    assert.deepEqual(accounting[1], { type: "model_usage", usageReported: true, usage: { ...usages[1], reasoningTokens: null } });
+    const summary = accounting[2]?.type === "usage" ? accounting[2].usage : undefined;
     assert.deepEqual(summary, { cacheReadTokens: 10, cacheWriteTokens: null, inputTokens: 731, outputTokens: 87, reasoningTokens: 71, totalTokens: 818 });
     // The same key order the native agent's summary has: it is serialised into subagent results.
     assert.deepEqual(Object.keys(summary as object), ["inputTokens", "outputTokens", "reasoningTokens", "totalTokens", "cacheReadTokens", "cacheWriteTokens"]);
@@ -341,6 +358,62 @@ test("a run that reported no usage emits no usage summary", async () => {
   } finally {
     await adapter.close();
   }
+});
+
+test("main and child gateways keep provider reasoning isolated, preserve true zero, and ignore SDK-filled zeros", async () => {
+  const adapter = await fakeAdapter(async ({ body }, response) => {
+    response.writeHead(200);
+    const result = await fetch(`${body.model.baseUrl}/chat/completions`, {
+      method: "POST", headers: { authorization: `Bearer ${body.model.apiKey}` },
+      body: JSON.stringify({ stream: true, messages: [] }),
+    });
+    assert.equal(result.status, 200); await result.text();
+    response.write(line({ event: { type: "model.usage", usage: { inputTokens: 1000, outputTokens: 1000, totalTokens: 2000 }, reasoningTokens: 0 } }));
+    response.end(line({ done: { finalText: "ok" } }));
+  });
+  try {
+    const factory = createJiuwenSwarmAgentFactory({ adapterUrl: adapter.url, modelStreamer: async endpoint => ({
+      assistantMessage: { role: "assistant", content: "ok" }, toolCalls: [],
+      usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15,
+        reasoningTokens: endpoint.model === "main" ? 4 : endpoint.model === "child-zero" ? 0 : null },
+    }) });
+    const create = (model: string) => {
+      const config = options().config;
+      const agent = factory(options({ config: { ...config, model } }));
+      return { agent, events: collect(agent) };
+    };
+    const main = create("main"), childZero = create("child-zero"), childUnknown = create("child-unknown");
+    await Promise.all([main.agent.execute("main task"), childZero.agent.execute("child task"), childUnknown.agent.execute("child task")]);
+    for (const [run, expected] of [[main, 4], [childZero, 0], [childUnknown, null]] as const) {
+      const calls = run.events.filter(event => event.type === "model_usage");
+      const totals = run.events.filter(event => event.type === "usage");
+      assert.equal(calls.length, 1); assert.equal(totals.length, 1);
+      assert.equal(calls[0]?.usage?.reasoningTokens, expected);
+      assert.equal(totals[0]?.usage.reasoningTokens, expected);
+      assert.equal(totals[0]?.usage.totalTokens, 15, "SDK repeats and reasoning do not increase the provider total");
+    }
+  } finally { await adapter.close(); }
+});
+
+test("an unreported gateway call remains unknown even if the SDK sends fabricated zero usage", async () => {
+  const adapter = await fakeAdapter(async ({ body }, response) => {
+    response.writeHead(200);
+    const result = await fetch(`${body.model.baseUrl}/chat/completions`, {
+      method: "POST", headers: { authorization: `Bearer ${body.model.apiKey}` }, body: JSON.stringify({ messages: [] }),
+    });
+    assert.equal(result.status, 200); await result.text();
+    response.write(line({ event: { type: "model.usage", usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 }, reasoningTokens: 0 } }));
+    response.end(line({ done: { finalText: "ok" } }));
+  });
+  try {
+    const agent = createJiuwenSwarmAgentFactory({ adapterUrl: adapter.url, modelStreamer: async () => ({
+      assistantMessage: { role: "assistant", content: "ok" }, toolCalls: [],
+    }) })(options());
+    const events = collect(agent);
+    await agent.execute("go");
+    assert.deepEqual(events.filter(event => event.type === "model_usage"), [{ type: "model_usage", usageReported: false }]);
+    assert.equal(events.some(event => event.type === "usage"), false);
+  } finally { await adapter.close(); }
 });
 
 test("a tool call from the adapter runs the real tool here and is reported as tool events", async () => {
@@ -567,6 +640,26 @@ test("the idle timeout stalls a run with no gateway progress, with the wording s
   } finally {
     await adapter.close();
   }
+});
+
+test("an unexpected generic Swarm question is shown in chat without leaving the run open", async () => {
+  const question = "Which timeout?\n- Idle timeout\n- Whole-turn timeout";
+  const adapter = await fakeAdapter((_request, response) => {
+    response.writeHead(200);
+    response.write(line({ event: { type: "user_input.required", turn: 1, request: { id: "q1", question } } }));
+  });
+  try {
+    const agent = createJiuwenSwarmAgentFactory({ adapterUrl: adapter.url })(options());
+    const events = collect(agent);
+    const result = await Promise.race([
+      agent.execute("Change the timeout"),
+      delay(1_000).then(() => { throw new Error("The run kept waiting on the question"); }),
+    ]);
+    assert.equal(result.finalMessages.at(-1)?.content, question);
+    const updates = events.filter(event => event.type === "message_update");
+    assert.deepEqual(updates.map(event => event.assistantMessageEvent.type === "text_delta" && event.assistantMessageEvent.delta),
+      [question]);
+  } finally { await adapter.close(); }
 });
 
 test("a JiuwenSwarm approval question pauses the idle clock: a human answer slower than the idle timeout still completes the run", async () => {
@@ -1735,7 +1828,7 @@ test("by default the model gets JiuwenSwarm's own tools but not those acting on 
     assert.equal(sent.systemPrompt.includes("Use only the registered workspace tools"), false);
     // Commands and file writes stay in ScienceDiscovery's sandbox: JiuwenSwarm's host tools are hidden, and the prompt says so.
     // These options give the run no web tools, so JiuwenSwarm's web tools are hidden as well.
-    assert.deepEqual(sent.hiddenJiuwenSwarmTools, ["bash", "read_file", "write_file", "edit_file", "glob", "list_files", "grep", "read_pdf",
+    assert.deepEqual(sent.hiddenJiuwenSwarmTools, ["ask_user", "bash", "read_file", "write_file", "edit_file", "glob", "list_files", "grep", "read_pdf",
       "free_search", "paid_search", "fetch_webpage",
       "todo_create", "todo_modify", "todo_list", "todo_get",
       "subagent_spawn", "subagent_wait", "task_tool", "subagent_list", "subagent_send_input", "subagent_close", "subagent_resume"]);
@@ -2097,12 +2190,13 @@ test("with the desktop launcher an empty staging leaves global skill switches un
 });
 
 for (const desktop of [false, true]) for (const fresh of [false, true]) {
-  test(`first-use import ${fresh ? "with an empty installed list " : ""}${desktop ? "keeps Desktop catalog explicit and imports Library references" : "imports non-Desktop skills"}`, async () => {
+  test(`first-use import ${fresh ? "with an empty installed list " : ""}${desktop ? "imports bundled skills and Library references while keeping managed Desktop catalog explicit" : "imports non-Desktop skills"}`, async () => {
     const adapter = await fakeAdapter(async ({ body, method, url }, response) => {
       response.writeHead(200);
       if (method === "GET" && url === "/agent/skills") {
         response.end(JSON.stringify({ skills: fresh ? [] : [
           { name: "disabled", enabled: false, skillId: "disabled", source: "sciencediscovery" },
+          { name: "literature-searcher", enabled: false, skillId: "literature-searcher", source: "sciencediscovery" },
         ] }));
       } else if (body.skills) {
         response.end(JSON.stringify({ skills: Object.fromEntries(body.skills.map(({ id }: { id: string }) => [id, { name: id }])) }));
@@ -2110,25 +2204,29 @@ for (const desktop of [false, true]) for (const fresh of [false, true]) {
     });
     try {
       await createJiuwenSwarmAgentFactory({ adapterUrl: adapter.url, ...(desktop ? { skillSelection: "desktop" as const } : {}) })(skillOptions({
-        skills: [skill("catalog"), { ...skill("library"), importOnRun: true }, ...(fresh ? [] : [{ ...skill("disabled"), importOnRun: true }])],
+        skills: [skill("evolve-design"), skill("catalog"), { ...skill("library"), importOnRun: true },
+          ...(fresh ? [] : [skill("literature-searcher"), { ...skill("disabled"), importOnRun: true }])],
       })).execute("go");
       const imports = adapter.requests.filter((request) => request.body.skills);
       assert.equal(imports.length, 1);
-      assert.deepEqual(imports[0]?.body.skills.map(({ id }: { id: string }) => id), desktop ? ["library"] : ["catalog", "library"]);
+      assert.deepEqual(imports[0]?.body.skills.map(({ id }: { id: string }) => id), desktop ? ["evolve-design", "library"] : ["evolve-design", "catalog", "library"]);
       assert.equal(adapter.requests.some((request) => request.url.includes("/enabled")), false);
       const run = adapter.requests.find((request) => request.body.tools)?.body;
       const reader = run.tools.find((tool: { name: string }) => tool.name === "read_skill");
       assert.doesNotMatch(JSON.stringify(reader.inputSchema), /disabled/);
+      assert.match(JSON.stringify(reader.inputSchema), /evolve-design/);
+      assert.doesNotMatch(JSON.stringify(reader.inputSchema), /literature-searcher/);
       if (desktop) assert.doesNotMatch(JSON.stringify(reader.inputSchema), /catalog/);
     } finally { await adapter.close(); }
   });
 }
 
-test("with the desktop selection missing skill packages still respects global switches", async () => {
+test("with the desktop selection missing skill packages defaults bundled readers on but respects saved disables", async () => {
   const adapter = await fakeAdapter(async ({ method, url }, response) => {
     response.writeHead(200);
     response.end(method === "GET" && url === "/agent/skills"
-      ? JSON.stringify({ skills: [] }) : line({ done: { finalText: "ok" } }));
+      ? JSON.stringify({ skills: [{ name: "evolve-design", skillId: "evolve-design", enabled: false, source: "sciencediscovery" }] })
+      : line({ done: { finalText: "ok" } }));
   });
   try {
     const config = { ...jiuwenSwarmConfigFromEnv({ SCIENCE_AGENT_EXECUTOR: "jiuwenswarm", SCIENCE_AGENT_ADAPTER_URL: adapter.url, SCIENCE_AGENT_SKILL_SELECTION: "desktop" })! };
@@ -2136,7 +2234,10 @@ test("with the desktop selection missing skill packages still respects global sw
     assert.equal(adapter.requests.filter((request) => request.url.startsWith("/agent/skills")).length, 1);
     const run = adapter.requests.find((request) => request.body.tools)?.body;
     assert.ok(run);
-    assert.equal(run.tools.some((tool: { name: string }) => tool.name === "read_skill"), false);
+    const reader = run.tools.find((tool: { name: string }) => tool.name === "read_skill");
+    assert.ok(reader);
+    assert.match(JSON.stringify(reader.inputSchema), /skill-creator/);
+    assert.doesNotMatch(JSON.stringify(reader.inputSchema), /evolve-design/);
   } finally {
     await adapter.close();
   }
@@ -2236,18 +2337,23 @@ test("the run's trajectory is recorded from the model calls JiuwenSwarm makes, a
   const workspaceRoot = await mkdtemp(join(tmpdir(), "jw-workspace-"));
   const turn = { assistantMessage: { role: "assistant", content: "Answer." }, toolCalls: [] };
   const streamer = (async () => turn) as never;
+  const issued: Array<string | null> = [];
   const adapter = await fakeAdapter(async ({ body }, response) => {
     response.writeHead(200);
     // Housekeeping is explicitly marked by the adapter's default-model route.
     for (const tools of [[{ type: "function", function: { name: "echo", description: "e", parameters: { type: "object" } } }], []]) {
-      await fetch(`${body.model.baseUrl}/chat/completions`, {
+      const reply = await fetch(`${body.model.baseUrl}/chat/completions`, {
         method: "POST", headers: { authorization: `Bearer ${body.model.apiKey}`,
           ...(!tools.length ? { "x-sciencediscovery-model-purpose": "housekeeping" } : {}) },
         body: JSON.stringify({ stream: false, tools, messages: [{ role: "system", content: "sys" }, { role: "user", content: "go" }] }),
-      }).then((reply) => reply.text());
+      });
+      issued.push(reply.headers.get("x-sciencediscovery-response-id"));
+      await reply.text();
     }
-    response.write(line({ event: { type: "assistant.response.started", responseId: "r1", turn: 1 } }));
-    response.write(line({ event: { type: "assistant.delta", responseId: "r1", delta: "Answer.", turn: 1 } }));
+    // The adapter announces the id the gateway minted, which is what the proxied route does with
+    // the response header — the whole loop, not just its two halves.
+    response.write(line({ event: { type: "assistant.response.started", responseId: issued[0], turn: 1 } }));
+    response.write(line({ event: { type: "assistant.delta", responseId: issued[0], delta: "Answer.", turn: 1 } }));
     response.end(line({ done: { finalText: "Answer." } }));
   });
   try {
@@ -2264,8 +2370,115 @@ test("the run's trajectory is recorded from the model calls JiuwenSwarm makes, a
     assert.ok(records[0].evidence.contextRef?.digest, "the captured context is in the version store");
     const started = events.find((event) => event.type === "response_start") as any;
     assert.equal(started.evidence?.contextRef?.digest, records[0].evidence.contextRef.digest, "the response is tied to the model input it answered");
+    // The adapter announced its response only after the answer was complete, which for a tool-only
+    // call is after this record was written. The record must still name the call (#1133).
+    const completion = records.find((record) => record.name === "model.completed");
+    assert.equal(completion.evidence.responseId, issued[0], "the completion carries the id the gateway minted for this call");
+    assert.equal(started.evidence?.responseId, issued[0], "and the adapter announced that same id, not one of its own");
+    assert.equal(issued[1], null, "housekeeping is not recorded, so it is not named");
   } finally {
     await adapter.close();
+    await remove(dataDir, { recursive: true, force: true });
+    await remove(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+
+test("an id minted for a call stays with that call when a later one is already in flight", async () => {
+  const { mkdtemp, rm: remove } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { JiuwenSwarmTrajectory } = await import("./jiuwenswarm-trajectory.js");
+  const dataDir = await mkdtemp(join(tmpdir(), "jw-call-ids-"));
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "jw-call-ids-ws-"));
+  const records: any[] = [];
+  const trajectory = new JiuwenSwarmTrajectory(options({
+    config: { dataDir },
+    workspaceRoot,
+    versioning: { agentId: "main:session-1", trajectoryId: "run-1", requestExecutionId: "run-1",
+      recordEvent: async (event: unknown) => { records.push(event); } },
+  } as never));
+  try {
+    await trajectory.start({});
+    const a = { responseId: "id-a" };
+    const b = { responseId: "id-b" };
+    // Dispatch A, dispatch B, then let A answer. A shared field would stamp A's record with B's id
+    // and B's turn; JiuwenSwarm's own sub-agents share the run's gateway, so this overlap is real.
+    await trajectory.modelRequest({ history: [], systemPrompt: "sys", tools: [], call: a });
+    await trajectory.modelRequest({ history: [], systemPrompt: "sys", tools: [], call: b });
+    const answer = (content: string) => ({ assistantMessage: { role: "assistant", content }, toolCalls: [] });
+    await trajectory.modelCompleted(answer("a") as never, [], a);
+    await trajectory.modelCompleted(answer("b") as never, [], b);
+    const completions = records.filter((record) => record.name === "model.completed");
+    assert.deepEqual(completions.map((record) => [record.evidence.turn, record.evidence.responseId]),
+      [[0, "id-a"], [1, "id-b"]], "each call keeps its own id and its own turn");
+  } finally {
+    // The recorder holds the version store open; release it before the temp directory goes.
+    await trajectory.finish().catch(() => undefined);
+    await remove(dataDir, { recursive: true, force: true });
+    await remove(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+
+test("a stale adapter's announcement is reported against the id its record carries", { timeout: 3000 }, async (t) => {
+  const { mkdtemp, rm: remove } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { JiuwenSwarmTrajectory } = await import("./jiuwenswarm-trajectory.js");
+  const dataDir = await mkdtemp(join(tmpdir(), "jw-stale-adapter-"));
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "jw-stale-adapter-ws-"));
+  const warnings: string[] = [];
+  t.mock.method(console, "warn", (line: string) => { warnings.push(line); });
+  const trajectory = new JiuwenSwarmTrajectory(options({
+    config: { dataDir }, workspaceRoot,
+    versioning: { agentId: "main:session-1", trajectoryId: "run-1", requestExecutionId: "run-1", recordEvent: async () => undefined },
+  } as never));
+  try {
+    await trajectory.start({});
+    const call = { responseId: "recorded-id" };
+    await trajectory.modelRequest({ history: [], systemPrompt: "sys", tools: [], call });
+    await trajectory.modelCompleted({ assistantMessage: { role: "assistant", content: "a" }, toolCalls: [] } as never, [], call);
+    // An adapter built before the id was minted upstream announces one of its own.
+    trajectory.evidence({ type: "response_start", responseId: "adapter-own" });
+    assert.ok(warnings.some((line) => line.includes("adapter-own") && line.includes("recorded-id")),
+      "the mismatch is reported instead of silently naming the response twice");
+  } finally {
+    await trajectory.finish().catch(() => undefined);
+    await remove(dataDir, { recursive: true, force: true });
+    await remove(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+test("completions that land before their announcements do not raise a false mismatch", { timeout: 3000 }, async (t) => {
+  const { mkdtemp, rm: remove } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { JiuwenSwarmTrajectory } = await import("./jiuwenswarm-trajectory.js");
+  const dataDir = await mkdtemp(join(tmpdir(), "jw-overlap-adapter-"));
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "jw-overlap-adapter-ws-"));
+  const warnings: string[] = [];
+  t.mock.method(console, "warn", (line: string) => { warnings.push(line); });
+  const trajectory = new JiuwenSwarmTrajectory(options({
+    config: { dataDir }, workspaceRoot,
+    versioning: { agentId: "main:session-1", trajectoryId: "run-1", requestExecutionId: "run-1", recordEvent: async () => undefined },
+  } as never));
+  try {
+    await trajectory.start({});
+    const first = { responseId: "id-a" };
+    const second = { responseId: "id-b" };
+    await trajectory.modelRequest({ history: [], systemPrompt: "sys", tools: [], call: first });
+    await trajectory.modelCompleted({ assistantMessage: { role: "assistant", content: "a" }, toolCalls: [] } as never, [], first);
+    await trajectory.modelRequest({ history: [], systemPrompt: "sys", tools: [], call: second });
+    await trajectory.modelCompleted({ assistantMessage: { role: "assistant", content: "b" }, toolCalls: [] } as never, [], second);
+    // A tool-only turn announces only after Swarm replays it, so both records
+    // exist before either announcement — the ordering that used to alarm about a
+    // swap that did not happen.
+    trajectory.evidence({ type: "response_start", responseId: "id-a" });
+    trajectory.evidence({ type: "response_start", responseId: "id-b" });
+    assert.deepEqual(warnings.filter((line) => line.includes("adapter announced")), []);
+  } finally {
+    await trajectory.finish().catch(() => undefined);
     await remove(dataDir, { recursive: true, force: true });
     await remove(workspaceRoot, { recursive: true, force: true });
   }

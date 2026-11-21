@@ -19,9 +19,13 @@ def api(tmp_path):
     call.store, call.root = store, tmp_path
     return call
 
-def create(api, key="create"):
-    return api("create", dict(executor=EXECUTOR, idempotencyKey=key, maxDepth=2, maxNodes=20,
-        maxSearchRounds=3, objective="Catalyst", rootHypothesis="Explore catalysts"))
+def create(api, key="create", **overrides):
+    # A keyword may not be repeated between the literals and **overrides, so the
+    # defaults go in first and the caller's values replace them.
+    payload = dict(executor=EXECUTOR, idempotencyKey=key, maxDepth=2, maxNodes=20,
+        maxSearchRounds=3, objective="Catalyst", rootHypothesis="Explore catalysts")
+    payload.update(overrides)
+    return api("create", payload)
 
 def mutate(api, tree, op, **params):
     result = api(op, dict(treeId=tree["treeId"], expectedRevision=tree["revision"], idempotencyKey=f'{op}-{tree["revision"]}', **params))
@@ -143,3 +147,44 @@ def test_lease_comparison_handles_microseconds_at_millisecond_boundary(api, monk
     assert result(api, tree, request)["handle"]
     monkeypatch.setattr(idea_tree_service, "now", lambda: "2026-09-10T12:00:00.124Z")
     assert api("recover")["recoveredExecutions"] == 1
+
+
+IDEA_TREE_READ_SCRIPT = """
+import sys
+from pathlib import Path
+from sciencediscovery_evolve.vendor.idea_tree.idea_tree_service import IdeaTreeStore
+
+root = Path(sys.argv[1])
+expected = "".join(chr(code) for code in (0x50ac, 0x5316, 0x5242))
+store = IdeaTreeStore(root)
+tree = store.call("project", "session", "readTree", {"treeId": sys.argv[2]}, "reader")
+assert tree is not None, "the tree did not survive the restart"
+assert tree["treeId"] == sys.argv[2], tree["treeId"]
+assert tree["objective"] == expected, tree["objective"]
+try:
+    (root / "project" / "session" / "state.json").read_text()
+except UnicodeDecodeError:
+    pass
+else:
+    raise SystemExit("this child decodes as UTF-8, so the probe above proves nothing")
+print("ok")
+"""
+
+
+def test_a_tree_with_non_ascii_content_reads_on_a_non_utf8_host(api):
+    # IdeaTreeStore.call() re-reads state.json on every operation, so a host whose
+    # default codec is not UTF-8 could not list or open any tree at all (#1229).
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    title = "".join(chr(code) for code in (0x50ac, 0x5316, 0x5242))
+    tree = create(api, key="non-ascii", objective=title, rootHypothesis=title)
+    environment = {**os.environ, "PYTHONUTF8": "0", "LC_ALL": "C", "LANG": "C", "PYTHONIOENCODING": "ascii"}
+    source = str(Path(__file__).resolve().parents[1] / "src")
+    environment["PYTHONPATH"] = os.pathsep.join(filter(None, [source, environment.get("PYTHONPATH")]))
+    completed = subprocess.run([sys.executable, "-c", IDEA_TREE_READ_SCRIPT, str(api.root), tree["treeId"]],
+                               capture_output=True, text=True, env=environment)
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "ok"

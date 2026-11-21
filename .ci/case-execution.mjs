@@ -79,9 +79,10 @@ function metricDocuments(root) {
 }
 const outcomeStatus = { PASS: 'passed', FAIL: 'failed', SKIPPED: 'skipped', PROVIDER_FAULT: 'provider_fault' };
 const status = value => typeof value === 'string' && /^[a-z][a-z0-9_-]{0,39}$/.test(value) ? value : undefined;
+const realLevels = { merge: 'L3', daily: 'L4', release: 'L5' };
 
 export function caseExecutionSummary(plan, root, verdict) {
-  if (!['daily', 'release'].includes(plan.profile)) return undefined;
+  if (!Object.hasOwn(realLevels, plan.profile)) return undefined;
   const results = new Map((verdict.results ?? []).map(result => [result.key, result]));
   const rows = [];
   for (const shard of realShards(plan)) {
@@ -91,6 +92,10 @@ export function caseExecutionSummary(plan, root, verdict) {
       // Ambiguous evidence cannot supply a measurement for this identity.
       const doc = candidates.length === 1 ? candidates[0] : {};
       const m = executionMeasurements(doc), evaluation = doc.evaluation;
+      const lowerBound = doc.benchmark === 'biomnibench-da' && doc.judge_usage?.complete === false;
+      const tokens = value => lowerBound && count(value) !== undefined ? `≥ ${compactTokens(value)}` : compactTokens(value);
+      const unknown = count(doc.judge_usage?.unknown_attempts);
+      const tokenNote = lowerBound && unknown !== undefined ? ` (${unknown} attempts unknown)` : '';
       const score = first(finite(evaluation?.overall_score), finite(evaluation?.total_score), finite(evaluation?.score));
       const duration = number(doc.generation_duration_ms);
       const started = typeof doc.started_at === 'string' ? Date.parse(doc.started_at) : NaN;
@@ -100,14 +105,15 @@ export function caseExecutionSummary(plan, root, verdict) {
         status: outcomeStatus[result?.outcome] ?? status(doc.integration_status) ?? status(doc.integration) ?? 'not_run',
         score: score === undefined ? 'n/a' : String(score),
         peak_memory_gb: m.peak_rss_bytes === undefined ? 'n/a' : (m.peak_rss_bytes / 1024 ** 3).toFixed(2),
-        generated_tokens: compactTokens(m.generated_tokens), judge_tokens: compactTokens(m.judge_tokens),
-        total_tokens: compactTokens(m.total_tokens), tool_calls: m.tool_calls === undefined ? 'n/a' : String(m.tool_calls),
+        generated_tokens: compactTokens(m.generated_tokens), judge_tokens: tokens(m.judge_tokens),
+        total_tokens: tokens(m.total_tokens) + tokenNote, tool_calls: m.tool_calls === undefined ? 'n/a' : String(m.tool_calls),
         duration_min: duration === undefined ? 'n/a' : (duration / 60000).toFixed(1),
       } });
     }
   }
   rows.sort((a, b) => a.started - b.started || a.row.case.localeCompare(b.row.case));
-  const table = { title: 'case execution', columns, rows: rows.map(({ row }, i) => ({ order: String(i + 1), ...row })) };
+  const table = { title: 'case execution', group: { key: plan.profile, label: `${realLevels[plan.profile]} · ${plan.profile}` },
+    columns, rows: rows.map(({ row }, i) => ({ order: String(i + 1), ...row })) };
   // Like tagged summaries, all selected but unverified cases count as failed.
   // These display counts do not change the gate's verdict or retry semantics.
   const tests = plan.entries.length, passed = verdict.passed;
@@ -118,7 +124,7 @@ export function caseExecutionSummary(plan, root, verdict) {
 
 export function renderCaseExecution(table) {
   const escape = value => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('|', '&#124;').replace(/[\r\n]/g, ' ');
-  return [`### ${table.title}`, '', `| ${table.columns.map(c => c.label).join(' | ')} |`,
+  return [`### ${table.title}${table.group ? ` — ${table.group.label}` : ''}`, '', `| ${table.columns.map(c => c.label).join(' | ')} |`,
     `| ${table.columns.map(() => '---').join(' | ')} |`,
     ...table.rows.map(row => `| ${table.columns.map(c => escape(row[c.key])).join(' | ')} |`), '', ''].join('\n');
 }
@@ -126,7 +132,7 @@ export function renderCaseExecution(table) {
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const [planPath, root, output] = process.argv.slice(2);
   const plan = validatePlan(JSON.parse(readFileSync(planPath, 'utf8')));
-  if (['daily', 'release'].includes(plan.profile)) {
+  if (Object.hasOwn(realLevels, plan.profile)) {
     const verdict = JSON.parse(readFileSync(join(root, 'verdict.json'), 'utf8'));
     if (verdict.planDigest !== plan.digest) throw new Error('CASE_EXECUTION_PLAN_MISMATCH');
     const summary = caseExecutionSummary(plan, root, verdict);

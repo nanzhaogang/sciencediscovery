@@ -13,6 +13,7 @@
 // limitations under the License.
 
 import { useState } from "react";
+import { isEvidenceSessionReadOnly } from "@sciencediscovery/schema";
 
 import type { WorkspaceActions } from "../app/use-workspace.js";
 import type { SessionDetail } from "../api/types.js";
@@ -81,6 +82,7 @@ export function SessionBar({
       >
         {title}
       </span>
+      {detail && isEvidenceSessionReadOnly(detail) ? <span className="research-readonly-badge">🔒 {TEXT.researchPackage.readOnlyBadge}</span> : null}
       <div className="task-head-meta">
         {projectName ? (
           <>

@@ -6,6 +6,7 @@ import json
 import math
 import os
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -126,11 +127,13 @@ class ResearchStore:
             queue.put_nowait(True)
 
     def read(self, project: str, session: str, research: str) -> dict:
-        return json.loads(self.path(project, session, research).read_text())
+        # The writer stores UTF-8 (see save above); a read that lets the host pick
+        # the codec fails on a Chinese Windows install, where the default is cp936.
+        return json.loads(self.path(project, session, research).read_text(encoding='utf-8'))
 
     def list(self, project: str, session: str) -> list[dict]:
         directory = self.path(project, session, 'unused').parent
-        return sorted((json.loads(p.read_text()) for p in directory.glob('*.json')), key=lambda s: s['createdAt'], reverse=True)
+        return sorted((json.loads(p.read_text(encoding='utf-8')) for p in directory.glob('*.json')), key=lambda s: s['createdAt'], reverse=True)
 
 
 def node(identifier: str, parent: str | None, hypothesis: str, kind: str, depth: int) -> dict:
@@ -139,7 +142,31 @@ def node(identifier: str, parent: str | None, hypothesis: str, kind: str, depth:
                 searchStatus='active', priority=0.0, createdAt=now(), updatedAt=now())
 
 
+def is_permanent_quota(detail: str) -> bool:
+    """True when a 429 body reports exhausted quota/billing, which no wait fixes.
+
+    Provider-agnostic: only the `insufficient_quota` marker is treated as
+    permanent. A plain `rate_limit_exceeded` is transient and stays retriable.
+    """
+    return 'insufficient_quota' in detail.lower()
+
+
+# The budget check sets this aside before one model call. It is a reservation,
+# not a cap: since #1281 the request itself sends no max_tokens.
+OUTPUT_RESERVATION_TOKENS = 32768
+
 class IdeaTreeEngine:
+    # Retry budget for the model transport, shared by 429 and 5xx: one retry
+    # after the first attempt. The protocol-compatibility suite pins exactly
+    # two upstream calls on a persistent provider failure, so enlarging this
+    # needs that suite updated in the same change.
+    MAX_ATTEMPTS = 2
+    # Longest single backoff wait. A provider may ask for more, but the wait
+    # must stay bounded and pause/cancel must stay responsive.
+    MAX_RETRY_AFTER_SECONDS = 60.0
+    # Poll interval while waiting out a retry, so a pause/end lands promptly.
+    RETRY_POLL_SECONDS = 0.25
+
     def __init__(self, state: dict, store: ResearchStore, endpoint: dict, call=None):
         self.state, self.store, self.endpoint = state, store, endpoint
         self.stop_action: str | None = None
@@ -171,30 +198,58 @@ class IdeaTreeEngine:
     def assessors(self):
         return self.state.setdefault('template', snapshot('scientific-hypothesis-general/v1'))['assessors']
 
-    def role_effort(self, role):
-        """The stage's own thinking effort, if one was configured; assessors share `assess`."""
-        stage = 'assess' if role in {item['id'] for item in self.assessors()} else role
-        return self.state['settings'].get('roleThinkingEfforts', {}).get(stage)
+    def retry_delay(self, error: urllib.error.HTTPError, attempt: int) -> float:
+        """Backoff before retrying `attempt` (0-based). Honors the provider's
+        Retry-After delay when it is a plain number of seconds, capped so the
+        wait stays bounded; otherwise the fixed backoff the Agent client uses
+        (500ms, doubling, capped at 4s)."""
+        headers = getattr(error, 'headers', None) or {}
+        try:
+            after = float(headers.get('Retry-After'))
+        except (TypeError, ValueError):
+            after = None
+        if after is not None and math.isfinite(after):
+            return max(0.0, min(after, self.MAX_RETRY_AFTER_SECONDS))
+        return min(4.0, 0.5 * 2 ** attempt)
 
-    def transport(self, system, payload, ceiling, effort=None):
+    def wait_for_retry(self, delay: float) -> None:
+        """Wait out a retry delay in short slices, so pause/cancel lands
+        promptly instead of only after the whole wait."""
+        remaining = delay
+        while remaining > 0:
+            self.check_stop()
+            step = min(self.RETRY_POLL_SECONDS, remaining)
+            time.sleep(step)
+            remaining -= step
+        self.check_stop()
+
+    def transport(self, system, payload):
         # No temperature: some gateways accept only their own value (Kimi: "only 1 is allowed"). See completion.py.
-        fields = dict(messages=[dict(role='system', content=system), dict(role='user', content=json.dumps(payload, ensure_ascii=False))], max_tokens=ceiling)
-        if effort:
-            # The control plane narrows it to a stop the model accepts.
-            fields['reasoning_effort'] = effort
+        # No max_tokens either: the per-call cap was removed (#1281), so the call
+        # leaves that ceiling to the model and the service behind it.
+        # No reasoning_effort either: every stage keeps the model profile's own thinking level.
+        fields = dict(messages=[dict(role='system', content=system), dict(role='user', content=json.dumps(payload, ensure_ascii=False))])
         body = json.dumps(fields).encode()
         request = urllib.request.Request(self.endpoint['url'], data=body, headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + self.endpoint['token']})
-        for attempt in range(2):
+        for attempt in range(self.MAX_ATTEMPTS):
             try:
                 with urllib.request.urlopen(request, timeout=1230) as response:
                     result = json.load(response)
                 usage = result.get('usage')
                 return result['choices'][0]['message']['content'], usage.get('total_tokens') if isinstance(usage, dict) else None
             except urllib.error.HTTPError as error:
-                if error.code >= 500 and attempt == 0:
-                    continue
                 detail = error.read(1000).decode(errors='replace')
-                raise RuntimeError(f"Model HTTP {error.code}: {detail}") from error
+                try:
+                    if error.code == 429 and is_permanent_quota(detail):
+                        raise RuntimeError(f"Model HTTP 429: permanent quota error, not retried: {detail}") from error
+                    if (error.code == 429 or error.code >= 500) and attempt + 1 < self.MAX_ATTEMPTS:
+                        self.wait_for_retry(self.retry_delay(error, attempt))
+                        continue
+                    if error.code == 429:
+                        raise RuntimeError(f"Model HTTP 429: retry budget exhausted after {self.MAX_ATTEMPTS} attempts: {detail}") from error
+                    raise RuntimeError(f"Model HTTP {error.code}: {detail}") from error
+                finally:
+                    error.close()
             except (urllib.error.URLError, TimeoutError):
                 raise
 
@@ -224,9 +279,9 @@ class IdeaTreeEngine:
         system = self.role_prompt(role) + '\nReturn JSON only, matching: ' + shape
         for attempt in range(2):
             self.check_stop()
-            ceiling = self.state['settings']['maxTokensPerCall']
-            # Conservative UTF-8 bound; no tokenizer/model dependency in the state engine.
-            estimate = len((system + json.dumps(payload, ensure_ascii=False)).encode()) + ceiling + 256
+            # Reservation only, not a cap: the request no longer sends max_tokens
+            # (#1281). The bound stays so the total-budget check keeps its shape.
+            estimate = len((system + json.dumps(payload, ensure_ascii=False)).encode()) + OUTPUT_RESERVATION_TOKENS + 256
             async with self.usage_lock:
                 budget = self.state['settings'].get('maxTokens')
                 if budget and self.state['tokens'] + self.state.get('unreportedBudgetEstimate', 0) + self.reserved + estimate > budget:
@@ -238,7 +293,7 @@ class IdeaTreeEngine:
                 if self.call_override:
                     raw, usage = await self.call_override(role, payload)
                 else:
-                    raw, usage = await asyncio.to_thread(self.transport, system, payload, ceiling, self.role_effort(role))
+                    raw, usage = await asyncio.to_thread(self.transport, system, payload)
                 received = True
             finally:
                 async with self.usage_lock:

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { DesktopConfigurationRequest } from "../api/configuration.js";
 
 import { artifactName } from "./artifact-labels.js";
 import {
@@ -81,9 +82,12 @@ import type {
 } from "../api/types.js";
 import { closeRunStream, reduceRunStream } from "../run-stream/reducer.js";
 import { emptyRunStream, isTerminalRunStatus, type RunStreamState } from "../run-stream/model.js";
+import { modelForNewConversation, readRememberedModel, writeRememberedModel } from "./session-model-memory.js";
+import type { ReadableStorage } from "../state/storage.js";
 import { pendingPermissions, reconcilePermissions } from "../run-stream/permission.js";
 import { foldRunRecords, replayRun, type RunReplay } from "../run-stream/replay.js";
 import { TEXT } from "../text.js";
+import { inheritForSession, newSessionRequest } from "./approval-mode-preference.js";
 
 /** A run in one of these states has not finished. `blocked` counts: the model
  *  is waiting on a permission decision, so the turn is still open. */
@@ -132,6 +136,8 @@ export interface WorkspaceState {
   connection: Connection;
   confirm: ConfirmRequest | undefined;
   defaultModelId?: string;
+  /** The mode a conversation created now would run under (project/global default). */
+  defaultApprovalMode?: ApprovalMode;
   detail?: SessionDetail;
   /** Counts the drafts started since the app opened. Two consecutive drafts
    *  share no Session id, so this is what tells them apart. */
@@ -221,6 +227,10 @@ export interface WorkspaceActions {
   renameSession: (session: Session, title: string) => Promise<void>;
   /** Re-read the model catalog after the wizard or settings changed it. */
   refreshCatalog: () => Promise<void>;
+  /** Keep upload preflight in step with the quota response confirmed by the service. */
+  applyQuotaSettings: (settings: import("../api/types.js").SystemQuotaSettings) => void;
+  /** Reconcile a saved card and follow its server-created continuation. */
+  refreshConfiguration: (request: DesktopConfigurationRequest) => void;
   /** Re-read session rows after research import, continuation or branching. */
   refreshSessions: () => Promise<void>;
   /** Take one card out of the composer. The file stays in the workspace: the
@@ -295,6 +305,11 @@ interface ReplayBatch {
   replays: RunReplay[];
 }
 
+/** The browser storage when this app runs with one; a test or a restricted host may not. */
+function modelStorage(): ReadableStorage | undefined {
+  return (globalThis as { localStorage?: ReadableStorage }).localStorage;
+}
+
 /**
  * All of this app's state, in one place.
  *
@@ -328,9 +343,16 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
   const [presets, setPresets] = useState<ModelProviderPreset[]>([]);
   const [providers, setProviders] = useState<ModelProvider[]>([]);
   const [defaultModelId, setDefaultModelId] = useState<string>();
+  /** The mode a conversation created right now would run under: the project or
+   *  global default the service applies (#1204). */
+  const [defaultApprovalMode, setDefaultApprovalMode] = useState<ApprovalMode>();
   const [selectedModelId, setSelectedModelId] = useState<string>();
   const [run, setRun] = useState<RunStreamState>(emptyRunStream);
   const [running, setRunning] = useState(false);
+  const pendingConfigurationRefresh = useRef<DesktopConfigurationRequest | undefined>(undefined);
+  const configurationRefreshEpoch = useRef(0);
+  const configurationRetryTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const followedConfigurationRuns = useRef(new Set<string>());
   const [pendingMessage, setPendingMessage] = useState<PendingMessage>();
   const [replays, setReplays] = useState<RunReplay[]>([]);
   const [outputs, setOutputs] = useState<SessionArtifactOutput[]>([]);
@@ -369,6 +391,15 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
    *  them one. `refreshSessionLists` is the only reader that may not fail. */
   const inboxRef = useRef<Project | undefined>(undefined);
   const draftModelOverride = useRef<string | undefined>(undefined);
+  /**
+   * The last model the user picked themselves, for conversations created later.
+   *
+   * Only an explicit pick writes it: opening a conversation reads that conversation's
+   * own model and must not become the default for the next one (#1205). It is restored
+   * from desktop storage at mount, so a conversation created after a restart still starts
+   * from it.
+   */
+  const rememberedModelId = useRef<string | undefined>(readRememberedModel(modelStorage()));
   const modelSelectionEpoch = useRef(0);
   const modelSelectionQueue = useRef(Promise.resolve());
   const runningRef = useRef(false);
@@ -575,19 +606,13 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
         setModels(profiles);
         setPresets(catalog.presets);
         setProviders(catalog.providers);
-        let hasHistory = false;
-        if (!profiles.length) {
-          const [projects, inbox] = await Promise.all([listProjects(client), ensureInbox(client)]);
-          hasHistory = projects.length > 0 || (await listSessions(client, inbox.id, "all")).length > 0;
-          if (cancelled) return;
-        }
-        const decision = resolveCatalog(profiles, settings.overrides, hasHistory);
+        const decision = resolveCatalog(profiles, settings.overrides);
         if (decision.boot === "setup") {
           setBoot("setup");
           return;
         }
         setDefaultModelId(decision.defaultModelId);
-        setSelectedModelId(decision.defaultModelId);
+        setSelectedModelId(decision.defaultModelId ?? profiles[0]?.id);
         if (cancelled) return;
         setBoot("ready");
       } catch (reason) {
@@ -628,7 +653,24 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
           setPresets(catalog.presets);
           setProviders(catalog.providers);
         }
+        if (!profiles.length) {
+          draftModelOverride.current = undefined;
+          rememberedModelId.current = undefined;
+          writeRememberedModel(modelStorage(), undefined);
+          setDefaultModelId(undefined);
+          setSelectedModelId(undefined);
+          setBoot("setup");
+          return;
+        }
+        // A remembered pick that left the catalog would point new conversations at a
+        // model this instance cannot run, so drop it and fall back below (#1205).
+        if (rememberedModelId.current && modelForNewConversation(rememberedModelId.current, profiles) === undefined) {
+          rememberedModelId.current = undefined;
+          writeRememberedModel(modelStorage(), undefined);
+        }
         setDefaultModelId(settings.overrides.modelId);
+        setDefaultApprovalMode((target ? undefined : projectSettings?.effective.defaultApprovalMode)
+          ?? settings.effective.defaultApprovalMode ?? "ask_for_dangerous");
         if (fresh && target) {
           setDetail(current => {
             if (!current || current.id !== target) return current;
@@ -640,7 +682,7 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
           setSelectedModelId(fresh.effective.modelId);
         } else {
           const inherited = projectSettings ? projectSettings.effective.modelId : settings.overrides.modelId;
-          setSelectedModelId(draftModelOverride.current ?? inherited);
+          setSelectedModelId(draftModelOverride.current ?? modelForNewConversation(rememberedModelId.current, profiles) ?? inherited ?? profiles[0]?.id);
         }
       } catch (reason) {
         // Background reads retry on the next tick; rejected credentials still
@@ -762,11 +804,19 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
     const inFlight = sessionCreation.current;
     if (inFlight !== undefined && inFlight.projectId === projectId) return inFlight.promise;
     const epoch = viewEpoch.current;
-    const explicitModelId = draftModelOverride.current;
+    // The pick the user made for the previous conversation is the default for this one,
+    // as long as this instance still has that model (#1205).
+    const explicitModelId = draftModelOverride.current ?? modelForNewConversation(rememberedModelId.current, models);
     const token = {};
     const creation = (async () => {
       try {
-        const created = await createSession(client, projectId, explicitModelId ? { modelId: explicitModelId } : {});
+        // #1206 remembers the approval mode for the new conversation; #1207 keeps the
+        // remembered model out of the top-level `modelId` shortcut, which the service
+        // expands into the session's review model as well.
+        const created = await createSession(client, projectId, {
+          ...newSessionRequest(),
+          ...(explicitModelId ? { settingsOverrides: { modelId: explicitModelId } } : {}),
+        });
         if (viewEpoch.current === epoch) {
           setSessionId(created.id);
           sessionRef.current = created.id;
@@ -789,7 +839,7 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
     })();
     sessionCreation.current = { projectId, promise: creation, token };
     return creation;
-  }, [client, refreshSessionLists, report, toast]);
+  }, [client, models, refreshSessionLists, report, toast]);
 
   /**
    * The session a write should land in, created if the app has none open.
@@ -1130,41 +1180,124 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
   /** Follow an already-existing run. `live` marks it as unfinished, which is
    *  what puts the composer into 停止 state. */
   const follow = useCallback(
-    async (target: string, runId: string, live: boolean) => {
+    async (target: string, runId: string, live: boolean, quiet = false) => {
       const controller = new AbortController();
+      const view = viewEpoch.current;
+      let outcome: "completed" | "interrupted" | "cancelled" | "denied" = "interrupted";
       abortRef.current = controller;
       if (live) {
         runningRef.current = true;
         setRunning(true);
       }
       try {
-        await subscribeRunEvents(client, target, runId, 0, applyEvent(target), controller.signal, {
+        const receive = applyEvent(target);
+        await subscribeRunEvents(client, target, runId, 0, (event, sequence) => {
+          if (view !== viewEpoch.current || controller.signal.aborted) return;
+          if (event?.type === "run.status" && isTerminalRunStatus(event.status)) outcome = "completed";
+          receive(event, sequence);
+        }, controller.signal, {
           // One low-key notice for the whole stream, and only when something
           // was actually missing: the run went on, so this is not an error.
           onSkippedFrames: (count) => toast(TEXT.conversation.malformedFrames(count), "info"),
         });
       } catch (reason) {
         if (isAuthFailure(reason)) {
+          outcome = "denied";
           onAuthRejected();
-        } else if (!isAbortError(reason)) {
+        } else if (!isAbortError(reason) && !quiet) {
           toast(TEXT.conversation.streamEnded);
         }
       } finally {
-        if (abortRef.current === controller) abortRef.current = undefined;
+        const ownsWire = abortRef.current === controller;
+        if (ownsWire) abortRef.current = undefined;
         // Leaving the Session aborts this wire but not the wait: by the time
         // the finally lands, `running` and the live run describe whichever
         // Session is on screen. Clearing them here would stop a run this view
         // no longer owns — `clearSession` has already cleared them for the
         // Session being left.
-        if (sessionRef.current === target) {
+        if (ownsWire && view === viewEpoch.current && sessionRef.current === target) {
           runningRef.current = false;
           setRunning(false);
           updateRun(closeRunStream);
         }
       }
+      return controller.signal.aborted ? "cancelled" : outcome;
     },
     [applyEvent, client, onAuthRejected, toast, updateRun],
   );
+
+  /** Saving a card does not send the prompt again. The server owns continuation;
+   * this client only reads its run and follows it, once the previous wire ends. */
+  const refreshConfiguration = useCallback(function retryConfiguration(request: DesktopConfigurationRequest, retry = false): void {
+    const target = request.sessionId;
+    if (target !== sessionRef.current || (!["applied", "dismissed", "cancelled", "expired"].includes(request.state)
+      && !(request.state === "stale" && !("capabilityId" in request))
+      && !("resumption" in request && ["pending", "queued", "started"].includes(request.resumption.state)))) return;
+    clearTimeout(configurationRetryTimer.current);
+    configurationRetryTimer.current = undefined;
+    const epoch = ++configurationRefreshEpoch.current;
+    pendingConfigurationRefresh.current = request;
+    if (request.state === "applied") void refreshModels(true);
+    if (runningRef.current) return;
+    pendingConfigurationRefresh.current = undefined;
+    const view = viewEpoch.current;
+    const sent = sendEpoch.current;
+    const current = () => target === sessionRef.current && view === viewEpoch.current && sent === sendEpoch.current
+      && epoch === configurationRefreshEpoch.current;
+    const scheduleRetry = () => {
+      pendingConfigurationRefresh.current = request;
+      configurationRetryTimer.current = setTimeout(() => {
+        if (!current() || pendingConfigurationRefresh.current !== request) return;
+        configurationRetryTimer.current = undefined;
+        retryConfiguration(request, true);
+      }, 2_000);
+    };
+    void (async () => {
+      try {
+        const [fresh, runs] = await Promise.all([getSession(client, target), listRuns(client, target)]);
+        const batch = await buildReplays(target, runs);
+        if (target !== sessionRef.current || view !== viewEpoch.current || sent !== sendEpoch.current
+          || epoch !== configurationRefreshEpoch.current || runningRef.current) return;
+        rememberBounded(detailsBySession.current, target, fresh);
+        setDetail(fresh);
+        commitReplays(target, batch);
+        resetRun();
+        const live = runs.filter(entry => isActiveRun(entry.status)).at(-1);
+        if (live && !followedConfigurationRuns.current.has(live.id)) {
+          followedConfigurationRuns.current.add(live.id);
+          void follow(target, live.id, true, retry).then(outcome => {
+            if (target !== sessionRef.current || view !== viewEpoch.current || sent !== sendEpoch.current) return;
+            // Deduplicate completed runs, not broken subscriptions. EOF without
+            // a terminal event is also a disconnect, even if fetch succeeded.
+            if (outcome === "interrupted") followedConfigurationRuns.current.delete(live.id);
+            if (!current() || outcome === "cancelled" || outcome === "denied") return;
+            if (outcome === "interrupted") scheduleRetry();
+            else {
+              // Reconcile through the same view/send/refresh guards. An older
+              // settle must not erase a newer card's continuation stream.
+              retryConfiguration(request, true);
+              void refreshPanel(target);
+            }
+          });
+        }
+        void refreshSessionLists();
+      } catch (reason) {
+        if (target !== sessionRef.current || view !== viewEpoch.current || sent !== sendEpoch.current
+          || epoch !== configurationRefreshEpoch.current) return;
+        if (!retry || isAuthFailure(reason)) report(reason);
+        if (isAuthFailure(reason)) return;
+        // The card intentionally does not notify on identical poll snapshots.
+        // Retain this refresh separately and retry one read at a time, without
+        // sending a prompt or requiring a new configuration state transition.
+        scheduleRetry();
+      }
+    })();
+  }, [buildReplays, client, commitReplays, follow, refreshModels, refreshPanel, refreshSessionLists, report, resetRun]);
+
+  useEffect(() => {
+    const pending = pendingConfigurationRefresh.current;
+    if (!running && pending && !configurationRetryTimer.current) refreshConfiguration(pending);
+  }, [running, refreshConfiguration]);
 
   // ── sending ──────────────────────────────────────────────────────────────
   const send = useCallback(
@@ -1174,6 +1307,10 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
       // Any settle still reading belongs to the turn before this message; it
       // must not write its snapshot — or clear this pending message — over it.
       sendEpoch.current += 1;
+      clearTimeout(configurationRetryTimer.current);
+      configurationRetryTimer.current = undefined;
+      pendingConfigurationRefresh.current = undefined;
+      configurationRefreshEpoch.current += 1;
       // Shown from the press, before the Session exists: the composer clears
       // its box on submit, and a message that disappears for the length of a
       // create request reads as a press that was dropped.
@@ -1273,6 +1410,11 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
 
   // ── session lifecycle ────────────────────────────────────────────────────
   const clearSession = useCallback(() => {
+    clearTimeout(configurationRetryTimer.current);
+    configurationRetryTimer.current = undefined;
+    pendingConfigurationRefresh.current = undefined;
+    followedConfigurationRuns.current.clear();
+    configurationRefreshEpoch.current += 1;
     abortRef.current?.abort();
     abortRef.current = undefined;
     // The stream whose wire was just cut will not clear these itself — it
@@ -1461,7 +1603,13 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
         // The listing is a mirror, so the row may be the one already open; the
         // open costs one read, and `openSession` returns before doing even that
         // when the ids match.
-        void openSession(reusable.id, target);
+        // An untouched draft is a new conversation too: give it the remembered
+        // mode before its read lands, and open it even if that write fails.
+        void (async () => {
+          try { await inheritForSession(reusable.id, (id, body) => updateSession(client, id, body)); }
+          catch { /* the draft keeps the service default */ }
+          await openSession(reusable.id, target);
+        })();
         return;
       }
 
@@ -1484,18 +1632,39 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
     async (name: string) => {
       try {
         const created = await createProjectRequest(client, name);
+        // The service creates a project's first conversation with its own default; a
+        // new conversation inherits the remembered mode here too, or this supported
+        // path would be the one place the rule does not hold.
+        try {
+          await inheritForSession(created.firstSession.id, (target, body) => updateSession(client, target, body));
+        } catch {
+          // The project already exists server-side; a failed inheritance write must
+          // not hide it. The conversation keeps the service default.
+        }
         setProjects((current) => [...current, created.project]);
+        // A Project arrives with one untitled conversation. Give it the model the user
+        // last picked, so "new conversation" means the same thing on this path too
+        // (#1205). A failure here is not fatal: opening the Session reads its real model.
+        const remembered = modelForNewConversation(rememberedModelId.current, models);
+        if (remembered && created.firstSession.modelId !== remembered) {
+          try { await updateSession(client, created.firstSession.id, { modelId: remembered }); }
+          catch { /* the stored selection still applies to the next conversation */ }
+        }
         await openSession(created.firstSession.id, created.project.id);
         await refreshSessionLists();
       } catch (reason) {
         report(reason);
       }
     },
-    [client, openSession, refreshSessionLists, report],
+    [client, models, openSession, refreshSessionLists, report],
   );
 
   const selectModel = useCallback(
     async (modelId: string) => {
+      // Written before the session update: a conversation created while that write is in
+      // flight must already start from the pick the user just made, and a restart keeps it.
+      rememberedModelId.current = modelId;
+      writeRememberedModel(modelStorage(), modelId);
       modelSelectionEpoch.current += 1;
       const epoch = modelSelectionEpoch.current;
       const target = sessionRef.current;
@@ -1530,7 +1699,7 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
    * Change the open session's approval mode.
    *
    * With no session open there is nothing to write: the choice applies to the
-   * session that exists, and a draft inherits the server's default. The reply
+   * session that exists, and a new one inherits the remembered preference. The reply
    * is read back rather than assumed — the detail is what the composer's
    * picker shows, and a failed write must not leave it claiming a mode the
    * session does not have.
@@ -1849,9 +2018,14 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
   // that ends the work itself.
   useEffect(
     () => () => {
+      clearTimeout(configurationRetryTimer.current);
+      configurationRetryTimer.current = undefined;
+      pendingConfigurationRefresh.current = undefined;
+      followedConfigurationRuns.current.clear();
+      configurationRefreshEpoch.current += 1;
       abortRef.current?.abort();
     },
-    [],
+    [client],
   );
 
   // What the sidebar lists: the raw listing keeps the drafts as well, because
@@ -1973,6 +2147,8 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
           },
         }),
       refreshCatalog,
+      applyQuotaSettings: (settings) => setUploadLimit(settings.uploadMaxFileBytes),
+      refreshConfiguration,
       refreshSessions: async () => { await refreshSessionLists(); },
       removeAttachment,
       retryAttachment,
@@ -2005,6 +2181,7 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
       openFile,
       openSession,
       refreshCatalog,
+      refreshConfiguration,
       refreshSessionLists,
       removeAttachment,
       report,
@@ -2033,6 +2210,7 @@ export function useWorkspace(client: ApiClient, onAuthRejected: () => void): Wor
     connection,
     confirm,
     defaultModelId,
+    defaultApprovalMode,
     detail,
     draftEpoch,
     inboxProject,

@@ -32,6 +32,7 @@ import {
   cloneRunEventDetails,
   computeSettingsSnapshot,
   firstUserAuthoredMessage,
+  hasConversation,
   skillAuthoringCommandPrompt,
   splitArtifactVersionSuffix,
 } from "./index.js";
@@ -103,6 +104,58 @@ test("Skill authoring slash commands expand into guarded Agent workflows", () =>
   assert.match(distill ?? "", /complete prior Session conversation and execution history/);
   assert.match(distill ?? "", /keep the validation steps/);
   assert.equal(skillAuthoringCommandPrompt("ordinary message"), undefined);
+
+  // #1262: an empty Session has nothing to distil. The unguarded wording sent the
+  // model looking for a conversation that was never there — 28 `run_shell` calls,
+  // 32 turns, ~89k tokens, no draft — so the prompt has to stop it instead.
+  const empty = skillAuthoringCommandPrompt("/distill-session 把这次会话里可复用的做法总结成一个技能", { hasHistory: false });
+  assert.ok(empty);
+  assert.match(empty, /no prior conversation to distil/u, "it says there is nothing to distil");
+  assert.match(empty, /Do not call create_skill yet/u, "it does not author a generic Skill");
+  assert.match(empty, /do not run shell commands/u, "it forbids looking for the conversation");
+  assert.match(empty, /application data directory/u, "it names the directory the run wandered into");
+  assert.match(empty, /把这次会话里可复用的做法总结成一个技能/u, "the user's own direction is kept");
+  assert.equal(/Infer the reusable workflow from the complete prior Session/u.test(empty), false,
+    "the inference instruction that caused the search must be absent");
+
+  // A caller that does not know keeps the old behaviour rather than refusing
+  // every distill, and a Session with history still gets the authoring prompt.
+  assert.equal(/Infer the reusable workflow/u.test(skillAuthoringCommandPrompt("/distill-session") ?? ""), true);
+  const withHistory = skillAuthoringCommandPrompt("/distill-session", { hasHistory: true });
+  assert.ok(withHistory);
+  assert.match(withHistory, /Infer the reusable workflow from the complete prior Session conversation/u);
+  assert.equal(/no prior conversation/u.test(withHistory), false);
+
+  // A notice-only Session has no conversation either. Runtime wake and review
+  // notices are stored with a user or assistant role and a `kind`, so a plain
+  // role test said "has history" for a Session that had only ever been woken.
+  assert.equal(hasConversation([]), false);
+  assert.equal(hasConversation([
+    { content: "wake", createdAt: "2026-11-20T00:00:00Z", id: "n1", kind: "wake_notice", role: "user" },
+  ]), false, "a wake notice is not a conversation");
+  assert.equal(hasConversation([
+    { content: "notice", createdAt: "2026-11-20T00:00:00Z", id: "n2", kind: "review_notice", role: "assistant" },
+  ]), false, "a review notice is not a conversation");
+  assert.equal(hasConversation([
+    { content: "config", createdAt: "2026-11-20T00:00:00Z", id: "n3", kind: "configuration_notice", role: "user" },
+  ]), false, "a configuration notice is not a conversation");
+  assert.equal(hasConversation([
+    { content: "checkpoint", createdAt: "2026-11-20T00:00:00Z", id: "n4", kind: "reviewer_checkpoint", role: "assistant" },
+  ]), false, "a reviewer checkpoint is not a conversation");
+  assert.equal(hasConversation([
+    { content: "timeout", createdAt: "2026-11-20T00:00:00Z", id: "n5", kind: "timeout_notice", role: "assistant" },
+  ]), false, "a timeout notice is not a conversation");
+  assert.equal(hasConversation([
+    { content: "hi", createdAt: "2026-11-20T00:00:00Z", id: "m1", role: "user" },
+  ]), true);
+  assert.equal(hasConversation([
+    { content: "hi", createdAt: "2026-11-20T00:00:00Z", id: "m2", kind: "message", role: "assistant" },
+  ]), true);
+
+  // The sibling command is untouched by the distill guard.
+  const creatorEmpty = skillAuthoringCommandPrompt("/skill-creator", { hasHistory: false });
+  assert.ok(creatorEmpty);
+  assert.match(creatorEmpty, /Ask one concise question for the workflow goal/u);
 });
 
 test("run event details clone falls back to JSON-safe values", () => {

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { completeChatRequest, normalizeUsage, carriedThinkingControls, rejectedThinkingControlFields, ModelRequestError, streamModelTurn, isAnthropicEndpoint, type ModelEndpoint, type ModelTurn } from "@sciencediscovery/model";
+import { completeChatRequest, normalizeUsage, carriedRequestFields, rejectedRequestFields, ModelRequestError, streamModelTurn, isAnthropicEndpoint, type ModelEndpoint, type ModelTurn } from "@sciencediscovery/model";
 import { request, type Dispatcher } from "undici";
 import { Readable } from "node:stream";
 import { MODEL_API_VARIANTS, DEFAULT_MODEL_API_VARIANT, type ModelApiProtocol, type ModelCompatibilityOutcome, type ModelConnectivityTestCategory, type ModelConnectivityTestResult, type ModelProfile, type ResolvedProxy } from "@sciencediscovery/schema";
@@ -86,7 +86,7 @@ export async function testModelConnectivity(options: ModelConnectivityTestOption
     // may rewrite `auto` to the model's declared default, and `kimi-k3` declares
     // `modes: ["enabled"]`), so `thinkingMode: "auto"` can rebuild the very body
     // the endpoint just refused. The streamed sender strips the named fields for
-    // the same reason (`withoutThinkingControls`).
+    // the same reason (`withoutFields`).
     let stripFromBody: string[] = [];
     let sentBody = "";
     const dispatch = async (target: ModelEndpoint) => {
@@ -134,9 +134,9 @@ export async function testModelConnectivity(options: ModelConnectivityTestOption
     try {
       let response = await dispatch(endpoint);
       if (!response.ok && response.status === 400) {
-        // A 400 that names the thinking control this request carried says
+        // A 400 that names a field this request carried says
         // nothing about the endpoint: the streamed sender strips exactly the
-        // named control and retries, so an endpoint whose streaming chat works
+        // named field and retries, so an endpoint whose streaming chat works
         // must not be reported as broken here. The transport keeps no fallback
         // of its own (see `completeChatRequest`), so this caller owns the retry.
         //
@@ -145,14 +145,14 @@ export async function testModelConnectivity(options: ModelConnectivityTestOption
         // injects nothing here would otherwise send the identical body again and
         // report a strip that never happened.
         const detail = await response.text().catch(() => "");
-        const carried = carriedThinkingControls(sentBody);
-        const named = [...rejectedThinkingControlFields(detail)].filter((field) => carried.has(field));
+        const carried = carriedRequestFields(sentBody);
+        const named = [...rejectedRequestFields(detail)].filter((field) => carried.has(field));
         if (named.length) {
           stripFromBody = named;
           response = await dispatch(endpoint);
           stripFromBody = [];
           basic = response.ok
-            ? { ...(await readCompletion(response)), message: "Valid basic completion structure after retrying without the thinking control this endpoint rejects" }
+            ? { ...(await readCompletion(response)), message: "Valid basic completion structure after retrying without the field this endpoint rejects" }
             : providerFailure(response.status);
         } else basic = providerFailure(response.status);
       } else if (!response.ok) basic = providerFailure(response.status);

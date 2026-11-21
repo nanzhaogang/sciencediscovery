@@ -17,7 +17,7 @@ export interface ResearchPackageExportProfileView {
 }
 export interface ResearchPackageExportTaskView {
   id: string;
-  status: "queued" | "running" | "completed" | "failed";
+  status: "queued" | "running" | "completed" | "failed" | "canceled";
   filename: string;
   createdAt: string;
   updatedAt: string;
@@ -66,8 +66,13 @@ export class PluginApiClient extends AuthApiClient {
     } finally { await reader.cancel().catch(() => undefined); reader.releaseLock(); }
   }
 
-  async exportResearchPackage(projectId: string, sessionId?: string, level: "necessary" | "complete" = "necessary", filePaths?: string[], includeFullTrajectory = true, includeFullMemoryGraph = false): Promise<Blob> {
+  /**
+   * Returns the live response instead of a Blob: a 5 GiB archive must reach the
+   * disk through `body`, not through a buffer that has to hold the whole thing.
+   */
+  async exportResearchPackage(projectId: string, sessionId?: string, level: "necessary" | "complete" = "necessary", filePaths?: string[], includeFullTrajectory = true, includeFullMemoryGraph = false, allowOverCap = false): Promise<Response> {
     const params = new URLSearchParams({ level });
+    if (allowOverCap) params.set("allowOverCap", "1");
     if (sessionId) params.set("sessionId", sessionId);
     if (!includeFullTrajectory) params.set("includeFullTrajectory", "0");
     params.set("includeFullMemoryGraph", includeFullMemoryGraph ? "1" : "0");
@@ -77,13 +82,18 @@ export class PluginApiClient extends AuthApiClient {
       headers: { authorization: `Bearer ${this.token}` },
     });
     this.reportAuthStatus(response.status);
-    if (!response.ok) throw new ApiRequestError("Research package export failed", response.status);
-    return response.blob();
+    if (!response.ok) {
+      // The refusal carries a stable code; without it the dialog can only show the
+      // generic English string and the localized over-cap copy is unreachable.
+      const payload = await response.json().catch(() => undefined) as { code?: string } | undefined;
+      throw new ApiRequestError("Research package export failed", response.status, payload?.code);
+    }
+    return response;
   }
 
   startResearchPackageExport(projectId: string, options: {
     sessionId: string; level: "necessary" | "complete"; filePaths?: string[];
-    includeFullTrajectory: boolean; includeFullMemoryGraph: boolean; revision: string;
+    includeFullTrajectory: boolean; includeFullMemoryGraph: boolean; revision: string; allowOverCap?: boolean;
   }): Promise<ResearchPackageExportTaskView> {
     return this.request(`/api/projects/${encodeURIComponent(projectId)}/research-package/exports`, {
       method: "POST", body: JSON.stringify(options),
@@ -114,7 +124,7 @@ export class PluginApiClient extends AuthApiClient {
     return response.blob();
   }
 
-  previewResearchPackage(projectId: string, sessionId: string, level: "necessary" | "complete", filePaths?: string[], includeFullTrajectory = true, includeFullMemoryGraph = true): Promise<{ revision?: string; estimatedBytes: number; estimateKind?: "uncompressed"; files: Array<{ path: string; size: number; selected?: boolean }>; omissions: string[]; exportProfile?: ResearchPackageExportProfileView }> {
+  previewResearchPackage(projectId: string, sessionId: string, level: "necessary" | "complete", filePaths?: string[], includeFullTrajectory = true, includeFullMemoryGraph = true): Promise<{ revision?: string; estimatedBytes: number; estimateKind?: "uncompressed"; files: Array<{ path: string; size: number; selected?: boolean }>; omissions: string[]; exportProfile?: ResearchPackageExportProfileView; maxBytes?: number; archiveBytes?: number }> {
     const params = new URLSearchParams({ sessionId, level });
     if (filePaths) { params.set("customFiles", "1"); for (const path of filePaths) params.append("filePath", path); }
     if (!includeFullTrajectory) params.set("includeFullTrajectory", "0");
@@ -135,9 +145,15 @@ export class PluginApiClient extends AuthApiClient {
 
   private async requestResearchPackagePreview<T>(path: string, signal?: AbortSignal): Promise<T> {
     try {
-      const result = await this.request<T | { code: "EXPORT_PREVIEW_PENDING" }>(path, { signal, headers: { Prefer: "respond-async" } });
+      const result = await this.request<T | { code: "EXPORT_PREVIEW_PENDING" } | { state: "deleted" }>(path, { signal, headers: { Prefer: "respond-async" } });
       if (result && typeof result === "object" && "code" in result && result.code === "EXPORT_PREVIEW_PENDING") {
         throw new ApiRequestError(translateActive("researchPackage.previewPending"), 202, result.code);
+      }
+      // The Project or Session was deleted while it was being polled. The API
+      // answers that as a normal end of polling rather than a resource error,
+      // and polling callers stop on this error instead of asking again (#1072).
+      if (result && typeof result === "object" && "state" in result && result.state === "deleted") {
+        throw new ApiRequestError(translateActive("researchPackage.resourceDeleted"), 410, "EXPORT_PREVIEW_RESOURCE_DELETED");
       }
       return result as T;
     } catch (error) {

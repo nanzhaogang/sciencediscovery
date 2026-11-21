@@ -28,7 +28,7 @@ Runner is a rootless executor. Ordinary Agent execution uses `run_shell`, includ
 
 Installation, building and starting the workbench do not require a usable local sandbox. Source/Docker startup and the binary launcher keep API/UI running if the local Runner is unavailable. Agent turns without code execution may continue; a missing local Runner does not select or validate remote execution on its behalf.
 
-Each Runner probes its own executable and sandbox profile. `GET /health` includes `execution` with `instanceId`, `checkedAt`, dependency availability, sandbox usability, readiness and a diagnostic reason. Authenticated `GET /execution-capability` reads the cached report; `POST` refreshes it after repair, including the shared sandbox profile cache. API exposes these operations at `/api/runners/{runnerId}/execution-capability`. Older Runners without this endpoint have unknown readiness and must be upgraded, not assumed safe.
+Each Runner probes its own executable and sandbox profile. Authenticated `GET /health` includes `execution` with `instanceId`, `checkedAt`, dependency availability, sandbox usability, readiness and a diagnostic reason. Authenticated `GET /execution-capability` reads the cached report; `POST` refreshes it after repair, including the shared sandbox profile cache. API exposes these operations at `/api/runners/{runnerId}/execution-capability`. Older Runners without this endpoint have unknown readiness and must be upgraded, not assumed safe.
 
 Runner settings show readiness and a **Recheck** button. The Agent can call `check_runner(runner_id?)` to refresh the same target-side capability report without using a sandbox. This tool is diagnostic only: it does not execute code or request user input. An unavailable pre-dispatch execution returns `RUNNER_UNAVAILABLE`, `dispatched: false`, an `operationId`, diagnostics and repair suggestions. The call is finished, not queued. The Agent chooses to continue other work, explain the blocker and finish, or explicitly call `wait_for_runner(operation_id)`.
 
@@ -191,7 +191,7 @@ The exception is “allowlisted host model job,” not “host shell for the Age
 ### Inspect or modify quotas
 
 ```bash
-curl -s http://127.0.0.1:4310/health | jq '.workspace, .runner.maxWorkspaceBytes, .runner.maxFileBytes, .runner.maxOutputBytes'
+curl -s -H "authorization: Bearer $TOKEN" http://127.0.0.1:4310/health | jq '.workspace, .runner.maxWorkspaceBytes, .runner.maxFileBytes, .runner.maxOutputBytes'
 curl -s -H "authorization: Bearer $TOKEN" http://127.0.0.1:4310/api/quota-settings
 ```
 
@@ -214,7 +214,7 @@ Interpreters come from host `/usr/bin` or managed `/opt/science-env/bin`.
 - Cold start creates only a read-only Python 3.12 base with numpy/pandas/scipy/matplotlib. The first explicit R named environment lazily creates an R 4.4 base with tidyverse/data.table.
 - Catalog and source settings are instance-global. Bases are read-only; named environments update in place under an environment lock. Revision records support tracing, not selection of an old runnable prefix.
 - Pip presets are upstream, TUNA, USTC, and Huawei Cloud; conda omits Huawei. Precedence is explicit request, global preset, upstream. Conda uses override/strict priority and an operator channel allowlist; exact built-in mirror URLs are accepted. Offline cache validates sources but uses local no-index/offline operation; CRAN/Bioconductor are rejected offline.
-- Layout includes catalog, provisioner, micromamba, named environment prefixes, revision snapshots, and SHA256-addressed wheel copies under `.sciencediscovery-data/scientific-envs/`.
+- Layout includes catalog, provisioner, micromamba, named environment prefixes, revision snapshots, and SHA256-addressed wheel copies under `.sciencediscovery-data/scientific-envs/`. New revision directories use the first 12 hex characters of the public ids (`task-xxxxxxxxxxxx/rev-xxxxxxxxxxxx`), so the default Windows data directory stays inside `MAX_PATH` even with `LongPathsEnabled=0`; catalog ids and API values remain the full `task-<uuid>`/`rev-<uuid>`. Existing full-id directories are resolved in place and never renamed, because relocating a conda prefix invalidates its recorded paths.
 - Pip `indexUrl` must be credential-free HTTPS, at most 2048 characters, without query/fragment/whitespace/control characters. Package lists reject option injection and remote URLs. A Session-relative wheel is copied to persistent hash storage and its source/hash/distribution/version enter the revision snapshot.
 - Direct package-manager mutation in `run_shell` is unsupported and the managed prefix is read-only in the sandbox.
 

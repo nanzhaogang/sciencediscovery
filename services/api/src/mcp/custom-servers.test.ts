@@ -13,7 +13,7 @@
 import { createTest } from "../../../../test/support/tagged/compat.mjs";
 const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:linux", "arch:amd64", "arch:arm64"] });
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,8 +25,77 @@ import { CustomMcpServers, normalizeCustomMcpConfig } from "./custom-servers.js"
 import { McpNodeClient } from "./node-client.js";
 import { SessionStore } from "../store.js";
 import { inspectMcpTool } from "./inspector.js";
+import type { McpCatalog } from "@sciencediscovery/schema";
+import { apiLog } from "../logging.js";
 
 const fixture = fileURLToPath(new URL("../../../../test/fixtures/mcp-echo.mjs", import.meta.url));
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+test("custom MCP mutations do not wait for the full catalog refresh", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "custom-mcp-background-"));
+  const gate = deferred();
+  let refreshCalls = 0;
+  const manager = new CustomMcpServers(
+    dir,
+    createMcpSourceRegistry(),
+    () => undefined,
+    () => {
+      refreshCalls += 1;
+      return gate.promise;
+    },
+  );
+  try {
+    await manager.load();
+    const saved = await manager.save({ name: "Disabled server", transport: "http", url: "http://127.0.0.1/mcp", enabled: false });
+    assert.equal(refreshCalls, 1);
+    await manager.remove(manager.list()[0]!.id);
+    assert.equal(refreshCalls, 1);
+    assert.equal(saved.status, "disabled");
+  } finally {
+    gate.resolve();
+    await manager.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("custom MCP testing probes through the server's effective proxy policy", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "custom-mcp-proxy-"));
+  const proxy = { mode: "url" as const, url: "http://127.0.0.1:18080" };
+  const manager = new CustomMcpServers(
+    dir,
+    createMcpSourceRegistry(),
+    () => undefined,
+    async () => undefined,
+    async () => undefined,
+    () => proxy,
+  );
+  const originalReload = McpNodeClient.prototype.reload;
+  const originalClose = McpNodeClient.prototype.close;
+  let capturedProxy: unknown;
+  try {
+    McpNodeClient.prototype.reload = (async function (this: McpNodeClient, proxies: Record<string, unknown>) {
+      capturedProxy = proxies;
+      return { loadedAt: new Date(0).toISOString(), revision: "", servers: [{ id: "custom-000000000000", enabled: true, transport: "http", tools: [] }] };
+    }) as typeof McpNodeClient.prototype.reload;
+    McpNodeClient.prototype.close = async () => undefined;
+    await manager.load();
+    const saved = await manager.save({ name: "Proxied server", transport: "http", url: "http://127.0.0.1/mcp", enabled: false });
+    const tested = await manager.test(saved.id);
+    assert.equal(tested.enabled, false);
+    assert.equal(tested.error, undefined);
+    assert.ok(String(saved.id).startsWith("custom-"));
+    assert.deepEqual(capturedProxy, { [saved.id]: proxy });
+  } finally {
+    McpNodeClient.prototype.reload = originalReload;
+    McpNodeClient.prototype.close = originalClose;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 async function setup() {
   const dir = await mkdtemp(join(tmpdir(), "custom-mcp-"));
@@ -38,19 +107,134 @@ async function setup() {
     // Isolate this integration test from bundled Python servers and external providers.
     return { ...config, servers: Object.fromEntries(Object.entries(config.servers).filter(([id]) => id.startsWith("custom-"))) };
   });
-  const catalog = new McpSourceCatalog(registry, client, undefined, (snapshot) => manager.applyCatalog(snapshot));
+  const catalog = new McpSourceCatalog(registry, client, undefined, (snapshot) => manager.applyCatalog(snapshot), undefined,
+    () => manager.discoveryRevision());
   await manager.load();
   await store.load();
-  return { dir, registry, store, manager, client, catalog, close: async () => { await client.close(); await rm(dir, { recursive: true, force: true }); } };
+  return { dir, registry, store, manager, client, catalog, close: async () => { await manager.close(); await client.close(); await rm(dir, { recursive: true, force: true }); } };
 }
+
+test("saving an enabled MCP discovers tools without a separate connection test", async () => {
+  const f = await setup();
+  try {
+    const saved = await f.manager.save({ name: "Background echo", command: process.execPath, args: [fixture], enabled: true });
+    assert.equal(saved.status, "untested");
+    for (let attempt = 0; f.manager.list()[0]?.status === "untested" && attempt < 200; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(f.manager.list()[0]?.status, "ready");
+    assert.equal(Object.keys(f.registry.get(saved.id).manifest.tools).length, 2);
+  } finally { await f.close(); }
+});
+
+test("background discovery failure is redacted and a later save recovers", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "custom-mcp-recovery-"));
+  let fail = true;
+  const manager = new CustomMcpServers(dir, createMcpSourceRegistry(), () => undefined, async () => {
+    if (fail) throw new Error("Failed Bearer private-fixture-secret at http://127.0.0.1/private");
+    manager.applyCatalog({ loadedAt: new Date().toISOString(), revision: "ready", servers: manager.list().map((item) => ({ id: item.id, enabled: true, tools: [], transport: "http" })) });
+  });
+  try {
+    await manager.load();
+    const saved = await manager.save({ name: "Recovery", url: "http://127.0.0.1/private", headers: { Authorization: "Bearer private-fixture-secret" }, enabled: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(manager.list()[0]?.status, "error");
+    assert.doesNotMatch(manager.list()[0]?.error ?? "", /private-fixture-secret|\/private/);
+    fail = false;
+    await manager.save(saved, saved.id);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(manager.list()[0]?.status, "ready");
+  } finally { await manager.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("a catalog captured before a configuration edit cannot repopulate cleared tools", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "custom-mcp-stale-"));
+  const gate = deferred();
+  const registry = createMcpSourceRegistry();
+  let snapshot!: McpCatalog;
+  let calls = 0;
+  const manager = new CustomMcpServers(dir, registry, () => undefined, () => catalog.reload());
+  const catalog = new McpSourceCatalog(registry, {
+    catalog: async () => snapshot,
+    reload: async () => { calls += 1; await gate.promise; return snapshot; },
+    invoke: async () => { throw new Error("unused"); },
+  }, undefined, (value) => manager.applyCatalog(value), undefined, () => manager.discoveryRevision());
+  try {
+    await manager.load();
+    const saved = await manager.save({ name: "Edited", url: "http://127.0.0.1/old", enabled: true });
+    snapshot = { loadedAt: new Date().toISOString(), revision: "old", servers: [{ id: saved.id, enabled: true, transport: "http", tools: [{ name: "old", description: "old", inputSchema: { type: "object" }, schemaHash: "old" }] }] };
+    assert.equal(calls, 1);
+    await manager.save({ ...saved, url: "http://127.0.0.1/new" }, saved.id);
+    // 关闭后只排空正在执行的旧刷新，不执行排队的新刷新，以观察旧结果是否被拒绝。
+    const closing = manager.close();
+    gate.resolve();
+    await closing;
+    assert.equal(manager.list()[0]?.status, "untested");
+    assert.equal(Object.keys(registry.get(saved.id).manifest.tools).length, 0);
+  } finally { gate.resolve(); await manager.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+for (const fault of ["invalid JSON", "missing file", "unreadable file"] as const) {
+  test(`background snapshot failure (${fault}) is observable and a later save recovers`, async () => {
+    const f = await setup();
+    const path = join(f.dir, "extensions.json");
+    const previous = process.env.SCIENCE_AGENT_EXTENSIONS_CONFIG_PATH;
+    try {
+      await writeFile(path, "{}");
+      process.env.SCIENCE_AGENT_EXTENSIONS_CONFIG_PATH = path;
+      if (fault === "invalid JSON") await writeFile(path, "{");
+      else {
+        await rm(path);
+        if (fault === "unreadable file") await mkdir(path);
+      }
+      const saved = await f.manager.save({ name: "Recover snapshot", command: process.execPath, args: [fixture], enabled: true });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(f.manager.list()[0]?.status, "error");
+      assert.ok(f.manager.list()[0]?.error);
+      await rm(path, { recursive: true, force: true }); await writeFile(path, "{}");
+      await f.manager.save(saved, saved.id);
+      for (let attempt = 0; f.manager.list()[0]?.status === "untested" && attempt < 300; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assert.equal(f.manager.list()[0]?.status, "ready");
+      assert.equal(f.manager.list()[0]?.tools.length, 2);
+    } finally {
+      if (previous === undefined) delete process.env.SCIENCE_AGENT_EXTENSIONS_CONFIG_PATH;
+      else process.env.SCIENCE_AGENT_EXTENSIONS_CONFIG_PATH = previous;
+      await f.close();
+    }
+  });
+}
+
+test("an error in background failure reporting cannot poison later refreshes", async context => {
+  const f = await setup();
+  let fail = true;
+  const original = f.manager.discoveryRevision.bind(f.manager);
+  context.mock.method(f.manager, "discoveryRevision", () => {
+    if (fail) throw new Error("broken configuration");
+    return original();
+  });
+  context.mock.method(apiLog, "warn", () => { if (fail) throw new Error("broken log sink"); });
+  try {
+    const saved = await f.manager.save({ name: "Recover logging", command: process.execPath, args: [fixture], enabled: true });
+    await new Promise(resolve => setImmediate(resolve));
+    fail = false;
+    await f.manager.save(saved, saved.id);
+    for (let attempt = 0; f.manager.list()[0]?.status === "untested" && attempt < 300; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(f.manager.list()[0]?.status, "ready");
+  } finally { await f.close(); }
+});
 
 test("custom stdio tools are discovered, authorized, invoked, audited and retained after restart", async () => {
   const f = await setup();
   try {
     const saved = await f.manager.save({ name: "Local echo", transport: "stdio", command: process.execPath, args: [fixture], enabled: true, env: { PRIVATE_TEST: "fixture-secret-value" } });
-    assert.equal(saved.status, "ready");
-    assert.equal(saved.tools.length, 2);
-    assert.deepEqual(saved.env, { PRIVATE_TEST: null });
+    const tested = await f.manager.test(saved.id);
+    assert.equal(tested.status, "ready");
+    assert.equal(tested.tools.length, 2);
+    assert.deepEqual(tested.env, { PRIVATE_TEST: null });
     const persisted = await readFile(join(f.dir, "custom-mcp-servers.enc"), "utf8");
     assert.ok(!persisted.includes("fixture-secret-value"));
     assert.ok(!persisted.includes("Local echo"));
@@ -111,8 +295,9 @@ test("JSON import is atomic, disabled by default, and concurrent saves do not lo
     await Promise.all([f.manager.save({ name: "A", command: process.execPath }), f.manager.save({ name: "B", command: process.execPath })]);
     assert.equal(f.manager.list().length, 3);
     const broken = await f.manager.save({ name: "Broken", command: "/nonexistent-mcp-command", enabled: true });
-    assert.equal(broken.status, "error");
-    assert.match(broken.error!, /ENOENT/);
+    const brokenTest = await f.manager.test(broken.id);
+    assert.equal(brokenTest.status, "error");
+    assert.match(brokenTest.error!, /ENOENT/);
   } finally { await f.close(); }
 });
 
@@ -128,12 +313,14 @@ for (const transport of ["http", "sse"] as const) {
       });
       const base = { name: transport, transport, url: `http://127.0.0.1:${port}/${transport === "sse" ? "sse" : "mcp"}`, enabled: true, headers: { Authorization: "Bearer fixture-only" } };
       const saved = await f.manager.save(base);
-      assert.equal(saved.status, "ready", saved.error ?? "");
-      assert.equal(saved.tools.length, 2);
-      assert.deepEqual(saved.headers, { Authorization: null });
+      const tested = await f.manager.test(saved.id);
+      assert.equal(tested.status, "ready", tested.error ?? "");
+      assert.equal(tested.tools.length, 2);
+      assert.deepEqual(tested.headers, { Authorization: null });
       const broken = await f.manager.save({ ...base, headers: { Authorization: "wrong-fixture-secret" } }, saved.id);
-      assert.equal(broken.status, "error");
-      assert.ok(!broken.error!.includes("wrong-fixture-secret"));
+      const brokenTest = await f.manager.test(broken.id);
+      assert.equal(brokenTest.status, "error");
+      assert.ok(!brokenTest.error!.includes("wrong-fixture-secret"));
     } finally { child.kill(); await f.close(); }
   });
 }

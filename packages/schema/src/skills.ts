@@ -126,7 +126,9 @@ export interface SkillDetail extends SkillDescriptor {
 }
 
 export interface CreateSkillRequest {
-  allowedTools?: string;
+  /** A declaration the runtime preserves: either the comma-string form or the
+   *  YAML sequence some Skills use. */
+  allowedTools?: string | string[];
   compatibility?: string;
   description: string;
   instructions: string;
@@ -243,13 +245,76 @@ export interface DistillSessionSkillRequest {
   name?: string;
 }
 
+/** One package in a background Git import. The selection came from an
+ *  inspection, so `overwrite`/`expectedRevision` are the same choice a single
+ *  import would carry. */
+export interface GitSkillImportJobItem {
+  expectedRevision?: number;
+  overwrite?: boolean;
+  subdirectory: string;
+}
+
+/** Start a background import for a selection at the commit that was inspected.
+ *  The request returns as soon as the job is queued; progress is read from the
+ *  job resource. */
+export interface StartGitSkillImportJobRequest {
+  commit?: string;
+  items: GitSkillImportJobItem[];
+  ref?: string;
+  repositoryUrl: string;
+}
+
+export type GitSkillImportJobStatus = "queued" | "running" | "done" | "cancelled" | "failed";
+
+/** The observable state of one background Git import. `imported` names the
+ *  packages that arrived; `created` is false for an update of an installation
+ *  that already existed. */
+export interface GitSkillImportJob {
+  commit?: string;
+  done: number;
+  failures: Array<{ message: string; subdirectory: string }>;
+  finishedAt?: string;
+  id: string;
+  imported: Array<{ created: boolean; id: string }>;
+  startedAt: string;
+  status: GitSkillImportJobStatus;
+  total: number;
+}
+
 export interface ImportSkillFromGitRequest {
+  /**
+   * Commit returned by inspection. When present, the import is rejected if the
+   * ref has moved, so what the user reviewed is what gets installed.
+   */
+  commit?: string;
+  /**
+   * Allow replacing an already installed managed Skill. Omitted keeps the
+   * historical conflict for callers that never inspected the repository.
+   */
+  overwrite?: boolean;
+  /**
+   * Required with `overwrite`: the revision the user saw. A mismatch is a
+   * conflict rather than a silent replacement of an edit made meanwhile.
+   */
+  expectedRevision?: number;
   ref?: string;
   repositoryUrl: string;
   subdirectory?: string;
 }
 
 export interface InspectGitSkillRepositoryRequest {
+  /**
+   * The commit a previous inspection returned. Required with `cursor`, so the
+   * next page is read from the same tree instead of whatever the ref points
+   * at now.
+   */
+  commit?: string;
+  /**
+   * Where the previous page ended: pass back the `nextCursor` it returned.
+   * Discovery walks the whole checkout on every page, so a page costs the
+   * `SKILL.md` files it returns, not the ones before it.
+   */
+  cursor?: string;
   ref?: string;
   repositoryUrl: string;
   /** Restrict discovery to a package root or marketplace subtree when it is already known. */
@@ -267,10 +332,19 @@ export interface GitSkillImportCandidate {
 }
 
 export interface GitSkillRepositoryInspection {
+  /** One page of the packages the repository carries, in subdirectory order. */
   candidates: GitSkillImportCandidate[];
   commit: string;
+  /**
+   * Where the next page starts. Absent when this page is the last one. Pass
+   * it back with `commit` (and the same repository, ref and subdirectory) to
+   * read on.
+   */
+  nextCursor?: string;
   ref?: string;
   repositoryUrl: string;
+  /** How many packages the repository carries, across every page. */
+  total?: number;
 }
 
 export interface CreateGitSkillReviewDraftsRequest {

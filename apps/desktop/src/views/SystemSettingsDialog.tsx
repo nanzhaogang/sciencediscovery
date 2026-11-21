@@ -21,25 +21,37 @@ import { claimsEscape } from "./dialog-escape.js";
 import { SidebarToggle } from "./SidebarToggle.js";
 import { GeneralSettings } from "./settings/GeneralSettings.js";
 import { ModelSettings } from "./settings/ModelSettings.js";
+import { ModelUsageSettings } from "./settings/ModelUsageSettings.js";
 import { NetworkSettings } from "./settings/NetworkSettings.js";
 import { RuntimeSettings } from "./settings/RuntimeSettings.js";
+import { QuotaSettings } from "./settings/QuotaSettings.js";
+import { WebSearchSettings } from "./settings/WebSearchSettings.js";
+import { ProxySettings } from "./settings/ProxySettings.js";
 import { SkillsSettings } from "./settings/SkillsSettings.js";
 import { McpServers } from "./settings/system/McpServers.js";
 import { MemorySettings } from "./settings/system/MemorySettings.js";
 import { SpecialistsSettings } from "./settings/system/Specialists.js";
 import { TimeoutSettings } from "./settings/system/Timeouts.js";
+import { ExportHistorySettings } from "./settings/system/ExportHistory.js";
+import { IdeaTreeSettings } from "./settings/IdeaTreeSettings.js";
 
 /** The original desktop nav, extended with MCP, 专家, 科学记忆 and 超时. */
 export type SettingsGroup =
   | "general"
   | "memory"
   | "models"
+  | "usage"
   | "skills"
   | "mcp"
   | "specialists"
+  | "idea-tree"
   | "sandbox-network"
   | "remote"
-  | "timeouts";
+  | "quotas"
+  | "web"
+  | "proxies"
+  | "timeouts"
+  | "export-history";
 
 type CategoryId = "system" | "intelligence" | "connection" | "workspace";
 
@@ -48,9 +60,9 @@ const CATEGORIES: { groups: SettingsGroup[]; id: CategoryId }[] = [
   // 科学记忆 is how the agent remembers what it read and made, so it sits with
   // the intelligence settings and after 专家, the last thing that is given to
   // the agent rather than the environment it runs in.
-  { groups: ["models", "skills", "mcp", "specialists", "memory"], id: "intelligence" },
-  { groups: ["sandbox-network", "remote"], id: "connection" },
-  { groups: ["timeouts"], id: "workspace" },
+  { groups: ["models", "usage", "skills", "mcp", "specialists", "idea-tree", "memory", "web"], id: "intelligence" },
+  { groups: ["sandbox-network", "proxies", "remote"], id: "connection" },
+  { groups: ["timeouts", "quotas", "export-history"], id: "workspace" },
 ];
 
 function categoryOf(group: SettingsGroup): CategoryId {
@@ -92,7 +104,6 @@ export function SystemSettingsDialog({
    *  pane keeps the width rather than reflowing around a zero column. */
   const [navOpen, setNavOpen] = useState(true);
   const [addingModel, setAddingModel] = useState(false);
-  const [addingSkill, setAddingSkill] = useState(false);
 
   // A group picked from the directory opens its category, so a collapsed one
   // never hides the choice the user just made.
@@ -104,7 +115,6 @@ export function SystemSettingsDialog({
   // state lives in the pane and unmounts here.
   useEffect(() => {
     setAddingModel(false);
-    setAddingSkill(false);
   }, [group]);
 
   useEffect(() => {
@@ -136,14 +146,10 @@ export function SystemSettingsDialog({
             state={state}
           />
         );
+      case "usage":
+        return <ModelUsageSettings client={client} />;
       case "skills":
-        return (
-          <SkillsSettings
-            adding={addingSkill}
-            client={client}
-            onAddingChange={setAddingSkill}
-          />
-        );
+        return <SkillsSettings client={client} onConfirm={actions.confirmAction} />;
       case "mcp":
         return (
           <McpServers
@@ -154,6 +160,8 @@ export function SystemSettingsDialog({
         );
       case "specialists":
         return <SpecialistsSettings client={client} onConfirm={actions.confirmAction} />;
+      case "idea-tree":
+        return <IdeaTreeSettings client={client} />;
       case "sandbox-network":
         return (
           <NetworkSettings
@@ -167,11 +175,18 @@ export function SystemSettingsDialog({
           <RuntimeSettings
             client={client}
             onConfirm={actions.confirmAction}
-            project={state.activeProject}
           />
         );
+      case "quotas":
+        return <QuotaSettings client={client} onSaved={actions.applyQuotaSettings} />;
+      case "web":
+        return <WebSearchSettings client={client} onConfirm={actions.confirmAction} />;
+      case "proxies":
+        return <ProxySettings client={client} onConfirm={actions.confirmAction} />;
       case "timeouts":
         return <TimeoutSettings client={client} />;
+      case "export-history":
+        return <ExportHistorySettings projects={state.projects} />;
     }
   })();
 
@@ -239,25 +254,23 @@ export function SystemSettingsDialog({
               <SidebarToggle onClick={() => setNavOpen(true)} open={false} />
             </div>
           )}
-          <div className="settings-group-detail" key={group}>
-            <header className="settings-detail-header">
-              <div>
-                <h3>{meta.label}</h3>
-                <p>{meta.description}</p>
-              </div>
-              {group === "models" ? (
-                <button className="pill-button is-dark" onClick={() => setAddingModel(true)} type="button">
-                  {TEXT.settings.model.add}
-                </button>
-              ) : group === "skills" ? (
-                <button className="pill-button is-dark" onClick={() => setAddingSkill(true)} type="button">
-                  {TEXT.settings.skills.add}
-                </button>
-              ) : null}
-            </header>
+          {group === "skills" ? pane : (
+            <div className="settings-group-detail" key={group}>
+              <header className="settings-detail-header">
+                <div>
+                  <h3>{meta.label}</h3>
+                  <p>{meta.description}</p>
+                </div>
+                {group === "models" ? (
+                  <button className="pill-button is-dark" onClick={() => setAddingModel(true)} type="button">
+                    {TEXT.settings.model.add}
+                  </button>
+                ) : null}
+              </header>
 
-            {pane}
-          </div>
+              {pane}
+            </div>
+          )}
         </div>
       </section>
     </div>

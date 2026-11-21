@@ -223,12 +223,16 @@ def test_decide_deny_and_allow_matching():
     assert answer["selected_options"] == ["B"] and resolved["request"]["decision"] == "allowed"
 
 
-def test_ask_user_question_is_reported_as_an_external_user_wait():
-    mapper = RunEventMapper()
+def test_ask_user_question_preserves_prompts_and_choices_for_chat():
+    mapper = RunEventMapper(turn=2)
     assert mapper.feed({"type": "event", "event": "chat.ask_user_question", "payload": {
-        "request_id": "r", "source": "ask_user_interrupt", "questions": [{"question": "Choose a goal"}],
-    }}) == [{"type": "user_input.required", "request": {
-        "id": "r", "question": "Choose a goal", "source": "ask_user_interrupt",
+        "request_id": "r", "source": "ask_user_interrupt", "questions": [
+            {"question": "Which timeout?", "options": [{"label": "Idle"}, {"label": "Whole turn"}]},
+            {"question": "How many seconds?"},
+        ],
+    }}) == [{"type": "user_input.required", "turn": 2, "request": {
+        "id": "r", "question": "Which timeout?\n- Idle\n- Whole turn\n\nHow many seconds?",
+        "source": "ask_user_interrupt",
     }}]
     assert mapper.unmapped == []
 
@@ -411,3 +415,21 @@ def test_finite_integral_float_usage_counts_remain_usable():
         "metadata": {"usage_metadata": {"input_tokens": 1.0, "output_tokens": 2.0}}}})
     assert events[0]["usage"]["totalTokens"] == 3
     assert events[0]["usage"]["outputTokens"] == 2
+
+
+def test_a_response_is_announced_with_the_id_the_gateway_minted_for_the_call():
+    """A tool-only turn is recorded by the API before Swarm announces its response, so the mapper
+    names that response with the id the gateway minted instead of inventing one afterwards (#1133)."""
+    mapper = RunEventMapper(response_ids=["dispatched-1"])
+    events = mapper.feed({"type": "event", "event": "chat.tool_call", "payload": {
+        "tool_call": {"name": "test", "tool_call_id": "1", "arguments": "{}"}}})
+    started = [event for event in events if event["type"] == "assistant.response.started"]
+    assert [event["responseId"] for event in started] == ["dispatched-1"]
+    assert mapper.response_ids == [], "the dispatched id is claimed once"
+
+
+def test_without_a_dispatched_id_the_mapper_still_names_its_own_response():
+    """A Swarm pointed at something other than this run's gateway dispatches no id."""
+    events = RunEventMapper().feed({"type": "event", "event": "chat.delta", "payload": {"content": "hi"}})
+    started = [event for event in events if event["type"] == "assistant.response.started"]
+    assert len(started) == 1 and started[0]["responseId"]

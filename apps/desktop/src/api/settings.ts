@@ -22,6 +22,21 @@
 
 import type { ApiClient } from "./client.js";
 import type {
+  McpAuthorizationStart,
+  McpInspectorRequest,
+  McpInspectorResult,
+} from "@sciencediscovery/schema";
+import type {
+  CreateEnvironmentRequest,
+  CreateProxyServerRequest,
+  Environment,
+  EnvironmentInstallStatus,
+  EnvironmentRevision,
+  InstallEnvironmentRequest,
+  ScientificEnvironmentSetup,
+  UpdateProxyServerRequest,
+  UpdateProxySettingsRequest,
+  ResolvedProxy,
   ConnectorManifest,
   CreateSkillPackageRequest,
   JiuwenSwarmSkillsResponse,
@@ -30,7 +45,12 @@ import type {
   CustomMcpServerInput,
   EnvironmentPackageSourceId,
   EnvironmentSourceSettings,
+  GitSkillRepositoryInspection,
   IdeaTreeSettingsDetails,
+  ImportSkillFromGitRequest,
+  GitSkillImportJob,
+  InspectGitSkillRepositoryRequest,
+  StartGitSkillImportJobRequest,
   McpProxyPolicies,
   McpSource,
   MemoryGraphSettingsDetails,
@@ -43,13 +63,17 @@ import type {
   RuntimeSettingsOverrides,
   RuntimeStatus,
   SandboxNetworkSettings,
+  SkillDeletionImpact,
   SkillDescriptor,
   SkillDetail,
+  SkillResourceContent,
   Specialist,
   SystemQuotaSettings,
   SystemTimeoutSettings,
   UpdateIdeaTreeSettingsRequest,
   UpdateMemoryGraphSettingsRequest,
+  UpdateSkillFileRequest,
+  UpdateSkillRequest,
   UpdateSpecialistRequest,
   UpdateWebSettingsRequest,
   WebSettingsDetails,
@@ -167,6 +191,123 @@ export function createSkill(
   });
 }
 
+/** Install a `SKILL.md` or a ZIP package. The multipart field name is the
+ *  server's, not a choice: `file`, with no content type of our own. */
+export function importSkillFile(client: ApiClient, file: File): Promise<SkillDetail> {
+  const form = new FormData();
+  form.set("file", file);
+  // The desktop imports under the next free name when one is taken; web and
+  // CLI keep the historical 409 by omitting this flag.
+  return client.request<SkillDetail>("/api/skills/import?onDuplicate=rename", {
+    body: form,
+    method: "POST",
+  });
+}
+
+/** List the Skill packages a repository contains at the commit it resolves to.
+ *  `signal` lets the caller stop waiting: a clone of a large repository is the
+ *  one request here long enough that a user may change their mind. */
+export function inspectGitSkillRepository(
+  client: ApiClient,
+  body: InspectGitSkillRepositoryRequest,
+  signal?: AbortSignal,
+): Promise<GitSkillRepositoryInspection> {
+  return client.request<GitSkillRepositoryInspection>("/api/skills/import-git/inspect", {
+    body: JSON.stringify(body),
+    method: "POST",
+    ...(signal ? { signal } : {}),
+  });
+}
+
+/** Install one inspected package. `overwrite` and `expectedRevision` are the
+ *  only way to replace an installed Skill, and both are checked server-side. */
+export function importSkillFromGit(
+  client: ApiClient,
+  body: ImportSkillFromGitRequest,
+): Promise<SkillDetail> {
+  return client.request<SkillDetail>("/api/skills/import-git", {
+    body: JSON.stringify(body),
+    method: "POST",
+  });
+}
+
+/** Start a background import for an inspected selection. The request returns
+ *  as soon as the job is queued; the job resource carries its progress. */
+export function startGitSkillImportJob(
+  client: ApiClient,
+  body: StartGitSkillImportJobRequest,
+): Promise<GitSkillImportJob> {
+  return client.request<GitSkillImportJob>("/api/skills/import-git/jobs", {
+    body: JSON.stringify(body),
+    method: "POST",
+  });
+}
+
+export function getGitSkillImportJob(client: ApiClient, jobId: string): Promise<GitSkillImportJob> {
+  return client.request<GitSkillImportJob>(`/api/skills/import-git/jobs/${encodeURIComponent(jobId)}`);
+}
+
+export function cancelGitSkillImportJob(client: ApiClient, jobId: string): Promise<GitSkillImportJob> {
+  return client.request<GitSkillImportJob>(`/api/skills/import-git/jobs/${encodeURIComponent(jobId)}`, {
+    method: "DELETE",
+  });
+}
+
+export function updateSkill(
+  client: ApiClient,
+  skillId: string,
+  body: UpdateSkillRequest,
+): Promise<SkillDetail> {
+  return client.request<SkillDetail>(`/api/skills/${encodeURIComponent(skillId)}`, {
+    body: JSON.stringify(body),
+    method: "PUT",
+  });
+}
+
+export function updateSkillFile(
+  client: ApiClient,
+  skillId: string,
+  path: string,
+  body: UpdateSkillFileRequest,
+): Promise<SkillDetail> {
+  return client.request<SkillDetail>(`/api/skills/${encodeURIComponent(skillId)}/files/${encodeURIComponent(path)}`, {
+    body: JSON.stringify(body),
+    method: "PUT",
+  });
+}
+
+export function readSkillResource(
+  client: ApiClient,
+  skillId: string,
+  path: string,
+): Promise<SkillResourceContent> {
+  return client.request<SkillResourceContent>(`/api/skills/${encodeURIComponent(skillId)}/resources/${encodeURIComponent(path)}`);
+}
+
+/**
+ * The installed package as a ZIP: one root directory named after the Skill,
+ * holding its `SKILL.md` and every resource. The same shape the importer
+ * accepts, so an exported package can be imported again unchanged.
+ */
+export async function exportSkillPackage(client: ApiClient, skillId: string): Promise<ArrayBuffer> {
+  const response = await client.fetchStream(`/api/skills/${encodeURIComponent(skillId)}/package`);
+  return await response.arrayBuffer();
+}
+
+/** What would break if this Skill were removed: the Project and Session
+ *  selection documents that still name it. */
+export function getSkillDeletionImpact(client: ApiClient, skillId: string): Promise<SkillDeletionImpact> {
+  return client.request<SkillDeletionImpact>(`/api/skills/${encodeURIComponent(skillId)}/deletion-impact`);
+}
+
+/** Remove an installed package. The route refuses (`SKILL_CONFLICT`) while a
+ *  runtime settings document still references it. */
+export function deleteSkill(client: ApiClient, skillId: string): Promise<{ deleted: string }> {
+  return client.request<{ deleted: string }>(`/api/skills/${encodeURIComponent(skillId)}`, {
+    method: "DELETE",
+  });
+}
+
 /**
  * Turn skills on and off for a project.
  *
@@ -210,7 +351,7 @@ export function updateProxyDefault(
 
 export function createProxyServer(
   client: ApiClient,
-  body: { kind: string; name: string; url?: string },
+  body: CreateProxyServerRequest,
 ): Promise<ProxyServer> {
   return client.request<ProxyServer>("/api/proxy/servers", {
     body: JSON.stringify(body),
@@ -221,7 +362,7 @@ export function createProxyServer(
 export function updateProxyServer(
   client: ApiClient,
   serverId: string,
-  body: { kind?: string; name?: string; url?: string },
+  body: UpdateProxyServerRequest,
 ): Promise<ProxyServer> {
   return client.request<ProxyServer>(`/api/proxy/servers/${encodeURIComponent(serverId)}`, {
     body: JSON.stringify(body),
@@ -414,6 +555,62 @@ export function deleteMcpServer(client: ApiClient, id: string): Promise<{ delete
   });
 }
 
+/**
+ * Import a `{ "mcpServers": { … } }` spec.
+ *
+ * The route writes the whole spec or nothing, and a name clash with any existing
+ * server fails the write as a whole; the page therefore sends one entry per call
+ * so each server's outcome is its own.
+ */
+export function importMcpServers(
+  client: ApiClient,
+  body: unknown,
+): Promise<CustomMcpServerDetails[]> {
+  return client.request<CustomMcpServerDetails[]>("/api/mcp/servers/import", {
+    body: JSON.stringify(body),
+    method: "POST",
+  });
+}
+
+/** Call one tool on the server, for the read-only inspector. */
+export function inspectMcpTool(
+  client: ApiClient,
+  id: string,
+  body: McpInspectorRequest,
+  signal?: AbortSignal,
+): Promise<McpInspectorResult> {
+  return client.request<McpInspectorResult>(
+    `/api/mcp/servers/${encodeURIComponent(id)}/inspect`,
+    { body: JSON.stringify(body), method: "POST", ...(signal ? { signal } : {}) },
+  );
+}
+
+/** Begin OAuth: the route answers the URL the browser has to open. */
+export function startMcpAuthorization(
+  client: ApiClient,
+  id: string,
+  redirectUrl: string,
+): Promise<McpAuthorizationStart> {
+  return client.request<McpAuthorizationStart>(
+    `/api/mcp/servers/${encodeURIComponent(id)}/oauth/start`,
+    { body: JSON.stringify({ redirectUrl }), method: "POST" },
+  );
+}
+
+export function cancelMcpAuthorization(client: ApiClient, id: string): Promise<{ ok: boolean }> {
+  return client.request<{ ok: boolean }>(
+    `/api/mcp/servers/${encodeURIComponent(id)}/oauth/cancel`,
+    { method: "POST" },
+  );
+}
+
+export function clearMcpAuthorization(client: ApiClient, id: string): Promise<{ ok: boolean }> {
+  return client.request<{ ok: boolean }>(
+    `/api/mcp/servers/${encodeURIComponent(id)}/oauth/clear`,
+    { method: "POST" },
+  );
+}
+
 /* -- Web ----------------------------------------------------------------- */
 
 export function getWebSettings(client: ApiClient): Promise<WebSettingsDetails> {
@@ -494,4 +691,35 @@ export function deleteSpecialist(
   return client.request<{ deleted: string }>(`/api/specialists/${encodeURIComponent(specialistId)}`, {
     method: "DELETE",
   });
+}
+
+/** Environment operations are scoped to a Runner; package source preferences remain global. */
+export function runnerEnvironmentApi(client: ApiClient, runnerId: string) {
+  const root = `/api/runners/${encodeURIComponent(runnerId)}`;
+  return {
+    setup: () => client.request<ScientificEnvironmentSetup>(`${root}/environment-setup`),
+    initialize: () => client.request<ScientificEnvironmentSetup>(`${root}/environment-setup`, {
+      method: "POST", body: JSON.stringify({ confirmed: true }),
+    }),
+    list: () => client.request<Environment[]>(`${root}/environments`),
+    revisions: () => client.request<EnvironmentRevision[]>(`${root}/environment-revisions`),
+    create: (body: CreateEnvironmentRequest) => client.request<Environment>(`${root}/environments`, {
+      method: "POST", body: JSON.stringify(body),
+    }),
+    install: (id: string, body: InstallEnvironmentRequest) => client.request<EnvironmentInstallStatus>(`${root}/environments/${encodeURIComponent(id)}/install`, {
+      method: "POST", body: JSON.stringify(body),
+    }),
+    remove: (id: string) => client.request(`${root}/environments/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  };
+}
+
+export function updateProxySettings(client: ApiClient, body: UpdateProxySettingsRequest): Promise<ProxySettingsDetails> {
+  return client.request("/api/proxy/settings", { method: "PUT", body: JSON.stringify(body) });
+}
+
+/** Diagnostic runs on the service host and tests only the returned target. */
+export function testProxyConnectivity(client: ApiClient, proxy: ResolvedProxy): Promise<{
+  ok: boolean; message: string; elapsedMs: number; target: string;
+}> {
+  return client.request("/api/proxy/test", { method: "POST", body: JSON.stringify(proxy) });
 }

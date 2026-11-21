@@ -3,12 +3,16 @@ import pytest
 
 pytestmark = pytest.mark.science_tags(category='ut', os='linux', arch=('amd64', 'arm64'))
 import asyncio
+import io
 import json
 import tempfile
+import time
 import unittest
+import unittest.mock
+import urllib.error
 from pathlib import Path
 
-from sciencediscovery_evolve.vendor.idea_tree.research import IdeaTreeEngine, ResearchStore, node, now, parse_json
+from sciencediscovery_evolve.vendor.idea_tree.research import IdeaTreeEngine, Interrupted, ResearchStore, node, now, parse_json
 from sciencediscovery_evolve.vendor.idea_tree.research_service import Settings
 from sciencediscovery_evolve.vendor.idea_tree.templates import snapshot
 
@@ -112,7 +116,10 @@ class ResearchTests(unittest.IsolatedAsyncioTestCase):
         fail = True
         async def model(role, payload):
             if role == 'stability' and fail:
-                raise RuntimeError('Model HTTP 429: budget exceeded')
+                # What transport() raises once its retry budget is exhausted
+                # (issue #1232): the stage fails, the run is interrupted, and
+                # the completed stages are kept for the resume.
+                raise RuntimeError('Model HTTP 429: retry budget exhausted after 2 attempts')
             return await self.model(role, payload)
         engine = IdeaTreeEngine(self.state, self.store, {}, model)
         await engine.run()
@@ -126,6 +133,56 @@ class ResearchTests(unittest.IsolatedAsyncioTestCase):
         await IdeaTreeEngine(self.state, self.store, {}, model).run()
         self.assertEqual(self.state['status'], 'completed')
         self.assertEqual(len([c for c in self.calls if c[0] == 'design']), prior)
+
+    async def test_run_continues_same_stage_after_transient_429(self):
+        # Issue #1232: one 429 on the first model call must not interrupt the
+        # research; the same stage continues once the retry succeeds.
+        attempts = []
+        sleeps = []
+
+        class Reply:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self, *_):
+                return self.body
+
+        def urlopen(request, timeout):
+            body = json.loads(request.data)
+            system = body['messages'][0]['content']
+            attempts.append(json.loads(body['messages'][1]['content']))
+            if len(attempts) == 1:
+                raise urllib.error.HTTPError(request.full_url, 429, 'Too Many Requests', {'Retry-After': '1'},
+                                             io.BytesIO(b'{"error":{"type":"rate_limit_exceeded","message":"Too many requests; retry shortly"}}'))
+            if '"candidates"' in system:
+                payload = json.loads(body['messages'][1]['content'])
+                value = dict(candidates=[dict(parentId=payload['selectedParentIds'][0], direction=f"Direction {payload['round']}", hypothesis=f"Candidate {payload['round']}: addresses prior leaching")], reason='A distinct improvement remains')
+            elif '"score":1.0' in system:
+                value = dict(text='Independent assessment', score=8)
+            elif '"strengths"' in system:
+                value = dict(text='aggregate output', strengths=[], failureModes=[], uncertainties=[], evidenceGaps=[], recommendedNextMoves=[], constraintFlags=[], confidence=.5)
+            else:
+                value = dict(text='design output')
+            reply = Reply()
+            reply.body = json.dumps(dict(choices=[dict(message=dict(content=json.dumps(value)))], usage=dict(total_tokens=100))).encode()
+            return reply
+
+        monkeypatch = unittest.mock.patch('urllib.request.urlopen', urlopen)
+        sleep_patch = unittest.mock.patch.object(time, 'sleep', sleeps.append)
+        with monkeypatch, sleep_patch:
+            await IdeaTreeEngine(self.state, self.store, dict(url='http://model.test/v1/chat/completions', token='t')).run()
+        self.assertEqual(self.state['status'], 'completed', self.state['reason'])
+        # The first round's ideation was attempted twice (429, then success);
+        # later rounds were attempted once each.
+        ideations = [payload for payload in attempts if 'selectedParentIds' in payload]
+        self.assertEqual([payload['round'] for payload in ideations], [1, 1, 2, 3])
+        candidates = [n for n in self.state['nodes'] if n['kind'] == 'candidate']
+        self.assertTrue(candidates and all(n['status'] == 'done' for n in candidates))
+        # One bounded wait, honoring the provider's Retry-After: 1.
+        self.assertAlmostEqual(sum(sleeps), 1.0)
 
     async def test_pause_does_not_commit_late_result(self):
         gate = asyncio.Event()
@@ -243,7 +300,7 @@ class ResearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(persisted['usageKnown'])
         self.assertEqual(persisted['activities'][-1]['status'], 'failed')
         # Just enough for one stage; a stale failed-call reserve would block it.
-        self.state['settings']['maxTokens'] = len((engine.role_prompt('design') + '\nReturn JSON only, matching: {"text":"..."}' + '{}').encode()) + self.state['settings']['maxTokensPerCall'] + 256
+        self.state['settings']['maxTokens'] = len((engine.role_prompt('design') + '\nReturn JSON only, matching: {"text":"..."}' + '{}').encode()) + 32768 + 256  # the reservation constant, not a cap
         self.assertEqual(await engine.ask('design', {}), {'text': 'valid design'})
         self.assertEqual(len(calls), 2)
         self.assertEqual(engine.reserved, 0)
@@ -469,9 +526,94 @@ def test_transport_leaves_temperature_to_the_provider(monkeypatch):
     monkeypatch.setattr('urllib.request.urlopen', urlopen)
     with tempfile.TemporaryDirectory() as root:
         engine = IdeaTreeEngine(dict(id='r'), ResearchStore(Path(root)), dict(url='http://model.test/v1/chat/completions', token='t'))
-        assert engine.transport('system', dict(a=1), 100) == ('{}', 7)
+        assert engine.transport('system', dict(a=1)) == ('{}', 7)
     assert 'temperature' not in sent[0]
-    assert sent[0]['max_tokens'] == 100
+    assert 'max_tokens' not in sent[0], 'the per-call cap is gone: the request carries no max_tokens'
+
+
+def rate_limit_error(url, after='1', error_type='rate_limit_exceeded'):
+    return urllib.error.HTTPError(url, 429, 'Too Many Requests', {'Retry-After': after},
+                                  io.BytesIO(json.dumps(dict(error=dict(type=error_type, message='Too many requests; retry shortly'))).encode()))
+
+
+class SuccessReply:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def read(self, *_):
+        return json.dumps(dict(choices=[dict(message=dict(content='{}'))], usage=dict(total_tokens=7))).encode()
+
+
+def transport_with_faults(monkeypatch, faults):
+    """A transport whose urlopen fails per `faults`, then succeeds; sleeps are recorded, not waited."""
+    attempts = []
+    sleeps = []
+
+    def urlopen(request, timeout):
+        attempts.append(1)
+        if len(attempts) <= len(faults):
+            raise faults[len(attempts) - 1](request.full_url)
+        return SuccessReply()
+
+    monkeypatch.setattr('urllib.request.urlopen', urlopen)
+    monkeypatch.setattr(time, 'sleep', sleeps.append)
+    with tempfile.TemporaryDirectory() as root:
+        engine = IdeaTreeEngine(dict(id='r'), ResearchStore(Path(root)), dict(url='http://model.test/v1/chat/completions', token='t'))
+        return engine, attempts, sleeps
+
+
+def test_transport_retries_transient_429_then_succeeds(monkeypatch):
+    # Issue #1232: one 429 with Retry-After: 1, then success, must continue.
+    engine, attempts, sleeps = transport_with_faults(monkeypatch, [rate_limit_error])
+    assert engine.transport('system', dict(a=1)) == ('{}', 7)
+    assert len(attempts) == 2
+    assert sum(sleeps) == pytest.approx(1.0)
+
+
+def test_transport_gives_up_after_bounded_429_retries(monkeypatch):
+    # Repeated 429s terminate after the existing two-attempt budget, with a clear reason.
+    engine, attempts, sleeps = transport_with_faults(monkeypatch, [rate_limit_error, rate_limit_error])
+    with pytest.raises(RuntimeError, match='Model HTTP 429: retry budget exhausted after 2 attempts'):
+        engine.transport('system', dict(a=1))
+    assert len(attempts) == 2
+    assert sum(sleeps) == pytest.approx(1.0)
+
+
+def test_transport_does_not_retry_permanent_quota_429(monkeypatch):
+    # A 429 that reports exhausted quota/billing is permanent, not transient.
+    engine, attempts, sleeps = transport_with_faults(monkeypatch, [lambda url: rate_limit_error(url, error_type='insufficient_quota')])
+    with pytest.raises(RuntimeError, match='Model HTTP 429: permanent quota error, not retried'):
+        engine.transport('system', dict(a=1))
+    assert len(attempts) == 1
+    assert sleeps == []
+
+
+def test_transport_retry_wait_respects_pause(monkeypatch):
+    # A pause issued while waiting out a 429 must interrupt the wait, not the retry.
+    engine, attempts, sleeps = transport_with_faults(monkeypatch, [rate_limit_error])
+
+    def pausing_sleep(seconds):
+        sleeps.append(seconds)
+        engine.stop_action = 'pause'
+
+    monkeypatch.setattr(time, 'sleep', pausing_sleep)
+    with pytest.raises(Interrupted):
+        engine.transport('system', dict(a=1))
+    assert len(attempts) == 1
+
+
+def test_transport_still_retries_500_then_succeeds(monkeypatch):
+    # Control case: the pre-existing 5xx retry is unchanged by the 429 fix.
+    def server_error(url):
+        return urllib.error.HTTPError(url, 503, 'Service Unavailable', {}, io.BytesIO(b'{"error":"original temporary provider cause"}'))
+
+    engine, attempts, sleeps = transport_with_faults(monkeypatch, [server_error])
+    assert engine.transport('system', dict(a=1)) == ('{}', 7)
+    assert len(attempts) == 2
+    assert sum(sleeps) == pytest.approx(0.5)
 
 
 def test_a_fenced_json_answer_is_read_as_json():
@@ -485,7 +627,10 @@ def test_a_fenced_json_answer_is_read_as_json():
         parse_json('Here it is: {"a": 1}')
 
 
-def test_each_stage_asks_for_its_own_effort_and_unset_stages_ask_for_none(monkeypatch):
+def test_every_stage_follows_the_models_own_thinking_level(monkeypatch):
+    """No stage asks for an effort: the request leaves `reasoning_effort` out so the
+    model profile's own thinking level applies, and a settings payload written before
+    the per-stage control was removed is simply not carried into the research."""
     sent = []
 
     class Reply:
@@ -503,24 +648,65 @@ def test_each_stage_asks_for_its_own_effort_and_unset_stages_ask_for_none(monkey
         return Reply()
 
     monkeypatch.setattr('urllib.request.urlopen', urlopen)
-    settings = Settings(templateId='water-treatment-materials/v1', roleThinkingEfforts=dict(design='max', assess='low')).model_dump()
+    settings = Settings(templateId='water-treatment-materials/v1', roleThinkingEfforts=dict(design='max')).model_dump()
+    assert 'roleThinkingEfforts' not in settings
     with tempfile.TemporaryDirectory() as root:
         state = dict(id='r', projectId='p', sessionId='s', settings=settings, template=snapshot('water-treatment-materials/v1'),
                      round=0, tokens=0, usageKnown=True, nodes=[node('ROOT', None, 'Goal', 'direction', 0)])
         engine = IdeaTreeEngine(state, ResearchStore(Path(root)), dict(url='http://model.test/v1/chat/completions', token='t'))
-        # Every assessor of the template shares the `assess` stage.
-        assert [engine.role_effort(role) for role in ('design', 'activity', 'sustainability', 'aggregate')] == ['max', 'low', 'low', None]
         asyncio.run(engine.ask('design', {}))
-        assert sent[-1]['reasoning_effort'] == 'max'
-        engine.transport('system', dict(a=1), 100)
         assert 'reasoning_effort' not in sent[-1]
-        # A research created before stages had efforts carries none.
-        del state['settings']['roleThinkingEfforts']
-        assert engine.role_effort('design') is None
+        engine.transport('system', dict(a=1))
+        assert 'reasoning_effort' not in sent[-1]
 
 
-def test_a_stage_effort_must_name_a_known_stage_and_level():
-    assert Settings().roleThinkingEfforts == {}
-    for efforts in (dict(review='high'), dict(design='ultra')):
-        with pytest.raises(ValueError):
-            Settings(roleThinkingEfforts=efforts)
+RESEARCH_READ_SCRIPT = """
+import sys
+from pathlib import Path
+from sciencediscovery_evolve.vendor.idea_tree.research import ResearchStore
+
+root = Path(sys.argv[1])
+store = ResearchStore(root)
+expected = "".join(chr(code) for code in (0x8109, 0x86cb, 0x767d))
+one = store.read("p", "s", "r1")
+assert one["title"] == expected, one["title"]
+many = store.list("p", "s")
+assert [row["id"] for row in many] == ["r1"], [row["id"] for row in many]
+assert many[0]["title"] == expected, many[0]["title"]
+try:
+    (root / "p" / "s" / "r1.json").read_text()
+except UnicodeDecodeError:
+    pass
+else:
+    raise SystemExit("this child decodes as UTF-8, so the probe above proves nothing")
+print("ok")
+"""
+
+
+def read_on_a_host_with_ascii_as_the_default_codec(root, script, *arguments):
+    """Run `script` where `read_text()` with no encoding would decode as ASCII.
+
+    cp936 and ASCII fail on the same bytes, so this reproduces the reported host
+    on any runner instead of only on Windows.
+    """
+    import os
+    import subprocess
+    import sys
+
+    environment = {**os.environ, "PYTHONUTF8": "0", "LC_ALL": "C", "LANG": "C", "PYTHONIOENCODING": "ascii"}
+    source = str(Path(__file__).resolve().parents[1] / "src")
+    environment["PYTHONPATH"] = os.pathsep.join(filter(None, [source, environment.get("PYTHONPATH")]))
+    completed = subprocess.run([sys.executable, "-c", script, str(root), *arguments],
+                               capture_output=True, text=True, env=environment)
+    assert completed.returncode == 0, completed.stderr
+    return completed.stdout.strip()
+
+
+def test_a_research_with_non_ascii_content_reads_on_a_non_utf8_host(tmp_path):
+    store = ResearchStore(tmp_path)
+    store.save(dict(projectId="p", sessionId="s", id="r1", status="completed",
+                    title="".join(chr(code) for code in (0x8109, 0x86cb, 0x767d)),
+                    createdAt=now(), nodes={}, materials={}))
+    # Both the single read and the directory scan: `get` after a restart goes
+    # through read(), `list` always goes through the scan (research_service.py).
+    assert read_on_a_host_with_ascii_as_the_default_codec(tmp_path, RESEARCH_READ_SCRIPT) == "ok"

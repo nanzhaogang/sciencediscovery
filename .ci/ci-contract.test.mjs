@@ -30,11 +30,35 @@ import {
 } from "./ci-contract.mjs";
 import * as catalog from "./test-catalog.mjs";
 import { prepareRealE2EResults } from "./prepare-real-e2e-results.mjs";
-import { resultsLabel } from "../test/support/tagged/shared.mjs";
+import { coverageSourceMapStep, resultsLabel } from "../test/support/tagged/shared.mjs";
 
 // Repository-local, like the other script tests, so a fixture never lands
 // outside the checkout CI cleans up.
 const testRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", ".tmp", "ci-script-tests");
+
+test("coverage source-map preparation selects TypeScript workspaces, not source-loaded JavaScript", async t => {
+  await mkdir(testRoot, { recursive: true });
+  const root = await mkdtemp(join(testRoot, "coverage-projects-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  for (const directory of ["packages/network", "packages/model", "services/api", "config", "apps/web"]) {
+    await mkdir(join(root, directory), { recursive: true });
+    await writeFile(join(root, directory, "package.json"), "{}");
+    if (directory !== "packages/network") await writeFile(join(root, directory, "tsconfig.json"), "{}");
+  }
+  assert.deepEqual(coverageSourceMapStep(root), ["pnpm", ["--recursive", "--filter", "./config", "--filter", "./packages/model", "--filter", "./services/api", "exec", "tsc", "-p", "tsconfig.json", "--sourceMap"]]);
+  // Invalid configuration is still selected: tsc must report it, not silently skip it.
+  await writeFile(join(root, "packages/model/tsconfig.json"), "invalid-json");
+  assert.ok(coverageSourceMapStep(root)[1].includes("./packages/model"));
+});
+
+test("coverage source-map preparation does not run an unfiltered command without TS projects", async t => {
+  await mkdir(testRoot, { recursive: true });
+  const root = await mkdtemp(join(testRoot, "coverage-js-only-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, "packages/network"), { recursive: true });
+  await writeFile(join(root, "packages/network/package.json"), "{}");
+  assert.equal(coverageSourceMapStep(root), undefined);
+});
 
 for (const runtimeKind of ["relative", "absolute"]) {
   test(`E2E exports one absolute data directory for ${runtimeKind} runtime paths`, async (t) => {
@@ -377,9 +401,48 @@ test("mocked E2E keeps the complete HTML and results upload", async () => {
   assert.deepEqual(upload.paths, [".ci-results"]);
   assert.deepEqual(upload.excluded, []);
   assert.equal(upload.hidden, true);
-  assert.equal(upload.condition, "${{ always() && needs.policy.outputs.docs_only != 'true' }}");
+  assert.equal(upload.condition, "${{ always() && needs.policy.outputs.docs_only != 'true' && needs.policy.outputs.mocked == 'true' }}");
   assert.equal(upload.missing, "warn");
   assert.equal(upload.retention, 14);
+});
+
+test("Windows distribution gate builds the native Electron installer", async () => {
+  const ci = await readFile(join(defaultRepositoryRoot, ".github", "workflows", "ci.yml"), "utf8");
+  const job = workflowJobs(ci)["windows-desktop"];
+  assert.ok(job, "windows-desktop job was not found");
+  assert.match(job, /runs-on: windows-latest/);
+  assert.match(job, /needs\.policy\.outputs\.windows_desktop == 'true'/);
+  assert.match(job, /needs: \[policy, l1, binary\]/);
+  assert.match(job, /PYTHONUTF8:\s*["']1["']/,
+    "Windows JiuwenSwarm setup must force Python UTF-8 stdio");
+  assert.match(job, /uv sync --locked --extra candidates/);
+  assert.match(job, /node scripts\/jiuwenswarm\.mjs setup/);
+  assert.match(job, /fetch-managed-micromamba\.mjs[\s\S]*--platform win32/);
+  assert.match(job, /actions\/download-artifact@v4[\s\S]*pattern: windows-runner-sea-\*/);
+  assert.match(job, /merge-multiple: true/);
+  assert.match(job, /pnpm --dir application dist/);
+  // A single pwsh block reports only the last command's exit code, so the
+  // desktop suite must have its own step; otherwise a failing suite is recorded
+  // as a green step (#1182 review F1, #1187 review F2). Pinned here so the
+  // split cannot be folded back into one step unnoticed.
+  assert.match(job, /name: Test the desktop shell\n\s+run: pnpm --dir application test/,
+    "the desktop suite must run in its own step");
+  assert.match(job, /name: Typecheck the desktop shell\n\s+run: pnpm --dir application typecheck/,
+    "typecheck must be a separate step, not a second command in the test step");
+  assert.doesNotMatch(job, /Test and typecheck the desktop shell/,
+    "the combined step masked a failing suite and must not return");
+  // The other half of this gate: without the flag electron-builder attempts an
+  // implicit GitHub publish, which fails without a token (#1187). The plain
+  // `dist` regex above matches either form, so pin the flag itself.
+  assert.match(job, /pnpm --dir application dist --publish never/,
+    "the installer gate must build only; implicit publish fails without a token (#1187)");
+  const installer = artifactUploads(job).find((upload) => upload.artifact.includes("windows-desktop-installer"));
+  assert.ok(installer, "Windows installer artifact was not found");
+  assert.match(installer.paths[0], /'application\/release\/ScienceDiscovery-\*-win-x64-setup\.exe' \|\| 'application\/release'/);
+  assert.match(job, /Get-ChildItem -Path 'application\/release\/ScienceDiscovery-\*-win-x64-setup\.exe' -File/);
+  assert.match(job, /if \(\$installers\.Count -ne 1\) \{\s+throw/);
+  assert.match(job, /if \(\$installers\[0\]\.Length -le 0\) \{\s+throw/);
+  assert.equal(installer.missing, "error");
 });
 
 async function filesBelow(root, relative = "") {

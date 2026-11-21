@@ -397,6 +397,33 @@
 .mcp-secret-row .field-input { flex: 1; min-width: 0; }
 .mcp-secret-fields > .secondary-button { justify-self: start; }
 
+/* The two ways in for a server this machine has never seen, above the list they
+   add to. */
+.mcp-toolbar-actions {
+  display: flex;
+  gap: 8px;
+  margin: 0 0 10px;
+}
+
+/* What an import spec will add, and what each write did. */
+.mcp-import-list {
+  display: grid;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.mcp-import-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 12px;
+}
+
+.mcp-import-list li small { color: var(--text-secondary); }
+.mcp-import-list li small.is-error { color: var(--danger); }
+
 /* The tool list a built-in card expands to. It lives inside the card's main
    button, so every part is phrasing content. */
 .settings-builtin-tools {
@@ -474,4 +501,88 @@
   }
 
   .settings-group-detail { padding: 28px 24px 40px; }
+}
+
+/* Environment, quota, search and proxy pages share the desktop row rhythm. */
+.settings-form-actions,
+.settings-list-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin: 12px 0;
+}
+.settings-list-heading { justify-content: space-between; }
+.settings-list-heading h3 { margin: 0; font-size: 14px; }
+.settings-number { display: flex; flex-direction: column; gap: 6px; max-width: 100%; }
+.settings-number .field-input.is-number { width: 112px; max-width: 100%; }
+.environment-setup-progress,
+.proxy-diagnostics { display: grid; gap: 12px; font-size: 13px; color: var(--text-secondary); }
+.environment-setup-progress > div,
+.proxy-diagnostics > div { display: grid; gap: 4px; }
+.environment-setup-progress > button { justify-self: start; }
+.environment-setup-progress p { margin: 0; }
+.environment-details { display: grid; gap: 12px; }
+.proxy-default-controls { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; width: 360px; min-width: 0; max-width: 100%; }
+.proxy-default-controls > .row-inline-control { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; width: 100%; }
+.proxy-default-controls select { width: 100%; min-width: 0; max-width: 100%; }
+.proxy-default-controls .secondary-button,
+.proxy-bypass-editor .secondary-button { height: 34px; border-radius: 8px; font-size: 13px; white-space: nowrap; }
+.proxy-bypass-editor { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
+.proxy-bypass-editor .field-input { flex: 1 1 240px; min-width: 0; }
+.proxy-bypass-editor .secondary-button { flex: 0 0 auto; }
+.proxy-default-controls > .settings-note { margin: 0; max-width: 32rem; overflow-wrap: anywhere; }
+.environment-details-header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.environment-version { display: flex; flex: 1; align-items: center; gap: 10px; min-width: 0; min-height: 38px; padding: 8px 12px; box-sizing: border-box; border: 1px solid var(--border); border-radius: 8px; font-size: 13px; }
+.environment-version strong { flex-shrink: 0; font-weight: 500; }
+.environment-version code { min-width: 0; }
+.environment-details-header > button { flex-shrink: 0; }
+.environment-package-list { margin: 0; line-height: 1.8; }
+.environment-details code,
+.environment-package-list,
+.proxy-diagnostics code { overflow-wrap: anywhere; word-break: break-word; }
+.settings-modal .settings-card-form > .settings-row.is-stack .row-control > *,
+.environment-details .settings-row.is-stack .row-control > * { width: 100%; min-width: 0; }
+.settings-group-detail .settings-row .row-control { min-width: 0; max-width: 100%; }
+.settings-group-detail .settings-row .row-control > select { max-width: 100%; }
+@media (max-width: 760px) {
+  .settings-group-detail .settings-row { flex-wrap: wrap; gap: 12px; }
+  .settings-group-detail .settings-row .row-control { flex-wrap: wrap; }
+  .row-inline-control { justify-content: flex-start; }
+}
+
+.settings-modal-head h2 { min-width: 0; overflow-wrap: anywhere; }
+.settings-modal-close { flex-shrink: 0; }
+.settings-group-detail .settings-row .row-title strong { overflow-wrap: anywhere; }
+
+.runner-detail-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+.runner-detail-heading h3 { margin: 0; min-width: 0; overflow-wrap: anywhere; font-size: 17px; }
+.runner-open-indicator { color: var(--text-faint); font-size: 24px; }
+.machine-details > h4 { margin: 0 0 12px; color: var(--text-secondary); font-size: 13px; font-weight: 500; }
+
+/* Model usage keeps the same quiet surface and spacing as other settings pages. */
+.model-usage-settings { container-type: inline-size; }
+.usage-settings-toolbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+.usage-settings-toolbar .seg-pills { flex-wrap: wrap; }
+.usage-settings-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 0; }
+.usage-settings-metric { min-width: 0; padding: 18px; border: 1px solid #e6e6e6; border-radius: 12px; }
+.usage-settings-metric dt { color: var(--text-secondary); font-size: 12px; }
+.usage-settings-metric dd { margin: 8px 0 0; color: var(--text-strong); font-size: 25px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.usage-settings-table-scroll { max-width: 100%; overflow-x: auto; border: 1px solid #e6e6e6; border-radius: 12px; }
+.usage-settings-table { width: 100%; min-width: 480px; border-collapse: collapse; font-size: 13px; }
+.usage-settings-table th, .usage-settings-table td { padding: 12px 16px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.usage-settings-table thead th { background: var(--surface-subtle); color: var(--text-secondary); font-weight: 500; }
+.usage-settings-table tbody tr + tr { border-top: 1px solid #ededed; }
+.usage-settings-table th:first-child { width: 40%; min-width: 160px; text-align: left; white-space: normal; overflow-wrap: anywhere; }
+.usage-settings-table th strong { display: block; color: var(--text-strong); font-weight: 500; }
+.usage-settings-table th small { display: block; margin-top: 4px; color: var(--text-faint); font-weight: 400; }
+@container (max-width: 520px) {
+  .usage-settings-metrics { grid-template-columns: minmax(0, 1fr); }
 }

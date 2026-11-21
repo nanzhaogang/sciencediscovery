@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Cumulative gates: PR L1/L2; merge_group L3; daily L4; release L5.
+# CI profiles: PR L1/L2 and builds; merge_group L3 E2E; daily L4; release L5; manual packaging.
 # The shared source catalog owns selection. backend selects execution only.
 # Configure the stable merge-gate check as required on PRs and merge groups.
 # Reviewed queue candidates receive scoped test credentials without a second
@@ -23,7 +23,7 @@ name: CI
 on:
   push:
     branches: [main, master]
-  # Drafts run policy and L1. UT/ST, mocked E2E, coverage, binary, Docker and
+  # Drafts run policy and L1. UT/ST, coverage, Linux binary, Docker and
   # merge-gate skip drafts; ready_for_review and non-draft open/update/reopen
   # events enable the remaining jobs according to the selected profile.
   pull_request:
@@ -58,9 +58,13 @@ on:
         type: string
         default: ""
       profile:
-        description: "Cumulative policy: pr=L2, merge=L3, daily=L4, release=L5"
+        description: "CI policy: pr=L2 and builds, merge=L3 E2E, daily=L4, release=L5, package=distribution artifacts"
         type: string
         default: pr
+      package-platform:
+        description: "Package targets: linux-windows, macos or all"
+        type: string
+        default: linux-windows
       backend:
         description: "Independent E2E backend; legacy selects the native loop"
         type: string
@@ -75,7 +79,7 @@ on:
 # they would share a group and cancel each other. In a called workflow
 # `github.workflow` is the caller's name, so each pipeline gets its own lane.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.profile == 'package' && format('-package-{0}', inputs['package-platform'] || 'linux-windows') || '' }}
   cancel-in-progress: true
 
 permissions:
@@ -94,8 +98,14 @@ jobs:
     outputs:
       profile: ${{ steps.policy.outputs.profile }}
       backend: ${{ steps.policy.outputs.backend }}
+      mocked: ${{ steps.policy.outputs.mocked }}
       real: ${{ steps.policy.outputs.real }}
+      test_layers: ${{ steps.policy.outputs.test_layers }}
+      binary: ${{ steps.policy.outputs.binary }}
       distribution: ${{ steps.policy.outputs.distribution }}
+      windows_desktop: ${{ steps.policy.outputs.windows_desktop }}
+      macos_desktop: ${{ steps.policy.outputs.macos_desktop }}
+      package_platform: ${{ steps.policy.outputs.package_platform }}
       docs_only: ${{ steps.policy.outputs.docs_only }}
     steps:
       - uses: actions/checkout@v4
@@ -107,6 +117,7 @@ jobs:
       - id: policy
         env:
           CI_REQUESTED_PROFILE: ${{ inputs.profile || 'pr' }}
+          CI_REQUESTED_PACKAGE_PLATFORM: ${{ inputs['package-platform'] }}
           CI_REQUESTED_BACKEND: ${{ inputs.backend || vars.CI_E2E_BACKEND || 'jiuwenswarm' }}
           # Dispatch/call always have a profile input, even if explicitly empty.
           # A called workflow retains its caller's event_name (for example push).
@@ -147,7 +158,7 @@ jobs:
   e2e-plan:
     name: Freeze mocked E2E matrix
     needs: [policy, l1]
-    if: ${{ success() && needs.policy.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
+    if: ${{ success() && needs.policy.outputs.docs_only != 'true' && needs.policy.outputs.mocked == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -213,7 +224,7 @@ jobs:
   ut:
     needs: [policy, l1]
     name: UT
-    if: ${{ success() && needs.policy.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
+    if: ${{ success() && needs.policy.outputs.test_layers == 'true' && needs.policy.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -312,7 +323,7 @@ jobs:
     # nothing to report. Release calls skip it: a tagged build publishes no
     # coverage.
     needs: [policy, ut, st]
-    if: ${{ !cancelled() && needs.policy.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && github.workflow != 'Release' }}
+    if: ${{ !cancelled() && needs.policy.outputs.test_layers == 'true' && needs.policy.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && github.workflow != 'Release' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -389,7 +400,7 @@ jobs:
   st:
     needs: [policy, l1]
     name: ST
-    if: ${{ success() && needs.policy.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
+    if: ${{ success() && needs.policy.outputs.test_layers == 'true' && needs.policy.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -449,6 +460,11 @@ jobs:
           # Where the cache step above restores the verified archive, and where
           # fetch-runtime.mjs looks for it before touching the network.
           BINARY_CACHE_DIR: ${{ runner.temp }}/binary-cache
+          # A cache miss must not sit on a trickle: 128 KB/s is the floor at
+          # which the pinned 34 MB archive finishes inside this job's budget,
+          # and a slower read now fails in seconds with one readable line
+          # instead of being killed by the journey's own 300 s cap (#1026).
+          BINARY_DOWNLOAD_MIN_BYTES_PER_SECOND: "131072"
         run: pnpm ci:st -- --profile ${{ needs.policy.outputs.profile }} ${{ github.workflow != 'Release' && '--coverage' || '' }}
 
       - name: Report the shared plan
@@ -488,7 +504,7 @@ jobs:
   e2e:
     needs: [policy, l1, e2e-plan]
     name: L2 E2E (mocked, ${{ matrix.shard }})
-    if: ${{ success() && needs.policy.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
+    if: ${{ success() && needs.policy.outputs.docs_only != 'true' && needs.policy.outputs.mocked == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
     strategy:
       fail-fast: false
       max-parallel: 4
@@ -607,10 +623,16 @@ jobs:
   # the four entry points end to end.
   binary:
     needs: [policy, l1]
-    if: ${{ needs.policy.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.policy.outputs.distribution == 'true' }}
+    if: ${{ needs.policy.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.policy.outputs.binary == 'true' }}
     name: Binary release (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    env:
+      # Vite inlines import.meta.env at build time; without it the bundled UI
+      # resolves the accounts base URL to an empty string and sign-in calls the
+      # local API instead of the account service. Scoped to this job so test
+      # jobs never inherit a production endpoint.
+      VITE_ACCOUNTS_API: https://sciencediscovery.openjiuwen.com/accounts
     strategy:
       # One architecture failing must not cancel the other: which of the two
       # broke is the first thing worth knowing.
@@ -619,8 +641,10 @@ jobs:
         include:
           - arch: x86_64
             runner: ubuntu-latest
+            sea_dir: x64
           - arch: aarch64
             runner: ubuntu-24.04-arm
+            sea_dir: arm64
     steps:
       - uses: actions/checkout@v4
 
@@ -633,6 +657,7 @@ jobs:
 
       - uses: astral-sh/setup-uv@v6
         with:
+          version: "0.13.7"
           enable-cache: true
 
       # zstd compresses the payload; the script checks for it before starting.
@@ -650,7 +675,7 @@ jobs:
       # artifact's own name, so a caller that publishes what comes out has to
       # supply it; a merge-gate run leaves it empty and takes the script's
       # `git describe` default.
-      - name: Build both architectures
+      - name: Build the native Linux binary
         env:
           RELEASE_VERSION: ${{ inputs.release-version }}
         run: |
@@ -673,12 +698,26 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the release binaries
-        if: always()
+        if: ${{ always() && (needs.policy.outputs.profile != 'package' || success()) }}
         uses: actions/upload-artifact@v4
         with:
-          name: binary-release-${{ matrix.arch }}
+          name: ${{ needs.policy.outputs.profile == 'package' && format('package-linux-{0}-{1}', matrix.arch, github.sha) || format('binary-release-{0}', matrix.arch) }}
           path: dist/binary-release
-          if-no-files-found: warn
+          if-no-files-found: ${{ needs.policy.outputs.profile == 'package' && 'error' || 'warn' }}
+          retention-days: 7
+
+      - name: Stage Runner SEA for the Windows desktop package
+        run: |
+          mkdir -p "dist/windows-runner-sea/linux-${{ matrix.sea_dir }}"
+          cp -a "services/runner/dist/sea/linux-${{ matrix.sea_dir }}/." \
+            "dist/windows-runner-sea/linux-${{ matrix.sea_dir }}/"
+
+      - name: Upload Runner SEA for the Windows desktop package
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-runner-sea-${{ matrix.sea_dir }}
+          path: dist/windows-runner-sea
+          if-no-files-found: error
           retention-days: 7
 
   # Nothing else in this repository builds the product image, and that gap is
@@ -741,21 +780,30 @@ jobs:
       - name: Start the stack
         run: |
           cp .env.docker.example .env
+          # Fixed token so the deployment-contract step can fetch authenticated
+          # health details (public /health is liveness-only after the health
+          # visibility change). Empty SCIENCE_AGENT_AUTH_TOKEN would generate a
+          # one-off token only in the container log.
+          SD_AUTH_TOKEN="$(openssl rand -hex 24)"
           sed -i \
             -e "s/^SCIENCE_AGENT_UID=.*/SCIENCE_AGENT_UID=$(id -u)/" \
             -e "s/^SCIENCE_AGENT_GID=.*/SCIENCE_AGENT_GID=$(id -g)/" \
             -e "s/^SCIENCE_AGENT_PUBLISH_PORT=.*/SCIENCE_AGENT_PUBLISH_PORT=${SD_PORT}/" \
+            -e "s/^SCIENCE_AGENT_AUTH_TOKEN=.*/SCIENCE_AGENT_AUTH_TOKEN=${SD_AUTH_TOKEN}/" \
             .env
+          echo "SD_AUTH_TOKEN=${SD_AUTH_TOKEN}" >> "$GITHUB_ENV"
           mkdir -p data
           docker compose up -d
 
       - name: Wait for the control API
         run: |
+          # Liveness can stay unauthenticated; detail fields need the bearer.
           for _ in $(seq 1 60); do
             curl -fsS "http://127.0.0.1:${SD_PORT}/health" >/dev/null 2>&1 && break
             sleep 5
           done
-          curl -fsS "http://127.0.0.1:${SD_PORT}/health" > "${RUNNER_TEMP}/health.json"
+          curl -fsS -H "Authorization: Bearer ${SD_AUTH_TOKEN}" \
+            "http://127.0.0.1:${SD_PORT}/health" > "${RUNNER_TEMP}/health.json"
           jq . "${RUNNER_TEMP}/health.json"
 
       # Each check below guards a property the deployment depends on and that a
@@ -854,9 +902,201 @@ jobs:
         if: always()
         run: docker compose down
 
+  # The Windows desktop installer has a separate Electron workspace and a
+  # Windows-only payload (Python venv, JiuwenSwarm and micromamba). Build it on
+  # the native runner so the same command that produces the user-facing NSIS
+  # installer is exercised on nightly and release profiles.
+  windows-desktop:
+    needs: [policy, l1, binary]
+    if: ${{ needs.policy.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.policy.outputs.windows_desktop == 'true' }}
+    name: Windows desktop installer
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      # JiuwenSwarm initialization reports its selected language in Chinese.
+      # Windows runners default Python's stdio to cp1252, which crashes before
+      # the Electron build unless Python is explicitly put in UTF-8 mode.
+      PYTHONUTF8: "1"
+      # Compiled into apps/web and apps/desktop by the root `pnpm build`.
+      VITE_ACCOUNTS_API: https://sciencediscovery.openjiuwen.com/accounts
+    steps:
+      - name: Enable long paths
+        shell: pwsh
+        run: git config --global core.longpaths true
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Linux Runner SEA assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: windows-runner-sea-*
+          path: services/runner/dist/sea
+          merge-multiple: true
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.7"
+          enable-cache: true
+
+      - name: Cache Windows packaging inputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            .sciencediscovery-data
+            ~\AppData\Local\electron-builder\Cache
+          key: windows-desktop-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'uv.lock', 'scripts/jiuwenswarm.mjs', 'scripts/swarm-patches.py', 'jiuwen_swarm/patches/**', 'services/runner/src/micromamba-releases.json', 'application/pnpm-lock.yaml') }}
+
+      - name: Install the backend workspace
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the backend workspace
+        run: pnpm build
+
+      - name: Provision the shared Python environment
+        shell: pwsh
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}\.sciencediscovery-data\envs\sd-services
+        run: uv sync --locked --extra candidates
+
+      - name: Install the pinned JiuwenSwarm runtime
+        run: node scripts/jiuwenswarm.mjs setup
+
+      - name: Fetch the pinned Windows micromamba
+        shell: pwsh
+        run: >-
+          node scripts/fetch-managed-micromamba.mjs
+          --arch x64 --platform win32
+          --output .sciencediscovery-data\scientific-envs\bin\micromamba.exe
+
+      - name: Install the Electron workspace
+        run: pnpm --dir application install --frozen-lockfile
+
+      # Two steps on purpose: in one pwsh block the step reports the last
+      # command's exit code, so a failing suite used to be recorded as a green
+      # step (#1182 review F1, #1187 review F2).
+      - name: Test the desktop shell
+        run: pnpm --dir application test
+
+      - name: Typecheck the desktop shell
+        run: pnpm --dir application typecheck
+
+      - name: Build the Windows installer
+        # Build-only gate: electron-builder treats CI detection plus the
+        # configured github publish provider as "upload now", and this job has
+        # no token (#1187 review F1). Publishing stays manual.
+        run: pnpm --dir application dist --publish never
+
+      - name: Verify the Windows installer
+        if: ${{ success() && needs.policy.outputs.profile == 'package' }}
+        run: |
+          # electron-builder may use a literal artifact version that differs from package.json.
+          $installers = @(Get-ChildItem -Path 'application/release/ScienceDiscovery-*-win-x64-setup.exe' -File -ErrorAction Stop)
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one Windows installer, found $($installers.Count)"
+          }
+          if ($installers[0].Length -le 0) {
+            throw "Installer is empty: $($installers[0].FullName)"
+          }
+
+      - name: Upload the Windows installer
+        if: ${{ always() && (needs.policy.outputs.profile != 'package' || success()) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.policy.outputs.profile == 'package' && format('package-windows-x64-{0}', github.sha) || 'windows-desktop-installer' }}
+          path: ${{ needs.policy.outputs.profile == 'package' && 'application/release/ScienceDiscovery-*-win-x64-setup.exe' || 'application/release' }}
+          if-no-files-found: error
+          retention-days: 7
+
+  macos-desktop:
+    name: macOS desktop installer (arm64)
+    needs: [policy, l1]
+    if: ${{ needs.policy.outputs.macos_desktop == 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      UV_MANAGED_PYTHON: "1"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      SD_MAC_SIGN: "0"
+      # Compiled into apps/web and apps/desktop by the root `pnpm build`.
+      VITE_ACCOUNTS_API: https://sciencediscovery.openjiuwen.com/accounts
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            application/pnpm-lock.yaml
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.7"
+          enable-cache: true
+
+      - name: Install the backend workspace
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the backend workspace
+        run: pnpm build
+
+      - name: Provision the shared Python environment
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/.sciencediscovery-data/envs/sd-services
+        run: uv sync --locked --extra candidates --python 3.12
+
+      - name: Install the pinned JiuwenSwarm runtime
+        run: node scripts/jiuwenswarm.mjs setup
+
+      - name: Fetch the pinned macOS micromamba
+        run: >-
+          node scripts/fetch-managed-micromamba.mjs
+          --arch arm64 --platform darwin
+          --output .sciencediscovery-data/scientific-envs/bin/micromamba
+
+      - name: Install the Electron workspace
+        run: pnpm --dir application install --frozen-lockfile
+
+      - name: Build and verify the macOS installer
+        run: bash application/scripts/build-mac.sh
+
+      - name: Upload the macOS installer and archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-macos-arm64-${{ github.sha }}
+          path: |
+            application/release/ScienceDiscovery-*-mac-arm64.dmg
+            application/release/ScienceDiscovery-*-mac-arm64.zip
+          if-no-files-found: error
+          retention-days: 7
+
   merge-gate:
-    name: merge-gate
-    needs: [policy, l1, ut, st, e2e-plan, e2e, real-merge, real-scheduled, binary, docker]
+    # Keep the required check name for PR and queue events. Manual package
+    # runs report a distinct check even if the policy fails to resolve inputs.
+    name: ${{ inputs.profile == 'package' && github.event_name != 'pull_request' && github.event_name != 'merge_group' && 'package-gate' || 'merge-gate' }}
+    needs: [policy, l1, ut, st, e2e-plan, e2e, real-merge, real-scheduled, binary, docker, windows-desktop, macos-desktop]
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -866,20 +1106,20 @@ jobs:
         with:
           node-version: 22.19.0
       - uses: actions/download-artifact@v4
-        if: ${{ needs.policy.outputs.docs_only != 'true' }}
+        if: ${{ needs.policy.outputs.docs_only != 'true' && needs.policy.outputs.mocked == 'true' }}
         with:
           name: mocked-e2e-plan
           path: .ci-mocked-plan
       - uses: actions/download-artifact@v4
-        if: ${{ needs.policy.outputs.docs_only != 'true' }}
+        if: ${{ needs.policy.outputs.docs_only != 'true' && needs.policy.outputs.mocked == 'true' }}
         with:
           pattern: mocked-e2e-results-*
           path: .ci-mocked-results
       - name: Reconcile mocked results
-        if: ${{ needs.policy.outputs.docs_only != 'true' }}
+        if: ${{ needs.policy.outputs.docs_only != 'true' && needs.policy.outputs.mocked == 'true' }}
         run: node .ci/mocked-report.mjs .ci-mocked-plan/plan.json .ci-mocked-results .ci-results
       - name: Upload combined E2E results
-        if: ${{ always() && needs.policy.outputs.docs_only != 'true' }}
+        if: ${{ always() && needs.policy.outputs.docs_only != 'true' && needs.policy.outputs.mocked == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: e2e-results

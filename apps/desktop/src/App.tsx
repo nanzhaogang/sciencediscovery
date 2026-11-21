@@ -21,10 +21,18 @@ import {
   type ComponentProps,
   type CSSProperties,
 } from "react";
-import { isEvidenceSessionReadOnly, isEvolveRunActive, type EvolveAlgorithm } from "@sciencediscovery/schema";
+import { appendEvolveDirection, isEvidenceSessionReadOnly, isEvolveRunActive, type EvolveAlgorithm, type EvolveDirectionInput } from "@sciencediscovery/schema";
 
 import { ApiClient } from "./api/client.js";
-import { getSubagent } from "./api/sessions.js";
+import { TOKEN_STORAGE_KEY } from "./state/storage.js";
+import { AccountApiError, revokeAccountSession } from "./auth/account.js";
+import { ensureCreditsModel } from "./auth/credits-model.js";
+import { requiresLocalToken } from "./auth/gate.js";
+import { clearSession, readSession, saveSession, sessionRefreshDelayMs, type UserSession } from "./auth/session.js";
+import { ensureFreshAccountSession } from "./auth/session-refresh.js";
+import { LoginPage, hasAuthCallback, settleAuthCallback } from "./views/LoginPage.js";
+import { AccountPage, SignedOutAccount } from "./views/AccountPage.js";
+import { cancelRun, getSubagent } from "./api/sessions.js";
 import type {
   ComposerReference,
   PermissionDecision,
@@ -36,6 +44,8 @@ import type {
 import { CATALOG_FAILURES_BEFORE_STALE, createCatalogPoll } from "./app/catalog-poll.js";
 import type { GuideStep } from "./app/guide.js";
 import { isEmptyTranscript, landingKey } from "./app/landing.js";
+import { canExportSession } from "./app/session-export.js";
+import { useIdeaResearches } from "./app/use-idea-researches.js";
 import { useJiuwenReadiness, jwReadyFromBridge, wizardIntroHandled } from "./app/shell-bridge.js";
 import type { ToolDetail } from "./app/tool-io.js";
 import { followSubagent } from "./app/follow-subagent.js";
@@ -43,34 +53,41 @@ import { useFileDrop } from "./app/use-file-drop.js";
 import { useLanguage } from "./app/use-language.js";
 import { usePanelWidth } from "./app/use-panel-width.js";
 import { useWorkspace } from "./app/use-workspace.js";
+import { useConfigurationRequests } from "./app/use-configuration-requests.js";
 import { formatByteLimit } from "./app/upload.js";
 import {
   composeEvolveMessage,
+  designHasSearch,
   evolveCommandAlgorithm,
   evolveCommandCheckpointMode,
   evolveCommandGoal,
+  evolveDraftTask,
   isEvolveSkill,
+  latestEvolveCheckpointMode,
   splitEvolveCommand,
 } from "./evolve/command.js";
 import { designAnchor, useAutoContinue } from "./evolve/use-auto-continue.js";
+import { isIdeaTreeCommand } from "./idea/command.js";
+import { stepAwaitingIdea } from "./idea/awaiting.js";
+import { taskTabKept } from "./idea/task-tab.js";
 import { useEvolve } from "./evolve/use-evolve.js";
 import { allSubagents } from "./run-stream/model.js";
 import { mergedSubagentSteps } from "./run-stream/subagent.js";
 import {
   GUIDE_STORAGE_KEY,
   RIGHT_PANEL_STORAGE_KEY,
-  TOKEN_STORAGE_KEY,
   readStoredFlag,
   writeStoredFlag,
 } from "./state/storage.js";
 import { applyDocumentLanguage, TEXT } from "./text.js";
+import { inheritedApprovalMode, rememberApprovalMode } from "./app/approval-mode-preference.js";
 import { FeedbackDialog } from "./feedback/FeedbackDialog.js";
 import { ArtifactDialog } from "./views/ArtifactDialog.js";
-import { AuthScreen } from "./views/AuthScreen.js";
-import { CheckpointReplyProvider, type CheckpointReply } from "./views/CheckpointCard.js";
+import { CheckpointRefusedProvider, CheckpointReplyProvider, type CheckpointReply } from "./views/CheckpointCard.js";
 import { Composer, type SeededCommand } from "./views/Composer.js";
 import { ConfirmDialog } from "./views/ConfirmDialog.js";
 import { Conversation } from "./views/Conversation.js";
+import { draftEvolveDirection } from "./api/evolve.js";
 import { EvolveCreateDialog } from "./views/evolve/EvolveCreateDialog.js";
 import { EvolveDetail } from "./views/evolve/EvolveDetail.js";
 import { EvolveRuns } from "./views/evolve/EvolveRuns.js";
@@ -80,6 +97,9 @@ import { MemoryCardDialog } from "./views/MemoryCardDialog.js";
 import { OfflineScreen } from "./views/OfflineScreen.js";
 import { Rail } from "./views/Rail.js";
 import { SessionBar } from "./views/SessionBar.js";
+import { IdeaResearchCard } from "./views/idea/IdeaResearchCard.js";
+import { IdeaResearchPanel } from "./views/idea/IdeaResearchPanel.js";
+import { LegacyIdeaCard, LegacyIdeaTreePanel, useLegacyIdeaTree } from "./views/idea/LegacyIdeaTree.js";
 import { ResearchPackage, type PackageRequest } from "./views/ResearchPackage.js";
 import { SetupWizard } from "./views/SetupWizard.js";
 import {
@@ -89,6 +109,7 @@ import {
 import { Sidebar } from "./views/Sidebar.js";
 import { Toasts } from "./views/Toasts.js";
 import { WorkspacePanel, type PanelGroup } from "./views/WorkspacePanel.js";
+import type { TurnArtifact } from "./app/turn-artifacts.js";
 
 interface Props {
   /** Read once in `main.tsx`, before the tree mounts. */
@@ -98,13 +119,32 @@ interface Props {
 export function App({ initialToken }: Props) {
   const [packageRequest, setPackageRequest] = useState<PackageRequest>();
   const [token, setToken] = useState(initialToken);
+  const [accountSession, setAccountSession] = useState<UserSession | undefined>(() => readSession());
+  /** The HUAWEI callback is consumed on mount, before `replaceState` strips the
+   *  fragment: a workspace that already holds a local token would otherwise
+   *  skip the sign-in page and never exchange the ticket. It is released once
+   *  an account exists, so a later sign-out stays in the workspace. */
+  const [settlingAuth, setSettlingAuth] = useState(() => hasAuthCallback(window.location.hash));
   /** Set when the server answered 401, so the gate can say "this one was
    *  refused" instead of the generic "we have no credential". */
   const [rejected, setRejected] = useState(false);
   /** 设置 opens over the task surface and holds which pane it last showed, so
    *  reopening lands where the user left off. */
   const [settingsOpen, setSettingsOpen] = useState(false);
+  /** A sign-in started from the account panel comes back to it rather than to
+   *  the way-in page. The panel's return address carries `?account=1`, which is
+   *  read once here: the ticket exchange strips the address back to the page. */
+  const returnToAccount = useRef(new URLSearchParams(window.location.search).has("account"));
+  /** Opens on the panel for that return, so the workspace behind it is never
+   *  replaced by the sign-in page while the ticket is being exchanged. */
+  const [accountOpen, setAccountOpen] = useState(() => returnToAccount.current);
   const [settingsGroup, setSettingsGroup] = useState<SettingsGroup>("general");
+  /** Bumped when 设置 closes after showing 技能. The composer's `/` palette reads
+   *  the skill catalog once, so a skill installed or edited behind that surface
+   *  would otherwise stay missing from — or stale in — the palette until the
+   *  window reloads. Another page's close does not re-read it. */
+  const [skillsEpoch, setSkillsEpoch] = useState(0);
+  const skillsVisited = useRef(false);
   /** The citation whose memory card is open. It is a dialog over whichever
    *  document cites it, not a surface: closing it leaves the reader exactly
    *  where the chip was pressed. */
@@ -126,6 +166,9 @@ export function App({ initialToken }: Props) {
   const [linkedArtifactId, setLinkedArtifactId] = useState<string | undefined>();
   /** The task sidebar folds away; the conversation's does too when the panel
    *  needs the room. */
+  // The permission mode new conversations inherit: the reader's last choice, stored so
+  // it survives a restart, and never applied to a session that already exists (#1204).
+  const [lastApprovalMode, setLastApprovalMode] = useState(inheritedApprovalMode());
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [workspaceOpen, setWorkspaceOpen] = useState(() =>
     readStoredFlag(localStorage, RIGHT_PANEL_STORAGE_KEY),
@@ -134,6 +177,11 @@ export function App({ initialToken }: Props) {
    *  elsewhere in the app lands on the group that lists it; a panel that is
    *  simply being opened lands on 产物, which is what a run produces. */
   const [panelGroup, setPanelGroup] = useState<PanelGroup>("artifacts");
+  /** Latest values for the turn strip's stable callback — see
+   *  `previewTurnArtifact`. Assigned during render, the way `use-workspace`
+   *  keeps its own `tabsRef`. */
+  const openArtifactInPanelRef = useRef<(output: SessionArtifactOutput) => void>(() => {});
+  const outputsRef = useRef<readonly SessionArtifactOutput[]>([]);
   /** The subagent whose execution the panel is showing, if any. It is a
    *  mode of the panel rather than a fourth tab: the transcript's line opens
    *  it, and the panel's own back arrow closes it. */
@@ -159,12 +207,73 @@ export function App({ initialToken }: Props) {
       // A credential we could not clear is still one we do not use.
     }
   }, []);
+  // The latest account, read by callbacks that must not change identity when
+  // the account page updates the record (a new callback would restart its load).
+  const accountSessionRef = useRef(accountSession);
+  accountSessionRef.current = accountSession;
+  // Signing out drops the account, not the machine's credential: a workspace
+  // running on a custom model keeps working, and the user surface turns into a
+  // signed-out page with the one way back in.
+  const signOut = useCallback(() => {
+    const current = accountSessionRef.current;
+    if (current) void revokeAccountSession(current.accessToken).catch(() => undefined);
+    clearSession();
+    setAccountSession(undefined);
+    setAccountOpen(true);
+  }, []);
+  // The page reads the account back after every change, so the record it hands
+  // over is written through to storage as well: a rename must survive a reload.
+  const updateAccountSession = useCallback((next: UserSession) => {
+    setAccountSession(next);
+    saveSession(next);
+  }, []);
 
   // The client is rebuilt with the token, because every request carries it. A
   // token change is rare enough that re-creating it is cheaper than threading
   // a mutable header through every call site.
   const client = useMemo(() => new ApiClient(token, onAuthRejected), [onAuthRejected, token]);
   const { actions, boot, state } = useWorkspace(client, onAuthRejected);
+  const creditsModelToken = useRef<string | undefined>(undefined);
+
+  useEffect(() => {
+    if (!accountSession || boot !== "ready") return;
+    if (creditsModelToken.current === accountSession.accessToken) return;
+    creditsModelToken.current = accountSession.accessToken;
+    void ensureCreditsModel(client, accountSession)
+      .then((models) => {
+        if (models) void actions.refreshCatalog();
+      })
+      .catch(() => undefined);
+  }, [accountSession, actions, boot, client]);
+  // The account session is what the composer's balance and the sidebar's user
+  // card read. The local service token alone is not an account: it is only the
+  // credential that lets the shell reach this machine.
+  useEffect(() => {
+    if (!accountSession) return;
+    let cancelled = false;
+    let timerId: number | undefined;
+    const schedule = (delay: number) => {
+      if (cancelled) return;
+      timerId = window.setTimeout(() => {
+        void ensureFreshAccountSession(accountSession).then((next) => {
+          if (!cancelled && next && next.accessToken !== accountSession.accessToken) setAccountSession(next);
+        }).catch((error: unknown) => {
+          if (!cancelled && error instanceof AccountApiError && error.denied) {
+            clearSession();
+            setAccountSession(undefined);
+            setToken("");
+          }
+        }).finally(() => {
+          schedule(Math.max(sessionRefreshDelayMs(accountSession), 30_000));
+        });
+      }, delay);
+    };
+    schedule(sessionRefreshDelayMs(accountSession));
+    return () => {
+      cancelled = true;
+      if (timerId !== undefined) window.clearTimeout(timerId);
+    };
+  }, [accountSession]);
   const resize = usePanelWidth();
 
   /** The runtime and the open Session's searches. The transcript's run cards
@@ -172,6 +281,22 @@ export function App({ initialToken }: Props) {
    *  than inside the panel: the searches must stay reachable while the panel is
    *  closed. */
   const evolve = useEvolve(client, state.sessionId);
+  /** The session's Idea Tree researches. Read at this level for the same reason
+   *  as the searches: a card stays reachable while the task panel is closed. */
+  const idea = useIdeaResearches(client, state.sessionId);
+  /** Sessions written before the research API still carry a legacy tree; it is
+   *  only asked for when the session has no research to describe it. */
+  const legacy = useLegacyIdeaTree(client, state.sessionId, idea.views.length === 0 && !idea.unavailable);
+  /** Which research the task panel shows, by id. */
+  const [ideaResearchId, setIdeaResearchId] = useState<string>();
+  /** True from the moment `/idea-tree <task>` is sent until the research it
+   *  starts shows up in the list. The command is a message the agent acts on —
+   *  it is not intercepted — so the only way to open the panel at the start
+   *  rather than at the next unrelated refresh is to know that one is expected. */
+  const [awaitingIdea, setAwaitingIdea] = useState(false);
+  /** The legacy tree, open in the 任务 tab. It has no research and no stream, so
+   *  it is selected separately from `ideaResearchId`. */
+  const [legacyOpen, setLegacyOpen] = useState(false);
   const refreshEvolve = evolve.refresh;
   /** Which search the panel is showing, by id. Storing the id rather than the
    *  record keeps the panel reading the same list the run cards do, so a status
@@ -185,6 +310,12 @@ export function App({ initialToken }: Props) {
   /** The ids the list already held, so "new" means new and not merely "the
    *  first list a slow poll happened to return". */
   const seenRunIds = useRef<Set<string>>(new Set());
+  /** The same for the session's researches, kept apart from the runs: an Idea
+   *  Tree research is created by the agent, so it can only be recognised after
+   *  the fact. `awaitingIdeaFrom` records how many list reads had finished when
+   *  the command left, which is what makes the first read after it a baseline
+   *  rather than news — a read that started earlier can still land later. */
+  const awaitingIdeaFrom = useRef<{ loads: number; baseline?: ReadonlySet<string> } | undefined>(undefined);
   /** The instant the command was sent; a run older than it was already there. */
   const awaitingSince = useRef(0);
   /** The create dialog, open with a typed goal when the command was diverted
@@ -212,10 +343,54 @@ export function App({ initialToken }: Props) {
   // the switch.
   useEffect(() => {
     setEvolveRunId(undefined);
+    // A research id is the previous session's, so it goes with the run id.
+    setIdeaResearchId(undefined);
+    setLegacyOpen(false);
     setAwaitingRun(false);
+    setAwaitingIdea(false);
+    awaitingIdeaFrom.current = undefined;
     setSeededCommand(undefined);
     seenRunIds.current = new Set();
   }, [state.sessionId]);
+
+  // The list is not polled until a research is live, and the agent creates this
+  // one during a run, so the panel would otherwise wait for an unrelated
+  // refresh. Looking every few seconds is bounded: a command that never produced
+  // a research must not keep the window asking forever.
+  useEffect(() => {
+    if (!awaitingIdea) return undefined;
+    void idea.reload();
+    const started = Date.now();
+    const timer = window.setInterval(() => {
+      if (Date.now() - started > 5 * 60_000) {
+        setAwaitingIdea(false);
+        return;
+      }
+      idea.reload();
+    }, 3_000);
+    return () => window.clearInterval(timer);
+  }, [awaitingIdea, idea.reload]);
+
+  // Open a research this window asked for. The first list read that finishes
+  // after the command is the state the session was already in — a read that
+  // started earlier can still land later — so only an id that appears in a later
+  // read is the research the agent just created. A reopened session ends up with
+  // no wait at all, and nothing opens by itself.
+  useEffect(() => {
+    if (!awaitingIdea) return;
+    const wait = awaitingIdeaFrom.current;
+    if (wait === undefined || idea.loads <= wait.loads) return;
+    const step = stepAwaitingIdea(wait.baseline, idea.views.map((view) => view.research.id));
+    wait.baseline = step.baseline;
+    if (step.fresh === undefined) return;
+    setAwaitingIdea(false);
+    awaitingIdeaFrom.current = undefined;
+    setIdeaResearchId(step.fresh);
+    setEvolveRunId(undefined);
+    setLegacyOpen(false);
+    setPanelGroup("task");
+    setWorkspaceOpen(true);
+  }, [awaitingIdea, idea.loads, idea.views]);
 
   // A start is only visible once the list is re-read, and the list poll is
   // idle until something is active. Looking every few seconds until the new
@@ -249,10 +424,15 @@ export function App({ initialToken }: Props) {
 
   // 任务 is a tab an open panel shows; when the Session's runs go away (a new
   // Session, a deleted run) the tab goes with them, and an empty mode would
-  // leave the column with nothing in it.
+  // leave the column with nothing in it. An Idea Tree research is the other
+  // thing the tab shows, so a selected one keeps the tab: without it, opening
+  // a research's card landed on 产物 and the panel never appeared.
   useEffect(() => {
-    if (panelGroup === "task" && evolve.runs.length === 0) setPanelGroup("artifacts");
-  }, [evolve.runs.length, panelGroup]);
+    if (panelGroup !== "task") return;
+    const selected = idea.views.some((view) => view.research.id === ideaResearchId);
+    if (taskTabKept(evolve.runs.length, selected)) return;
+    setPanelGroup("artifacts");
+  }, [evolve.runs.length, idea.views, ideaResearchId, panelGroup]);
 
   // A search is created by the server while the agent's turn is running, and
   // the list is not polled until one is active. The created event is therefore
@@ -511,6 +691,33 @@ export function App({ initialToken }: Props) {
     setWorkspaceOpen(true);
   }, []);
 
+  /**
+   * A turn strip's overflow row (#1252): the files the strip does not list are
+   * in the panel's artifact group, so that is where it goes. Any record the
+   * panel was showing steps aside, as it does for a dependency link.
+   */
+  const openArtifactPanel = useCallback(() => {
+    setOpenSubagentId(undefined);
+    setOpenTool(undefined);
+    setPanelGroup("artifacts");
+    setWorkspaceOpen(true);
+  }, []);
+
+  /**
+   * A turn strip's card (#1252): read the file in the panel, where files are
+   * read, at the version the card printed.
+   *
+   * The output record is matched on its version id, not on the ordinal alone:
+   * the id is what the card names, and a record that has gone (deleted between
+   * the render and the press) draws nothing rather than quietly opening the
+   * newest version in place of the one asked for.
+   */
+  const previewTurnArtifact = useCallback((row: TurnArtifact) => {
+    const output = outputsRef.current.find((candidate) =>
+      candidate.artifact.id === row.artifact.id && candidate.version.id === row.version.id);
+    if (output !== undefined) openArtifactInPanelRef.current(output);
+  }, []);
+
   /** Back from a child's record or a tool's text to the panel's own groups. */
   const closePanelDetail = useCallback(() => {
     setOpenSubagentId(undefined);
@@ -590,7 +797,15 @@ export function App({ initialToken }: Props) {
    *  empty transcript: the composer sits centred with the wordmark, rather
    *  than pinned to the bottom of a page with nothing above it. A run that is
    *  still going keeps the transcript, even before its first event lands. */
-  const landing = !state.loadingSession && !state.running && isEmptyTranscript(state);
+  // Poll the selected Session even while it still has no messages: an API-
+  // created configuration request must not disappear behind the welcome page.
+  const configuration = useConfigurationRequests({
+    client, sessionId: state.detail?.id, active: state.running,
+    refreshKey: `${state.detail?.updatedAt ?? ""}:${state.detail?.messages.map(message => message.id).join(",") ?? ""}:${state.run.status ?? ""}:${state.run.turns.flatMap(turn => turn.tools.map(tool => `${tool.id}:${tool.trace.status}`)).join(",")}`,
+    onChange: actions.refreshConfiguration,
+  });
+  const landing = !state.loadingSession && !state.running && isEmptyTranscript(state)
+    && !configuration.requests.length && !configuration.legacyRequests.length && !configuration.loading && !configuration.error;
 
   useEffect(() => {
     pageRef.current = { landing, running: state.running };
@@ -618,20 +833,76 @@ export function App({ initialToken }: Props) {
     actions.retryBoot();
   };
 
-  /** The command is a way into the surface, not only a message. While the
-   *  runtime is not ready the goal typed after it is carried into the setup
-   *  dialog instead of being sent to a server that cannot run it; a bare
-   *  command opens the dialog that asks for one. On a host with no sandbox
-   *  every command detours there, including one that already carries
-   *  `--allow-direct`: a pasted flag is a word the user typed without the
-   *  warning on screen, and the dialog is where that warning is read and
-   *  answered. So the dialog is the only writer of the flag — a command that
-   *  reaches the server with it is one the user confirmed here.
+  /** A HUAWEI sign-in opens the workspace directly: the credits-backed model is
+   *  registered before the new token reaches the boot effect, so the catalog is
+   *  never briefly empty (which would show the model wizard for a user who
+   *  already chose to pay with credits). */
+  const authenticate = useCallback(async (session: UserSession, localToken: string) => {
+    try {
+      await ensureCreditsModel(new ApiClient(localToken, onAuthRejected), session);
+    } catch {
+      // The gateway may be unreachable; the model wizard is the fallback.
+    }
+    // A signed-out workspace already holds this machine's token: re-accepting
+    // the same one would restart boot behind the account panel, and a sign-in
+    // that came from that panel lands on the panel itself. Only the catalog
+    // needs refreshing, which keeps the account details on screen.
+    if (localToken !== token) {
+      acceptToken(localToken);
+    } else {
+      void actions.refreshCatalog();
+    }
+    setAccountSession(session);
+    setSettlingAuth(false);
+    setAccountOpen(returnToAccount.current);
+  }, [actions, onAuthRejected, token]);
+
+  // A restored account settles the callback latch as well: the ticket is no
+  // longer the reason this render is a sign-in page.
+  useEffect(() => {
+    if (accountSession) setSettlingAuth(false);
+  }, [accountSession]);
+
+  // A sign-in started from the account panel is settled here, not on the
+  // sign-in page: the panel stays on screen, says it is confirming, and swaps
+  // to the details as soon as the ticket is exchanged.
+  const panelSettlementStarted = useRef(false);
+  useEffect(() => {
+    if (!returnToAccount.current || panelSettlementStarted.current) return;
+    panelSettlementStarted.current = true;
+    void (async () => {
+      try {
+        const settled = await settleAuthCallback(window.location.hash);
+        if (settled) {
+          await authenticate(settled.session, settled.localToken);
+          return;
+        }
+      } catch {
+        // A refused ticket or an unreachable service falls through to the
+        // panel's signed-out state, which offers the button again.
+      }
+      window.history.replaceState(null, "", window.location.pathname);
+      setSettlingAuth(false);
+    })();
+  }, [authenticate]);
+
+  /** The command is a way into the surface, not only a message.
+   *
+   *  A command typed as text — pasted, or written without picking the skill
+   *  from the palette — always opens the setup dialog rather than being sent.
+   *  The dialog is the one place the task, the search, the pace and the
+   *  parameters are visible together, and on a host with no sandbox it is the
+   *  only writer of `--allow-direct`: a pasted flag is a word typed without
+   *  the warning on screen, and the dialog is where that warning is read and
+   *  answered. The sentence typed after the command rides along, so it is not
+   *  written twice. A token the dialog already placed in the composer takes
+   *  the branch above instead — sending it is the user's final word, and it
+   *  must not reopen the dialog.
    *
    *  Defined above the boot screens' early returns because the checkpoint
    *  provider below reads it in an effect: a `const` declared after an early
    *  `return` is still in its temporal dead zone when that effect commits. */
-  const sendMessage = (content: string, command?: string) => {
+  const sendMessage = (content: string, command?: string, direction?: EvolveDirectionInput) => {
     if (isEvidenceSessionReadOnly(state.detail)) { actions.toast(TEXT.researchPackage.readOnly, "error"); return; }
     // The token came from the design dialog, which collected the goal, the
     // search and the no-sandbox consent before placing it. Sending it is a
@@ -641,13 +912,12 @@ export function App({ initialToken }: Props) {
       setSeededCommand(undefined);
       awaitingSince.current = Date.now();
       setAwaitingRun(true);
-      void actions.send(composeEvolveMessage(command, content));
+      const message = composeEvolveMessage(command, content);
+      void actions.send(direction ? appendEvolveDirection(message, direction) : message);
       return;
     }
     const goal = evolveCommandGoal(content);
-    if (goal !== undefined
-        && (goal === "" || evolve.status.state !== "ready"
-            || evolve.status.sandbox === "direct")) {
+    if (goal !== undefined) {
       setEvolveCreate({
         algorithm: evolveCommandAlgorithm(content),
         checkpointMode: evolveCommandCheckpointMode(content),
@@ -655,9 +925,18 @@ export function App({ initialToken }: Props) {
       });
       return;
     }
-    if (goal !== undefined) {
-      awaitingSince.current = Date.now();
-      setAwaitingRun(true);
+    if (isIdeaTreeCommand(content)) {
+      // The command stays a message: the agent runs its preparation and calls
+      // `create_idea_research`, because the evidence it gathers cannot be
+      // produced here. Remembering that one was asked for — plus the ids the
+      // session already had, when a read has finished — is what lets the panel
+      // open on the research that request creates rather than on one that was
+      // already there. Without a finished read there is no baseline to compare
+      // against, so the first read after the command takes that role instead.
+      awaitingIdeaFrom.current = idea.loads > 0
+        ? { loads: idea.loads, baseline: new Set(idea.views.map((view) => view.research.id)) }
+        : { loads: idea.loads };
+      setAwaitingIdea(true);
     }
     void actions.send(content);
   };
@@ -691,23 +970,63 @@ export function App({ initialToken }: Props) {
     [state.detail?.messages, state.pendingMessage?.content],
   );
 
+  /** The pace that design was started with, from the same transcript. Only a
+   *  design nobody is waiting on may be carried forward. */
+  const designPace = useMemo(
+    () => latestEvolveCheckpointMode(state.detail?.messages ?? [], state.pendingMessage?.content),
+    [state.detail?.messages, state.pendingMessage?.content],
+  );
+
+  /** Whether *this design* already has a search. The Session's whole run list
+   *  would answer for designs that are long finished, and a second no-confirm
+   *  design in the same conversation would never be carried. The command `now`
+   *  being sent counts: a design whose `/evolve-design` is still pending owns
+   *  no run, whatever the previous design in the transcript started. */
+  const searchStarted = useMemo(
+    () => designHasSearch(
+      evolve.runs,
+      state.detail?.messages ?? [],
+      state.pendingMessage?.content,
+    ),
+    [evolve.runs, state.detail?.messages, state.pendingMessage?.content],
+  );
+
   // A no-confirm design that ends its turn on an auto card is carried forward
   // here — the model cannot start the next turn by itself, and the card offers
   // nothing to press. See the hook for what it refuses to act on.
-  useAutoContinue({
+  const autoContinue = useAutoContinue({
+    checkpointMode: designPace,
     design,
     running: state.running,
     run: state.run,
+    searchStarted,
     send: (text) => latestSend.current(text),
     sessionId: state.sessionId,
   });
 
-  // No token is its own screen, ahead of the boot states: without one nothing
-  // the app can say about the server is knowable, including whether it is up.
-  if (token === "") {
+  // Returning from HUAWEI ID takes priority over every other gate: the ticket
+  // has to be exchanged even when the machine already has its local token (and
+  // therefore a perfectly usable, signed-out workspace). A sign-in that came
+  // from the account panel settles inside the panel instead (see above), so
+  // the page is only shown for a callback that started on it.
+  if (settlingAuth && !accountSession && !returnToAccount.current) {
     return (
       <>
-        <AuthScreen onSubmit={acceptToken} rejected={rejected} />
+        <LoginPage onAuthenticated={(session, localToken) => void authenticate(session, localToken)} />
+        <Toasts onDismiss={actions.dismissToast} toasts={state.toasts} />
+      </>
+    );
+  }
+
+  // The local service token is the only hard credential: without it even the
+  // model catalog is unreadable, so a browser that has never been handed one
+  // can only be signed in through HUAWEI ID.
+  if (requiresLocalToken(token)) {
+    return (
+      <>
+        <LoginPage
+          onAuthenticated={(session, localToken) => void authenticate(session, localToken)}
+        />
         <Toasts onDismiss={actions.dismissToast} toasts={state.toasts} />
       </>
     );
@@ -734,6 +1053,26 @@ export function App({ initialToken }: Props) {
       <>
         <OfflineScreen onRetry={actions.retryBoot} reason="unreachable" />
         <FeedbackDialog />
+      </>
+    );
+  }
+
+  // No account and no model: the entry page offers the two ways in — sign in
+  // for credits, or point the workspace at a model endpoint. Either one is
+  // enough to open the workspace; the other stays configurable from there.
+  if (!accountSession && (boot === "setup" || boot === "auth")) {
+    return (
+      <>
+        <LoginPage
+          client={client}
+          offerModelSetup
+          onAuthenticated={(session, localToken) => void authenticate(session, localToken)}
+          onModelConfigured={() => actions.finishSetup()}
+          onProvidersChanged={actions.refreshCatalog}
+          presets={state.presets}
+          providers={state.providers}
+        />
+        <Toasts onDismiss={actions.dismissToast} toasts={state.toasts} />
       </>
     );
   }
@@ -792,11 +1131,27 @@ export function App({ initialToken }: Props) {
   // the grid here, because two things have to agree on it: the shell's third
   // track, and the panel that fills it. `--panel-width` inherits, so setting it
   // once on the shell reaches both, and neither has to be told twice.
+  outputsRef.current = state.outputs;
+
   const shellStyle = { "--panel-width": `${resize.width}px` } as CSSProperties;
 
   const openSettings = (group: SettingsGroup) => {
     setSettingsGroup(group);
+    // 会话 / 设置 / 用户 are peers in the rail: opening one puts the other away,
+    // so the user page is never buried under the settings surface.
+    setAccountOpen(false);
+    if (group === "skills") skillsVisited.current = true;
     setSettingsOpen(true);
+  };
+
+  const closeSettings = () => {
+    setSettingsOpen(false);
+    // 导入 or a card's 编辑 happens on this surface, so closing it after 技能 is
+    // the moment the composer's palette is known to be out of date.
+    if (skillsVisited.current) {
+      skillsVisited.current = false;
+      setSkillsEpoch((epoch) => epoch + 1);
+    }
   };
 
   /** The run the 任务 tab shows: the one the reader picked, else the one that
@@ -806,20 +1161,40 @@ export function App({ initialToken }: Props) {
     ?? evolve.runs.find((run) => isEvolveRunActive(run.status))
     ?? evolve.runs[0];
 
-  /** Open a run in the panel: the card and 会话设置 both land here, and neither
-   *  should have to open the panel first. */
+  /** Open a run in the panel from its card in the transcript: the card should
+   *  not have to open the panel first. */
+  /** The research the 任务 tab shows, when its card was the way in. */
+  const ideaResearch = idea.views.find((view) => view.research.id === ideaResearchId);
+
   const showEvolveRun = (id: string) => {
     setEvolveRunId(id);
+    // 任务 shows one thing: a research or a legacy tree left selected would keep
+    // drawing over the run the reader just asked for, and #1169 requires Evolve
+    // to stay usable in a session that has both.
+    setIdeaResearchId(undefined);
+    setLegacyOpen(false);
     setPanelGroup("task");
     setWorkspaceOpen(true);
   };
 
-  /** 会话设置's row goes to the search that wants attention — a running one,
-   *  else the newest — and starts one only when the session has none. */
-  const openEvolve = () => {
-    const target = evolve.runs.find((run) => isEvolveRunActive(run.status)) ?? evolve.runs[0];
-    if (target === undefined) setEvolveCreate({});
-    else showEvolveRun(target.id);
+  /** The same for a research's card: the panel is the 任务 tab, and the search
+   *  detail steps aside for it. */
+  const showIdeaResearch = (id: string) => {
+    setIdeaResearchId(id);
+    setEvolveRunId(undefined);
+    setLegacyOpen(false);
+    setPanelGroup("task");
+    setWorkspaceOpen(true);
+  };
+
+  /** 会话设置's row always starts a new design. A search already in the
+   *  session stays reachable through its card in the transcript, so opening
+   *  the newest one here would only hide the create dialog behind a run that
+   *  has nothing left to do. The composer's draft rides into the new design's
+   *  task field: a sentence already written is the one the design would start
+   *  from. */
+  const openEvolve = (draft?: string) => {
+    setEvolveCreate({ goal: evolveDraftTask(draft ?? "") });
   };
 
   const closeEvolveCreate = () => setEvolveCreate(undefined);
@@ -861,6 +1236,11 @@ export function App({ initialToken }: Props) {
     }
   };
 
+  // The strip's door into the panel: `openDependencyInPanel` already focuses an
+  // open tab and moves it to the requested version, which is exactly the gesture
+  // a card asks for.
+  openArtifactInPanelRef.current = openDependencyInPanel;
+
   // The dialog only keeps its offset while the panel is still showing the
   // dependency: pointing the panel at another document or another group ends
   // the gesture, and the dialog goes back to the middle of the window.
@@ -876,14 +1256,26 @@ export function App({ initialToken }: Props) {
    *  in the middle of the welcome page — so its props are assembled once. */
   const composerProps: Omit<ComponentProps<typeof Composer>, "landing" | "seed" | "tag"> = {
     activeProjectId: state.activeProjectId,
-    approvalMode: state.detail?.approvalMode,
+    // The session's own mode, else the reader's last choice, else the project/global
+  // default the service would apply — never a third "follow settings" state (#1204).
+  approvalMode: state.detail?.approvalMode ?? lastApprovalMode ?? state.defaultApprovalMode ?? "ask_for_dangerous",
     attachBlocked: canUpload ? undefined : TEXT.composer.attachArchived,
     attachLimit,
     attachments: state.attachments,
     client,
     jwBlocked: jwReady ? undefined : TEXT.composer.jwBlocked,
     models: state.models,
-    onApprovalMode: (mode) => void actions.setApprovalMode(mode),
+    onApprovalMode: (mode) => {
+    // The choice is remembered before it is applied: a new conversation started
+    // from this instance inherits it, and the selector on the landing page has
+    // nothing else to read it from.
+    rememberApprovalMode(mode);
+    setLastApprovalMode(mode);
+    // Unconditional: the action itself is a no-op without an open session, while
+    // `state.detail` is cleared during a read, so guarding on it loses the choice
+    // made in that window.
+    void actions.setApprovalMode(mode);
+  },
     onClearAttachments: actions.clearAttachments,
     onClearCommand: () => setSeededCommand(undefined),
     onCreateProject: (name) => void actions.createProject(name),
@@ -891,9 +1283,10 @@ export function App({ initialToken }: Props) {
     onOpenSettings: () => openSettings("models"),
     // A skill that has a setup surface opens it instead of dropping its
     // command into the draft — the same dialog 会话设置's evolve row opens.
-    onPickSkill: (skill) => {
+    // The draft is the task it was going to replace.
+    onPickSkill: (skill, draft) => {
       if (!isEvolveSkill(skill)) return false;
-      setEvolveCreate({});
+      setEvolveCreate({ goal: evolveDraftTask(draft) });
       return true;
     },
     onRemoveAttachment: actions.removeAttachment,
@@ -914,7 +1307,8 @@ export function App({ initialToken }: Props) {
     running: state.running,
     seededCommand,
     selectedModelId: state.selectedModelId,
-    unavailableModel: Boolean(state.detail?.settingsOverrides.modelId && !state.models.some(model => model.id === state.detail?.settingsOverrides.modelId)),
+    skillsEpoch,
+    unavailableModel: Boolean(state.detail?.settingsOverrides?.modelId && !state.models.some(model => model.id === state.detail?.settingsOverrides.modelId)),
     selectedSpecialistId: state.detail?.specialistId,
     uploading: state.uploading,
   };
@@ -936,14 +1330,24 @@ export function App({ initialToken }: Props) {
     "page-task",
     taskSidebar ? "" : "sidebar-hidden",
     panelOpen ? "panel-open" : "workspace-hidden",
+    accountOpen ? "account-open" : "",
   ].filter(Boolean).join(" ");
 
   return (
     <CheckpointReplyProvider value={checkpointReply}>
       <div className={shellClass} style={shellStyle}>
         <Rail
+          account={accountSession}
+          accountOpen={accountOpen}
+          onOpenAccount={() => {
+            setSettingsOpen(false);
+            setAccountOpen(true);
+          }}
           onOpenSettings={() => openSettings(settingsGroup)}
-          onSelectTask={() => setSettingsOpen(false)}
+          onSelectTask={() => {
+            setSettingsOpen(false);
+            setAccountOpen(false);
+          }}
           settingsOpen={settingsOpen}
         />
 
@@ -951,7 +1355,7 @@ export function App({ initialToken }: Props) {
           <Sidebar
             actions={actions}
             onExportSession={session => {
-              if (session.projectId !== state.inboxProject?.id && !state.projects.some(project => project.id === session.projectId)) { actions.toast(TEXT.researchPackage.sourceUnavailable, "error"); return; }
+              if (!canExportSession(session, state.projects, state.inboxProject?.id)) { actions.toast(TEXT.researchPackage.sourceUnavailable, "error"); return; }
               setPackageRequest({ kind: "export", sessionId: session.id, projectId: session.projectId });
             }}
             onImportSession={() => setPackageRequest({ kind: "import", projectId: state.inboxProject?.id })}
@@ -984,24 +1388,66 @@ export function App({ initialToken }: Props) {
             <Landing composer={composerProps} key={landingKey(state)} />
           ) : (
             <>
-              <Conversation
-                client={client}
-                detail={state.detail}
-                // A search keeps running after the turn that started it, so its
-                // card is the last thing the conversation produced. It draws
-                // nothing at all for a session that has no searches.
-                evolve={<EvolveRuns onOpen={showEvolveRun} runs={evolve.runs} />}
-                loading={state.loadingSession}
-                onDecidePermission={decidePermission}
-                onOpenSubagent={openSubagentDetails}
-                onOpenTool={openToolDetails}
-                onBranch={isEvidenceSessionReadOnly(state.detail) || state.running ? undefined : messageId => setPackageRequest({ kind: "branch", sessionId: state.detail?.id, projectId: state.detail?.projectId, messageId })}
-                onReferenceClick={openReference}
-                pending={state.pendingMessage}
-                replays={state.replays}
-                run={state.run}
-                workspaceFiles={state.panelFiles}
-              />
+              {/* A design the client stopped carrying says so on the card it
+                  stopped at; the value is the step, and every other card
+                  ignores it. Hidden while a turn runs: the refusal describes
+                  the ending that already happened, and a new answer that
+                  happens to stream a card of the same step must not wear that
+                  ending's badge for a frame. */}
+              {/* One card per research; the panel is where the tree and the
+                  controls live, so the card itself only opens it. */}
+              {/* The research list is the way in, so a list that could not be
+                  read is said here: an empty column would otherwise read as
+                  "nothing was ever started" when the sidecar is simply down. */}
+              {idea.unavailable || idea.error || legacy.error ? (
+                <p className="idea-notice" role="alert">
+                  {idea.unavailable ? TEXT.ideaTree.unavailable : idea.error ?? legacy.error}
+                </p>
+              ) : null}
+              {legacy.graph ? (
+                <LegacyIdeaCard
+                  graph={legacy.graph}
+                  onOpen={() => { setLegacyOpen(true); setIdeaResearchId(undefined); setEvolveRunId(undefined); setPanelGroup("task"); setWorkspaceOpen(true); }}
+                />
+              ) : null}
+              {idea.views.length ? (
+                <div className="idea-cards">
+                  {idea.views.map((view) => (
+                    <IdeaResearchCard
+                      key={view.research.id}
+                      onOpen={showIdeaResearch}
+                      view={view}
+                    />
+                  ))}
+                </div>
+              ) : null}
+              <CheckpointRefusedProvider value={state.running ? undefined : autoContinue.refusedStep}>
+                <Conversation
+                  onOpenConfigurationSettings={openSettings}
+                  client={client}
+                  detail={state.detail}
+                  configuration={configuration}
+                  onConfigurationChange={actions.refreshConfiguration}
+                  configurationReadOnly={isEvidenceSessionReadOnly(state.detail) || state.detail?.archivedAt !== undefined}
+                  // A search keeps running after the turn that started it, so its
+                  // card is the last thing the conversation produced. It draws
+                  // nothing at all for a session that has no searches.
+                  evolve={<EvolveRuns onOpen={showEvolveRun} runs={evolve.runs} />}
+                  loading={state.loadingSession}
+                  onDecidePermission={decidePermission}
+                  onOpenArtifactPanel={openArtifactPanel}
+                  onOpenSubagent={openSubagentDetails}
+                  onPreviewArtifact={previewTurnArtifact}
+                  onOpenTool={openToolDetails}
+                  onBranch={isEvidenceSessionReadOnly(state.detail) || state.running ? undefined : messageId => setPackageRequest({ kind: "branch", sessionId: state.detail?.id, projectId: state.detail?.projectId, messageId })}
+                  onReferenceClick={openReference}
+                  outputs={state.outputs}
+                  pending={state.pendingMessage}
+                  replays={state.replays}
+                  run={state.run}
+                  workspaceFiles={state.panelFiles}
+                />
+              </CheckpointRefusedProvider>
               {isEvidenceSessionReadOnly(state.detail) ? null : <Composer {...composerProps} />}
             </>
           )}
@@ -1023,25 +1469,52 @@ export function App({ initialToken }: Props) {
           subagent={openSubagent}
           subagentLoading={subagentLoading && (openSubagent?.steps.length ?? 0) === 0}
           subagentStale={subagentStale}
-          task={evolveRun === undefined ? undefined : <EvolveDetail
-            client={client}
-            key={evolveRun.id}
-            onError={(message) => actions.toast(message, "error")}
-            onRunChanged={() => void refreshEvolve()}
-            run={evolveRun}
-          />}
+          task={legacyOpen && legacy.graph !== undefined
+            ? <LegacyIdeaTreePanel graph={legacy.graph} onClose={() => setLegacyOpen(false)} />
+            : ideaResearch !== undefined
+              ? <IdeaResearchPanel
+                client={client}
+                key={ideaResearch.research.id}
+                onClose={() => setIdeaResearchId(undefined)}
+                researchId={ideaResearch.research.id}
+                sessionId={state.sessionId!}
+              />
+              : evolveRun === undefined ? undefined : <EvolveDetail
+                client={client}
+                key={evolveRun.id}
+                onError={(message) => actions.toast(message, "error")}
+                onRunChanged={() => void refreshEvolve()}
+                run={evolveRun}
+              />}
           tabs={state.tabs}
           tool={openTool}
         />
       </div>
+      {accountOpen && accountSession ? (
+        <AccountPage
+          account={accountSession}
+          onAccountChange={updateAccountSession}
+          onSignOut={signOut}
+          onToggleSidebar={expandSidebar}
+          sidebarOpen={taskSidebar}
+        />
+      ) : accountOpen ? (
+        // After signing out the account surface shows a grey avatar and the
+        // single way back in; the workspace behind it stays usable with a
+        // custom model.
+        <SignedOutAccount pending={settlingAuth} />
+      ) : null}
 
       {settingsOpen ? (
         <SystemSettingsDialog
           actions={actions}
           client={client}
           group={settingsGroup}
-          onClose={() => setSettingsOpen(false)}
-          onGroupChange={setSettingsGroup}
+          onClose={closeSettings}
+          onGroupChange={(next) => {
+            if (next === "skills") skillsVisited.current = true;
+            setSettingsGroup(next);
+          }}
           // 设置 is where a user looks when the interface is what they cannot
           // find, so the guide's one replay lives there. The dialog has to go
           // first: the cards point at the page behind it.
@@ -1086,6 +1559,7 @@ export function App({ initialToken }: Props) {
 
       {evolveCreate === undefined ? null : (
         <EvolveCreateDialog
+          activeRun={evolve.runs.some((run) => isEvolveRunActive(run.status))}
           archived={state.detail?.archivedAt !== undefined}
           error={evolve.error}
           initialAlgorithm={evolveCreate.algorithm}
@@ -1093,15 +1567,19 @@ export function App({ initialToken }: Props) {
           initialGoal={evolveCreate.goal}
           initializing={evolve.initializing}
           onClose={closeEvolveCreate}
+          onGenerateDirection={state.detail
+            ? (task, signal) => draftEvolveDirection(client, state.detail!.id, task, signal)
+            : undefined}
           onInitialize={() => void evolve.initialize()}
-          onSend={(command) => {
+          onSend={(command, direction) => {
             closeEvolveCreate();
-            // The flags become a token in the composer and the goal becomes
-            // the sentence after it. The message leaves when the user says so,
-            // not when the dialog closes: the design usually needs a sentence
-            // of its own added after the goal.
+            // The flags become a token in the composer, the task the sentence
+            // after it, and the confirmed parameters ride with the token until
+            // the user sends. The message leaves when the user says so, not
+            // when the dialog closes: the design usually needs a sentence of
+            // its own added after the task.
             const draft = splitEvolveCommand(command);
-            setSeededCommand({ command: draft.command, nonce: Date.now(), text: draft.goal });
+            setSeededCommand({ command: draft.command, direction, nonce: Date.now(), text: draft.goal });
           }}
           running={state.running}
           status={evolve.status}

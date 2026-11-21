@@ -642,7 +642,7 @@ test.describe("技能", () => {
     await expect(dialog.getByRole("switch", { name: "启用或停用「xlsx」", exact: true })).toBeChecked();
   });
 
-  test("a switch updates JiuwenSwarm globally and survives a reload", async ({ page }) => {
+  test("a bundled skill defaults on and its first disable survives a reload", async ({ page }) => {
     const mock = await installMockApi(page, {
       models: MODELS,
       jiuwenSwarmSkills: [{ skillId: "skill-1", name: "skill-1", description: "", enabled: true, source: "sciencediscovery" }],
@@ -651,12 +651,12 @@ test.describe("技能", () => {
     const dialog = await openSettings(page, "技能");
 
     const card = dialog.locator(".settings-card").filter({ hasText: "分子绘图" });
-    await expect(card).toContainText("已停用");
-    await card.getByRole("switch", { name: "启用或停用「分子绘图」" }).click();
     await expect(card).toContainText("已启用");
+    await card.getByRole("switch", { name: "启用或停用「分子绘图」" }).click();
+    await expect(card).toContainText("已停用");
 
-    expect(writeCall(mock, "PUT", /^\/api\/jiuwenswarm\/skills-by-id\/skill-2$/u)).toEqual({ enabled: true });
-    expect(mock.state.jiuwenSwarmSkills.find((skill) => skill.skillId === "skill-2")?.enabled).toBe(true);
+    expect(writeCall(mock, "PUT", /^\/api\/jiuwenswarm\/skills-by-id\/skill-2$/u)).toEqual({ enabled: false });
+    expect(mock.state.jiuwenSwarmSkills.find((skill) => skill.skillId === "skill-2")?.enabled).toBe(false);
     expect(mock.calls.some((call) => call.method === "PUT" && /\/projects\/[^/]+\/settings$/u.test(call.path))).toBe(false);
 
     await page.keyboard.press("Escape");
@@ -665,12 +665,13 @@ test.describe("技能", () => {
     await page.getByRole("button", { name: "设置", exact: true }).click();
     const reopened = page.getByRole("dialog", { name: "设置" });
     await reopened.getByRole("button", { name: "技能", exact: true }).click();
-    await expect(reopened.locator(".settings-card").filter({ hasText: "分子绘图" })).toContainText("已启用");
+    await expect(reopened.locator(".settings-card").filter({ hasText: "分子绘图" })).toContainText("已停用");
   });
 
   test("bulk enable continues after one skill fails and shows the saved state", async ({ page }) => {
     const mock = await installMockApi(page, {
       models: MODELS, skills, skillToggleFailures: ["skill-1"],
+      jiuwenSwarmSkills: [{ skillId: "skill-1", name: "skill-1", description: "", enabled: false, source: "sciencediscovery" }],
     });
     const dialog = await openSettings(page, "技能");
     await expect(dialog.locator(".settings-card")).toHaveCount(2);
@@ -678,7 +679,9 @@ test.describe("技能", () => {
     await expect(dialog.locator(".settings-card").filter({ hasText: "分子绘图" })).toContainText("已启用");
     await expect(dialog.locator(".settings-card").filter({ hasText: "文献检索" })).toContainText("已停用");
     await expect(dialog).toContainText("Skill switch failed");
+    expect(mock.state.jiuwenSwarmSkills.find((skill) => skill.skillId === "skill-1")?.enabled).toBe(false);
     expect(mock.state.jiuwenSwarmSkills.find((skill) => skill.skillId === "skill-2")?.enabled).toBe(true);
+    expect(writeCall(mock, "PUT", /^\/api\/jiuwenswarm\/skills-by-id\/skill-2$/u)).toEqual({ enabled: true });
   });
 
   test("a card opens to the skill's source, version and file count", async ({ page }) => {
@@ -778,7 +781,7 @@ test.describe("模型", () => {
     await modal.getByLabel("API key").fill("sk-test");
     await modal.getByPlaceholder("例如 deepseek-chat").fill("deepseek-chat");
     await modal.getByRole("button", { name: "测试连接" }).click();
-    await expect(modal.locator(".test-result")).toContainText("✓ 连接成功（12 ms）");
+    await expect(modal.locator(".test-result")).toContainText("✓ 基础检查通过（12 ms）");
 
     await modal.getByRole("button", { name: "保存", exact: true }).click();
     await expect(modal).toBeHidden();
@@ -790,6 +793,128 @@ test.describe("模型", () => {
       mock.calls.some((call) => call.method === "POST" && /^\/api\/providers\/[^/]+\/models$/u.test(call.path)),
     ).toBe(true);
     expect(writeCall(mock, "PUT", "/api/settings")).toMatchObject({ modelId: "model-2" });
+  });
+
+  test("a fetched model list opens over the dialog and scrolls to every entry", async ({ page }) => {
+    const listed = Array.from({ length: 30 }, (_, index) => ({
+      displayName: `Model ${index}`,
+      id: `model-${index}`,
+    }));
+    await installMockApi(page, { models: MODELS });
+    // Registered after the fixture, so it answers first for this one route: a
+    // provider that reports a listing long enough to need scrolling.
+    await page.route("**/api/providers/preview-models", (route) => route.fulfill({
+      body: JSON.stringify({ models: listed }),
+      contentType: "application/json",
+      status: 200,
+    }));
+
+    const dialog = await openSettings(page, "模型");
+    await dialog.getByRole("button", { name: "添加模型" }).click();
+    const modal = page.getByRole("dialog", { name: "添加模型" });
+    await modal.getByLabel("基础URL").fill("https://gateway.example/v1");
+    await modal.getByLabel("API key").fill("sk-test");
+    await modal.getByRole("button", { name: "刷新列表" }).click();
+
+    // The click asked for the listing, so it opens without another click.
+    const listbox = page.getByRole("listbox", { name: "模型名称" });
+    await expect(listbox).toBeVisible();
+    // Portalled to <body> (through the square anchor that backs its rounded
+    // corners): the dialog's `overflow-y: auto` used to clip the menu after
+    // its first row, which is what made the list hard to use.
+    const anchor = page.locator(".field-combo-anchor");
+    expect(await anchor.evaluate((element) => element.parentElement === document.body)).toBe(true);
+    const box = await page.locator(".field-combo-menu").boundingBox();
+    expect(box?.height ?? 0).toBeGreaterThan(200);
+
+    // Scrolling the list — including a wheel over it — must not close the
+    // menu the way the old input `onBlur` did.
+    await listbox.hover();
+    await page.mouse.wheel(0, 900);
+    await expect(listbox).toBeVisible();
+    await listbox.evaluate((element) => {
+      element.scrollTop = element.scrollHeight;
+    });
+    await expect(listbox.locator(".field-combo-option").last()).toContainText("model-29");
+
+    // The last entry is reachable and choosing it fills the field.
+    await listbox.locator(".field-combo-option").last().click();
+    await expect(modal.getByPlaceholder("例如 deepseek-chat")).toHaveValue("model-29");
+    await expect(listbox).toHaveCount(0);
+
+    // A click on the field itself reopens the listing (not only the caret).
+    await modal.getByPlaceholder("例如 deepseek-chat").click();
+    await expect(listbox).toBeVisible();
+
+    // The caret closes the list it opened. A real pointer sequence is what
+    // catches the old order: the capture-phase outside handler closed the menu
+    // on the button's pointerdown, and the click that followed reopened it.
+    const caret = modal.locator(".field-combo-toggle");
+    await caret.click();
+    await expect(listbox).toHaveCount(0);
+    await caret.click();
+    await expect(listbox).toBeVisible();
+
+    // Escape still belongs to the list when focus is not in the input: a click
+    // on the list's own padding leaves focus on the page, where the input's
+    // keydown handler never sees the key. Only the list may close.
+    const menuBox = await page.locator(".field-combo-menu").boundingBox();
+    if (!menuBox) throw new Error("the listing has no box");
+    await page.mouse.click(menuBox.x + 2, menuBox.y + 2);
+    await page.keyboard.press("Escape");
+    await expect(listbox).toHaveCount(0);
+    await expect(modal).toBeVisible();
+
+    // Tab also closes the empty filtered state, so leaving the field does not
+    // leave the 没有匹配 popup over the form. The empty state renders instead
+    // of the listbox, so the assertion has to watch the portal itself.
+    await caret.click();
+    const modelInput = modal.getByPlaceholder("例如 deepseek-chat");
+    await modelInput.fill("no-such-model");
+    await expect(page.locator(".field-combo-empty")).toBeVisible();
+    await modelInput.press("Tab");
+    await expect(page.locator(".field-combo-anchor")).toHaveCount(0);
+    await expect(page.locator(".field-combo-empty")).toHaveCount(0);
+  });
+
+  test("the provider chooser picks a preset and closes one Escape at a time", async ({ page }) => {
+    const presets = [
+      { baseUrl: "https://api.deepseek.com", id: "deepseek", name: "DeepSeek" },
+      { baseUrl: "https://api.moonshot.cn/v1", id: "kimi", name: "Moonshot Kimi" },
+    ];
+    await installMockApi(page, { models: MODELS });
+    await page.route("**/api/providers", (route) => {
+      if (route.request().method() !== "GET") return route.fallback();
+      return route.fulfill({
+        body: JSON.stringify({ presets, providers: [] }),
+        contentType: "application/json",
+        status: 200,
+      });
+    });
+
+    const dialog = await openSettings(page, "模型");
+    await dialog.getByRole("button", { name: "添加模型" }).click();
+    const modal = page.getByRole("dialog", { name: "添加模型" });
+    const trigger = modal.getByRole("button", { name: "服务商类型" });
+    await trigger.click();
+    const listbox = page.getByRole("listbox", { name: "服务商类型" });
+    await expect(listbox).toBeVisible();
+
+    // The list is drawn by the app, not by the OS, so it can carry the same
+    // rows as the model listing: a check on the current value and no native
+    // blue selection bar.
+    await page.getByRole("option", { name: "DeepSeek" }).click();
+    await expect(modal.getByLabel("基础URL")).toHaveValue("https://api.deepseek.com");
+
+    // Escape closes the list only. The dialog and the settings surface both
+    // listen for the key; the list claims it in the capture phase so only the
+    // list closes.
+    await trigger.click();
+    await expect(listbox).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(listbox).toHaveCount(0);
+    await expect(modal).toBeVisible();
+    await expect(dialog).toBeVisible();
   });
 
   test("a profile that fails its test is saved but never becomes the default", async ({ page }) => {

@@ -15,12 +15,13 @@
 import { createTest } from "../../../test/support/tagged/compat.mjs";
 const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:linux", "arch:amd64", "arch:arm64"] });
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 
 import { fileURLToPath } from "node:url";
 
-import { strToU8, zipSync } from "fflate";
+import { strToU8, unzipSync, zipSync } from "fflate";
 
 import {
   BUNDLED_SKILL_IDS,
@@ -101,6 +102,52 @@ test("loads legacy managed Skills without descriptions but rejects new packages 
     assert.throws(
       () => packageFromUpload("legacy-description.md", Buffer.from("---\nname: legacy-description-skill\n---\n\n# New\n")),
       /description must be a non-empty string/,
+    );
+  } finally {
+    await rm(dataDir, { force: true, recursive: true });
+  }
+});
+
+test("an exported package is the archive the importer accepts back", async () => {
+  const dataDir = await temporaryDataDir();
+  try {
+    const catalog = new SkillCatalog(dataDir, repositoryRoot);
+    await catalog.load();
+    await catalog.createPackage({
+      description: "Portable enough to leave.",
+      instructions: "# Instructions\n\nExport me.",
+      name: "portable-export",
+      resources: [
+        { content: "guide", path: "references/guide.md" },
+        { content: "script", path: "scripts/inert.py" },
+      ],
+    });
+
+    const exported = catalog.exportPackage("portable-export");
+    assert.equal(exported.filename, "portable-export.zip");
+    assert.deepEqual(Object.keys(unzipSync(new Uint8Array(exported.bytes))).sort(), [
+      "portable-export/SKILL.md",
+      "portable-export/references/guide.md",
+      "portable-export/scripts/inert.py",
+    ]);
+    // Keeping the archive shape a package has is what makes the export usable:
+    // the same bytes import back, here or on another machine.
+    const reimported = packageFromUpload("portable-export.zip", exported.bytes);
+    assert.equal(reimported.detail.name, "portable-export");
+    assert.deepEqual([...reimported.files.keys()].sort(), [
+      "SKILL.md",
+      "references/guide.md",
+      "scripts/inert.py",
+    ]);
+
+    // Read-only says who may change a package, not who may copy it.
+    const builtIn = catalog.exportPackage(BUNDLED_SKILL_IDS[0]!);
+    const builtInEntries = unzipSync(new Uint8Array(builtIn.bytes));
+    assert.ok(builtInEntries[`${BUNDLED_SKILL_IDS[0]}/SKILL.md`]?.length);
+
+    assert.throws(
+      () => catalog.exportPackage("missing-skill"),
+      (error: unknown) => error instanceof SkillCatalogError && error.code === "SKILL_NOT_FOUND",
     );
   } finally {
     await rm(dataDir, { force: true, recursive: true });
@@ -360,6 +407,81 @@ test("keeps a reviewed Agent draft when its external Library publication fails",
       throw new Error("Library commit failed");
     }), /Library commit failed/);
     assert.deepEqual(catalog.listReviewDrafts().map((candidate) => candidate.draftId), [draft.draftId]);
+    assert.equal(catalog.get("publication-failure-skill"), undefined, "and nothing reached the Skill catalog");
+  } finally {
+    await rm(dataDir, { force: true, recursive: true });
+  }
+});
+
+test("a draft confirmed through a Library publication is also installed in the Skill catalog", async () => {
+  const dataDir = await temporaryDataDir();
+  try {
+    const catalog = new SkillCatalog(dataDir, repositoryRoot);
+    await catalog.load();
+    const draft = await catalog.createReviewDraft({
+      description: "A draft a Library publication must make visible as a Skill.",
+      instructions: "# Workflow\n\nLand in the Library and in the catalog.",
+      name: "published-to-library-skill",
+    }, { sessionId: "session-source", source: "agent" });
+    const detail = await catalog.getReviewDraft(draft.draftId);
+    let publishedId: string | undefined;
+    const result = await catalog.publishReviewDraft(draft.draftId, {
+      expectedUpdatedAt: draft.updatedAt,
+      files: detail!.files.map((file) => ({ content: file.content, path: file.path })),
+    }, async (prepared) => {
+      publishedId = prepared.detail.id;
+      return { libraryId: "project-skills", skillId: prepared.detail.id, versionId: "version-1" };
+    });
+
+    assert.equal(publishedId, "published-to-library-skill");
+    assert.deepEqual(result, { libraryId: "project-skills", skillId: "published-to-library-skill", versionId: "version-1" });
+    // The user confirmed a Skill, not merely a Library version: it has to be
+    // listed and selectable, which is what the catalog drives.
+    const installed = catalog.get("published-to-library-skill");
+    assert.ok(installed, "the confirmed Skill is in the catalog");
+    assert.equal(installed.currentRevision, 1);
+    assert.ok(catalog.list().some((skill) => skill.id === "published-to-library-skill"), "and the Skills list returns it");
+    assert.deepEqual(catalog.listReviewDrafts(), [], "the draft is consumed");
+
+    const reloaded = new SkillCatalog(dataDir, repositoryRoot);
+    await reloaded.load();
+    assert.equal(reloaded.get("published-to-library-skill")?.currentRevision, 1, "and it survives a reload");
+  } finally {
+    await rm(dataDir, { force: true, recursive: true });
+  }
+});
+
+test("a Library publication refuses a colliding draft before it publishes anything", async () => {
+  const dataDir = await temporaryDataDir();
+  try {
+    const catalog = new SkillCatalog(dataDir, repositoryRoot);
+    await catalog.load();
+    // The draft is opened while the name is free, then the same id lands in the
+    // catalog through an import. Publishing would install over it, so the
+    // publisher must never run — otherwise a Library version would record a
+    // package the catalog refused.
+    const draft = await catalog.createReviewDraft({
+      description: "A draft whose name is taken before it is published.",
+      instructions: "# Workflow\n\nThis must never reach the Library.",
+      name: "collision-skill",
+    }, { sessionId: "session-source", source: "agent" });
+    const archive = Buffer.from(zipSync({
+      "collision-skill/SKILL.md": strToU8(markdown("collision-skill").toString("utf8")),
+    }));
+    await catalog.import("collision-skill.zip", archive);
+    assert.equal(catalog.get("collision-skill")?.currentRevision, 1, "the import installed it first");
+
+    const detail = await catalog.getReviewDraft(draft.draftId);
+    let published = false;
+    await assert.rejects(catalog.publishReviewDraft(draft.draftId, {
+      expectedUpdatedAt: draft.updatedAt,
+      files: detail!.files.map((file) => ({ content: file.content, path: file.path })),
+    }, async () => {
+      published = true;
+      return { libraryId: "project-skills", skillId: "unexpected", versionId: "v1" };
+    }), SkillCatalogError);
+    assert.equal(published, false, "the publisher never ran");
+    assert.deepEqual(catalog.listReviewDrafts().map((candidate) => candidate.draftId), [draft.draftId], "and the draft survives");
   } finally {
     await rm(dataDir, { force: true, recursive: true });
   }
@@ -570,6 +692,131 @@ test("consolidates legacy duplicate drafts into one review with a proposal diff"
     assert.equal(detail?.baseFiles[0]?.content, "first proposal");
     assert.equal(detail?.files[0]?.content, "latest proposal");
     assert.deepEqual(await readdir(draftRoot), [`${latestId}.json`]);
+  } finally {
+    await rm(dataDir, { force: true, recursive: true });
+  }
+});
+
+test("an imported script that declares an interpreter stays executable", async () => {
+  const dataDir = await temporaryDataDir();
+  try {
+    const catalog = new SkillCatalog(dataDir, repositoryRoot);
+    await catalog.load();
+    const archive = Buffer.from(zipSync({
+      "shebang-skill/SKILL.md": strToU8(markdown("shebang-skill").toString("utf8")),
+      "shebang-skill/scripts/run.py": strToU8("#!/usr/bin/env python3\nprint('run')\n"),
+      "shebang-skill/scripts/plain.py": strToU8("print('plain')\n"),
+    }));
+    const imported = await catalog.import("shebang-skill.zip", archive);
+    const packageRoot = resolve(dataDir, "skills", imported.id, "revisions", "1", "package");
+    const runMode = (await stat(resolve(packageRoot, "scripts/run.py"))).mode;
+    const plainMode = (await stat(resolve(packageRoot, "scripts/plain.py"))).mode;
+    assert.ok(runMode & 0o100, "the shebang script is not executable");
+    assert.equal(plainMode & 0o100, 0, "a script without a shebang was made executable");
+  } finally {
+    await rm(dataDir, { force: true, recursive: true });
+  }
+});
+
+test("an update keeps allowed-tools declared as a sequence", async () => {
+  const dataDir = await temporaryDataDir();
+  try {
+    const catalog = new SkillCatalog(dataDir, repositoryRoot);
+    await catalog.load();
+    const created = await catalog.createPackage({
+      allowedTools: ["Read", "Grep"],
+      description: "A skill with a tool sequence.",
+      instructions: "# Use the tools\n",
+      name: "tool-sequence",
+    });
+    assert.deepEqual(created.frontmatter["allowed-tools"], ["Read", "Grep"]);
+
+    const updated = await catalog.update("tool-sequence", {
+      allowedTools: ["Read", "Grep"],
+      description: "An edited skill with a tool sequence.",
+      expectedRevision: 1,
+      instructions: "# Use the tools\n",
+      name: "tool-sequence",
+    });
+    assert.deepEqual(updated.frontmatter["allowed-tools"], ["Read", "Grep"]);
+  } finally {
+    await rm(dataDir, { force: true, recursive: true });
+  }
+});
+
+test("a package at the checkout root can be imported", async () => {
+  const dataDir = await temporaryDataDir();
+  const checkout = await mkdtemp(resolve(tmpdir(), "git-root-"));
+  const commit = "0123456789abcdef0123456789abcdef01234567";
+  try {
+    await writeFile(resolve(checkout, "SKILL.md"), "---\nname: root-skill\ndescription: A package at the repository root.\n---\n\n# Root\n");
+    const catalog = new SkillCatalog(dataDir, repositoryRoot, {
+      checkoutGit: async (_importRoot, input) => ({
+        checkout,
+        commit,
+        normalized: validateGitSkillImportRequest(input),
+        partial: false,
+      }),
+    });
+    await catalog.load();
+    const inspection = await catalog.inspectGitRepository({
+      repositoryUrl: "https://example.invalid/org/skills.git",
+    });
+    assert.deepEqual(inspection.candidates.map((candidate) => candidate.subdirectory), ["."]);
+
+    const imported = await catalog.importFromGit({
+      commit,
+      repositoryUrl: "https://example.invalid/org/skills.git",
+      subdirectory: ".",
+    });
+    assert.equal(imported.id, "root-skill");
+  } finally {
+    await rm(checkout, { force: true, recursive: true });
+    await rm(dataDir, { force: true, recursive: true });
+  }
+});
+
+test("a restart clears checkouts an inspection left under .imports", async () => {
+  const dataDir = await temporaryDataDir();
+  try {
+    const stale = resolve(dataDir, "skills", ".imports", "stale-checkout");
+    await mkdir(stale, { recursive: true });
+    await writeFile(resolve(stale, "SKILL.md"), "# stale\n");
+
+    const catalog = new SkillCatalog(dataDir, repositoryRoot);
+    await catalog.load();
+    await assert.rejects(readFile(resolve(stale, "SKILL.md")), /ENOENT/);
+  } finally {
+    await rm(dataDir, { force: true, recursive: true });
+  }
+});
+
+test("an imported name that is taken installs under the next free name", async () => {
+  const dataDir = await temporaryDataDir();
+  try {
+    const catalog = new SkillCatalog(dataDir, repositoryRoot);
+    await catalog.load();
+    const archive = Buffer.from(zipSync({
+      "portable-skill/SKILL.md": strToU8(markdown().toString("utf8")),
+      "portable-skill/references/guide.md": strToU8("one"),
+    }));
+
+    const first = await catalog.import("portable-skill.zip", archive);
+    assert.equal(first.id, "portable-skill");
+    await assert.rejects(
+      catalog.import("portable-skill.zip", archive),
+      (error: unknown) => error instanceof SkillCatalogError && error.code === "SKILL_CONFLICT",
+    );
+    const second = await catalog.import("portable-skill.zip", archive, { onDuplicate: "rename" });
+    assert.equal(second.id, "portable-skill-2");
+    assert.equal(second.name, "portable-skill-2");
+    assert.equal(second.frontmatter.name, "portable-skill-2");
+    assert.deepEqual(second.resources.map((resource) => resource.path), ["references/guide.md"]);
+
+    const reloaded = new SkillCatalog(dataDir, repositoryRoot);
+    await reloaded.load();
+    assert.equal(reloaded.get("portable-skill")?.currentRevision, 1);
+    assert.equal(reloaded.get("portable-skill-2")?.currentRevision, 1);
   } finally {
     await rm(dataDir, { force: true, recursive: true });
   }

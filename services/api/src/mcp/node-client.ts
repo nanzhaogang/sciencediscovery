@@ -37,6 +37,9 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type { FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+import { resolveProxyForUrl } from "@sciencediscovery/data-source";
 
 import { shortErrorMessage, type LogFields, type OperationalLogger } from "@sciencediscovery/operational-logging";
 import type {
@@ -54,13 +57,25 @@ import type {
 import { effectiveRouting, loadExtensionsConfig, type ExtensionsConfigFile, type McpServerEntry } from "./extensions-config.js";
 import type { McpOAuthManager } from "./oauth.js";
 import { apiLog } from "../logging.js";
+import { MCP_PROXY_ENV_VARS as PROXY_ENV_VARS } from "./runtime-environment.js";
+import { fetchMcpRequest } from "./fetch.js";
 
-const PROXY_ENV_VARS = [
-  "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
-  "http_proxy", "https_proxy", "all_proxy", "no_proxy",
-] as const;
 const URL_PROXY_ENV_VARS = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] as const;
 const STDERR_TAIL_LIMIT = 4_000;
+
+/** Header credentials belong to the configured origin. Match the existing OAuth
+ * transport policy: configure a final endpoint rather than forwarding on 3xx. */
+function configuredMcpFetch(endpoint: string, proxy: ResolvedProxy = { mode: "environment" }): FetchLike {
+  const origin = new URL(endpoint).origin;
+  return (input, init) => {
+    const request = new Request(input, init);
+    const target = new URL(request.url);
+    if (target.origin !== origin || target.username || target.password) {
+      throw new Error("MCP request does not match the configured server origin");
+    }
+    return fetchMcpRequest(request, proxy);
+  };
+}
 
 function endpointFields(raw: string | undefined, prefix = "endpoint"): LogFields {
   if (!raw) return {};
@@ -84,7 +99,11 @@ function proxyFields(proxy: ResolvedProxy | undefined): LogFields {
 }
 
 function proxyApplied(server: McpServerEntry, proxy: ResolvedProxy | undefined): boolean {
-  if (server.transport !== "stdio" || !proxy || proxy.mode === "direct") return false;
+  if (server.transport !== "stdio") {
+    try { return Boolean(server.url && resolveProxyForUrl(proxy ?? { mode: "environment" }, server.url).mode === "url"); }
+    catch { return false; }
+  }
+  if (!proxy || proxy.mode === "direct") return false;
   if (proxy.mode === "url") return true;
   return URL_PROXY_ENV_VARS.some((name) => Boolean(process.env[name]));
 }
@@ -251,10 +270,14 @@ export function sourceHttpFailure(message: string): (NonNullable<McpAttempt["ups
   } catch { return undefined; }
 }
 
-function errorCodeFor(status: McpAttemptStatus, message: string): string {
+function errorCodeFor(status: McpAttemptStatus, message: string, failureScope?: "endpoint" | "request" | "unknown"): string {
   const lowered = message.toLowerCase();
   if (message.startsWith("RESPONSE_TOO_LARGE:")) return "RESPONSE_TOO_LARGE";
   if (lowered.includes("401") || lowered.includes("unauthorized")) return "UNAUTHORIZED";
+  // A provider that classifies the failure as endpoint-wide is saying the
+  // configured service is gone, not that the requested record is absent. Say so
+  // instead of deriving NOT_FOUND from the status digits in the message (#1049).
+  if (failureScope === "endpoint") return "ENDPOINT_UNAVAILABLE";
   if (lowered.includes("404") || lowered.includes("not found")) return "NOT_FOUND";
   return status.toUpperCase().replaceAll("-", "_");
 }
@@ -356,7 +379,10 @@ export class McpNodeClient {
     }
     const existing = this.sessions.get(serverId);
     const proxySignature = this.proxySignature(serverId);
-    const configSignature = JSON.stringify(server);
+    // Display and per-call deadline edits do not alter a wire connection or
+    // justify aborting requests already admitted with their own deadlines.
+    // Retain every other field, including authentication extensions.
+    const configSignature = JSON.stringify(Object.fromEntries(Object.entries(server).filter(([field]) => !["name", "description", "timeoutSeconds", "toolCallTimeoutSeconds"].includes(field))));
     if (existing && existing.proxySignature === proxySignature && existing.configSignature === configSignature) return existing.client;
     const connection = this.connectSession(serverId, server, proxySignature, configSignature);
     this.connecting.set(serverId, connection);
@@ -405,7 +431,10 @@ export class McpNodeClient {
     };
     this.logger.info("mcp_connection_started", connectionFields);
     const client = new Client({ name: "sciencediscovery-api", version: "1.0.0" });
-    const options = { timeout: Math.min(10_000, (server.toolCallTimeoutSeconds ?? 60) * 1_000) };
+    // A remote streamable HTTP server may complete its first handshake just
+    // after 10 seconds. Keep the bound tied to the server timeout, but leave
+    // enough headroom so a successful slow initialize is not discarded.
+    const options = { timeout: Math.min(20_000, (server.toolCallTimeoutSeconds ?? 60) * 1_000) };
     let stderrTail: StderrTail | undefined;
     const connect = async (transport: Parameters<Client["connect"]>[0]): Promise<void> => {
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -419,8 +448,8 @@ export class McpNodeClient {
       } finally { if (timer) clearTimeout(timer); }
     };
     try {
-      await this.oauth?.prepare(serverId);
-      const authorizedFetch = this.oauth?.fetchFor(serverId);
+      await this.oauth?.prepare(serverId, undefined, this.proxies[serverId]);
+      const authorizedFetch = this.oauth?.fetchFor(serverId, this.proxies[serverId]);
       if (server.transport === "stdio") {
         if (!server.command) throw new Error(`MCP server '${serverId}' with stdio transport requires 'command'`);
         if (pythonFailure) throw pythonFailure;
@@ -431,6 +460,15 @@ export class McpNodeClient {
           if (!PROXY_ENV_VARS.includes(key as (typeof PROXY_ENV_VARS)[number])) env[key] = value;
         }
         Object.assign(env, overlay);
+        // [mac-desktop] W26: StdioClientTransport's getDefaultEnvironment()
+        // builds a MINIMAL env (HOME/PATH/USER/...) that drops the shell's
+        // PYTHONDONTWRITEBYTECODE — the sixth bundle-write surface (W22 fixed
+        // five). Bundled-python MCP servers import gateway sources straight
+        // from the sealed .app; every .pyc written there breaks the codesign
+        // seal and the next launch dies at amfid. Forward the guard whenever
+        // the parent carries it (set by packagedEnv on darwin; absent on
+        // win32 dev — no-op there).
+        if (process.env.PYTHONDONTWRITEBYTECODE) env.PYTHONDONTWRITEBYTECODE = process.env.PYTHONDONTWRITEBYTECODE;
         const transport = new StdioClientTransport({
           args: server.args,
           command,
@@ -445,13 +483,13 @@ export class McpNodeClient {
         if (!server.url) throw new Error(`MCP server '${serverId}' with sse transport requires 'url'`);
         await connect(new SSEClientTransport(new URL(server.url), {
           requestInit: { headers: server.headers },
-          ...(authorizedFetch ? { fetch: authorizedFetch } : {}),
+          fetch: authorizedFetch ?? configuredMcpFetch(server.url, this.proxies[serverId]),
         }));
       } else {
         if (!server.url) throw new Error(`MCP server '${serverId}' with http transport requires 'url'`);
         await connect(new StreamableHTTPClientTransport(new URL(server.url), {
           requestInit: { headers: server.headers },
-          ...(authorizedFetch ? { fetch: authorizedFetch } : {}),
+          fetch: authorizedFetch ?? configuredMcpFetch(server.url, this.proxies[serverId]),
         }));
       }
     } catch (error) {
@@ -473,32 +511,46 @@ export class McpNodeClient {
   }
 
   private async serverTools(serverId: string, server: McpServerEntry): Promise<McpCatalogTool[]> {
-    const client = await this.session(serverId, server);
-    const tools: McpCatalogTool[] = [];
-    let cursor: string | undefined;
-    const seen = new Set<string>();
-    do {
-      const page = await client.listTools(cursor ? { cursor } : {}, { timeout: 10_000 });
-      for (const tool of page.tools) {
-        const inputSchema = (tool.inputSchema ?? { properties: {}, type: "object" }) as Record<string, unknown>;
-        const routing = effectiveRouting(server, tool.name);
-        tools.push({
-          ...(routing ? { annotations: { routing } } : {}),
-          description: tool.description ?? tool.name,
-          inputSchema,
-          name: tool.name,
-          schemaHash: createHash("sha256").update(JSON.stringify(inputSchema)).digest("hex"),
-        });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const client = await this.session(serverId, server);
+      const tools: McpCatalogTool[] = [];
+      let cursor: string | undefined;
+      const seen = new Set<string>();
+      try {
+        do {
+          const page = await client.listTools(cursor ? { cursor } : {}, { timeout: 10_000 });
+          for (const tool of page.tools) {
+            const inputSchema = (tool.inputSchema ?? { properties: {}, type: "object" }) as Record<string, unknown>;
+            const routing = effectiveRouting(server, tool.name);
+            tools.push({
+              ...(routing ? { annotations: { routing } } : {}),
+              description: tool.description ?? tool.name,
+              inputSchema,
+              name: tool.name,
+              schemaHash: createHash("sha256").update(JSON.stringify(inputSchema)).digest("hex"),
+            });
+          }
+          cursor = page.nextCursor ?? undefined;
+          if (tools.length > 1_000 || (cursor && seen.has(cursor))) throw new Error("MCP tool catalog pagination limit exceeded");
+          if (cursor) seen.add(cursor);
+        } while (cursor);
+        tools.sort((a, b) => a.name.localeCompare(b.name));
+        return tools;
+      } catch (error) {
+        const retryable = server.transport === "http" && attempt === 0 && error instanceof Error
+          && ((error as Error & { code?: number }).code === ErrorCode.RequestTimeout || /timed out|timeout/i.test(error.message));
+        if (!retryable) throw error;
+        // A stateless streamable HTTP endpoint can time out on its first
+        // post-initialize request after a successful handshake. Rebuild the
+        // transport once; the second request is idempotent tools/list.
+        await this.closeSession(serverId, "tools_list_timeout_retry");
       }
-      cursor = page.nextCursor ?? undefined;
-      if (tools.length > 1_000 || (cursor && seen.has(cursor))) throw new Error("MCP tool catalog pagination limit exceeded");
-      if (cursor) seen.add(cursor);
-    } while (cursor);
-    tools.sort((a, b) => a.name.localeCompare(b.name));
-    return tools;
+    }
+    throw new Error("MCP tool catalog retry failed");
   }
 
-  async catalog(): Promise<McpCatalog> {
+  async catalog(_signal?: AbortSignal, proxies?: Record<string, ResolvedProxy>): Promise<McpCatalog> {
+    if (proxies) this.proxies = { ...proxies };
     const started = Date.now();
     const config = this.currentConfig();
     for (const id of this.sessions.keys()) {
@@ -658,7 +710,7 @@ export class McpNodeClient {
           const level = finalStatus === "semantic-error" ? "debug" : "warn";
           this.logger[level]("mcp_invocation_attempt_failed", {
             attempt: attemptNumber,
-            errorCode: errorCodeFor(finalStatus, finalError),
+            errorCode: errorCodeFor(finalStatus, finalError, upstream?.failureScope),
             errorMessage: finalError,
             ...(upstream ? { endpoint: upstream.endpoint, statusCode: upstream.statusCode, failureScope: upstream.failureScope } : {}),
             retryDecision: request.execution.retryPolicy.maxAttempts === 1 ? "return-to-broker" : "policy",
@@ -679,7 +731,7 @@ export class McpNodeClient {
       attempts.push({
         attempt: attemptNumber,
         durationMs: Date.now() - attemptStarted,
-        errorCode: errorCodeFor(finalStatus, finalError),
+        errorCode: errorCodeFor(finalStatus, finalError, upstream?.failureScope),
         errorMessage: finalError.slice(0, 1_000),
         ...(upstream ? { upstream } : {}),
         finishedAt: new Date().toISOString(),

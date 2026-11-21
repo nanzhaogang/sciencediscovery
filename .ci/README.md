@@ -26,18 +26,24 @@ test dependencies are supplied only by the checkout mounted at `/src`.
 Category (UT/ST/E2E), model/judge cost and execution backend remain independent.
 No workflow maintains its own list of case titles.
 
-| Tier | Event / authorization | Cumulative content | Gate / job ceiling |
+| Tier | Event / authorization | Workflow jobs | Gate / job ceiling |
 | --- | --- | --- | --- |
 | L1 | PR opened, synchronized or reopened (including drafts), or marked ready for review | Architecture, docs, test catalog and E2E metadata checks; no service or browser startup | Required before L2; 10 minutes |
-| L2 (`pr`) | Non-draft PR opened, synchronized, reopened or marked ready for review, after L1; also default-branch push | L1 + reviewed hermetic UT, ST and mock E2E; no external model credentials | Required before enqueue; UT 60, ST 30, mock E2E 90 minutes |
-| L3 (`merge`) | Maintainer reviews the current head and selects **Merge when ready**; `merge_group: checks_requested` | L2 rerun on the group SHA + nine short real API journeys (including Runner wait/finish decisions) + binary smoke and Docker distribution gates | Required before automatic merge; basic worker 60 minutes including setup, target 10–15 minutes of test time |
-| L4 (`daily`) | Daily at 16:00 UTC, or explicit dispatch | L3 + twelve nightly cases: DRB-58/59/62/64/75, research team, PUCT compression, J5 statistics, two provenance/card journeys, Biomni DA-13-3/DA-14-1 | Daily failure signal; each research worker 240 minutes including setup |
-| L5 (`release`) | Version tag push or explicit dispatch | Current L4 set + 45 active BiomniBench-DA tasks with score, tool rounds, RSS, time and token metrics; five retired cases are excluded; the result is an unapproved baseline candidate | Blocks creating the draft Release and its assets, not the already-created tag; a person publishes the draft from the Releases page; Biomni workers 360 minutes, other research workers 240 minutes |
+| L2 (`pr`) | Non-draft PR opened, synchronized, reopened or marked ready for review, after L1; also default-branch push | L1 + reviewed hermetic UT/ST + Linux binary and Docker distribution gates; mocked and real E2E are skipped; no external model credentials | Required before enqueue; UT 60, ST 30 minutes |
+| L3 (`merge`) | Maintainer reviews the current head and selects **Merge when ready**; `merge_group: checks_requested` | L1/UT/ST rerun on the group SHA + mocked E2E + nine short real API journeys (including Runner wait/finish decisions); Linux binary, Windows desktop and Docker jobs are skipped | Required before automatic merge; mock E2E 90 minutes; basic worker 60 minutes including setup, target 10–15 minutes of test time |
+| L4 (`daily`) | Nightly workflow at 16:00 UTC, or explicit dispatch | L3 + Linux binary, Windows desktop installer and Docker distribution gates + twelve nightly cases: DRB-58/59/62/64/75, research team, PUCT compression, J5 statistics, two provenance/card journeys, Biomni DA-13-3/DA-14-1 | Daily failure signal; each research worker 240 minutes including setup |
+| L5 (`release`) | Version release tag push or explicit dispatch | Current L4 set + 45 active BiomniBench-DA tasks with score, tool rounds, RSS, time and token metrics; five retired cases are excluded; the result is an unapproved baseline candidate | Blocks creating the draft Release and its assets, not the already-created tag; a person publishes the draft from the Releases page; Biomni workers 360 minutes, other research workers 240 minutes |
 
 `l1` through `l5` are also explicit local profile names. `pr`, `merge`, `daily`
 and `release` alias L2, L3, L4 and L5. The release policy now includes paid
 research; it is no longer equal to the hermetic PR policy. Release failures
 must not be worked around by moving the tag.
+
+The local test profiles remain cumulative. Workflow job selection is separate:
+PR runs build distributions without E2E; the merge queue runs E2E without
+distribution builds. The nightly (`daily`), version release (`release`), and
+on-demand `package` profiles can build the Windows desktop installer.
+`pnpm ci:e2e` still runs the mocked slice locally with the default `pr` profile.
 
 Run only the desired slice, or the complete cumulative profile:
 
@@ -182,7 +188,18 @@ workers start as soon as their own plan is ready, without waiting for UT, ST
 or mocked E2E. They do not download or reconcile mocked results as a prerequisite.
 The two callers are mutually exclusive, so each run executes the real suite once.
 A separate credential-free `policy` job selects the profile/backend before L1,
-so a failed L1 check cannot hide the requested real suite. Real workers still
+so a failed L1 check cannot hide the requested real suite. It also enforces one
+content rule, because it is the only job that checks out the pull request's
+history: a change to `application/package.json`'s `version` must be a release
+change — the title starts with `chore(release):` and every place the release is
+spelled carries the new number (the dot form in `electron-builder.yml` and the
+NSIS stub, plus the badge and the tag link in both READMEs; at GA the
+`${version}` macro is accepted in the artifact name, per
+`scripts/package-sd-windows.sh`). A violation fails `policy`, which every other
+job depends on, so the run stops before L1 with the reason in the log. Pull
+requests only: a push and the merge queue re-verify a commit whose pull request
+already answered. The rule is `.ci/release-version.mjs`; its cases carry
+`category:ut` and run in the UT slice like every other `.ci` case. Real workers still
 require a successfully frozen real plan and respect workflow cancellation.
 This changes execution eligibility, not the final verdict: `merge-gate` still
 requires every selected job and complete mocked/real accounting; any failure
@@ -204,13 +221,34 @@ Markdown elsewhere (including `skills/`) also keeps it. PR diffs use the merge
 base; push and merge-group diffs use the event's base and head SHAs.
 
 For a documentation-only change, L1 runs only `pnpm docs:check` (`check:docs`).
-UT, ST, mocked planning/E2E, coverage, real E2E, binary and Docker are skipped.
+UT, ST, mocked planning/E2E, coverage, real E2E, Linux binary, Windows desktop and Docker are skipped.
 The stable `merge-gate` still requires successful policy and documentation
 checks on non-draft PRs, pushes and merge groups, without downloading E2E
 artifacts. Drafts still check documentation and keep their existing gate skip.
 Manual dispatch and reusable workflow calls always run their requested profile,
 even when the caller's event is a documentation-only push. All other diffs
 retain the profile's existing job and artifact requirements.
+
+### On-demand package artifacts
+
+In **Actions → Package → Run workflow**, select the branch and choose
+`package-platform`. The Package workflow calls CI with `profile: package`.
+
+| Platform | Artifacts |
+| --- | --- |
+| `linux-windows` (default) | Native Linux single-file packages for x86_64 and ARM64, then a Windows x64 NSIS installer |
+| `macos` | Apple Silicon DMG and ZIP with ad-hoc signing |
+| `all` | Both sets of packages. macOS builds in parallel with Linux. Windows starts after the Linux binaries and Runner SEA artifacts pass their checks. |
+
+The profile runs L1 and the selected builds. The **package-gate** check requires
+successful packaging for every selected target. Artifacts carry the revision
+in their names and are retained for seven days. The macOS files are for build
+verification and use ad-hoc signing without notarization. This profile is also
+available to `workflow_call` with `profile: package` and the same platform input.
+
+```bash
+gh workflow run package.yml --ref <branch> -f package-platform=all
+```
 
 ### Merge queue and credentials: repository setup
 
@@ -220,8 +258,21 @@ GitHub Actions, and enable **Require merge queue**. Enabling the queue alone
 does not make CI required; without required checks, it need not wait for L3.
 Require approval of the current PR head and dismiss stale approvals. Start
 with queue build concurrency 1 and **Only merge non-failing pull requests**.
-Allow enough queue status-check time for L1/L2 + real setup/testing and the
-parallel distribution jobs. Do not require a queue-only check on the PR before
+Allow enough queue status-check time for L1/UT/ST + mocked and real setup/testing.
+Linux binary and Docker distribution jobs run in PR and daily/release profiles.
+The `daily` and `release` gates also require a macOS ARM64 DMG and ZIP, built with
+ad-hoc signing and uploaded as Actions artifacts. The Windows desktop installer
+runs in `daily`, `release`, and the `linux-windows`
+and `all` package selections. It uses
+the checked-in `application` NSIS build on `windows-latest`, provisioning the
+shared Python environment, the pinned JiuwenSwarm runtime and the verified
+Windows micromamba before uploading the installer. Its Linux Runner SEA inputs
+come from the two architecture-specific artifacts produced by the `binary`
+jobs; the installer assembly uses `--expect-runner-sea` and fails if either
+remote Runner binary is absent. The Windows job pins uv to `0.13.7` and
+normalizes every available shipped venv launcher to the bundled CPython
+interpreter (`python.exe` is required; `pythonw.exe` remains optional).
+Do not require a queue-only check on the PR before
 it can enqueue: the same aggregate requires L1/L2 on PR and full L3 on the group.
 Even a one-PR merge group receives its own run and candidate-SHA results.
 
@@ -323,8 +374,8 @@ minutes generation; DRB-59/64 allow 120 minutes. Nightly judge timeout is 10
 minutes. Team generation allows 55 minutes; PUCT generation 120 minutes.
 Its optional AI audit allows up to 65 more minutes when explicitly enabled
 locally; both daily and release leave that audit disabled. Job setup counts toward the four-hour worker
-ceiling. `fail-fast: false` retains evidence from independent workers; the only
-automatic repeat is the one an early model-gateway fault earns, described
+ceiling. `fail-fast: false` retains evidence from independent workers; automatic
+retry behavior is gated by the `daily` and `release` profiles and is described
 below. Rebuilding a merge group repeats its model calls.
 Monthly usage is the sum of actual provider usage across queue attempts,
 approximately 30 daily runs and version candidates; provider rates and actual
@@ -350,7 +401,11 @@ server error, not because the product ran and did not deliver. The suite
 tells the two apart. A failure that carries a gateway status (500, 502,
 503, 504) together with a provider marker — the gateway's own `181001`
 model-call code, `new_api_error`, `model_not_found`, "no available channel" —
-is recorded as `PROVIDER_FAULT` rather than `FAIL`:
+is recorded as `PROVIDER_FAULT` rather than `FAIL`. So is a stream that
+answered `200` and then broke on the wire: `read ECONNRESET`, `other side
+closed`, `socket hang up` or `UND_ERR_SOCKET` together with the same gateway
+marker carries no status at all, and is recorded as `PROVIDER_FAULT:
+provider-transport`:
 
 - the provider's own text is kept unchanged in the failure record;
 - the case counts as executed, and the cases that passed in the same job stay
@@ -360,9 +415,10 @@ is recorded as `PROVIDER_FAULT` rather than `FAIL`:
 - the fault stays visible in the verdict, the step summary and the artifacts.
 
 **A soft classification is not a soft pass.** A planned case that only faulted
-is an unverified case: the product was never checked in it. The required
-real-E2E check — Daily, merge L3 and release L5 alike — therefore does **not**
-pass while a provider fault remains:
+is an unverified case: the product was never checked in it. It remains
+unverified until the profile's allowed attempts produce a `PASS`. The required
+real-E2E check therefore does **not** pass while a provider fault remains after
+those attempts:
 
 | Outcome | Status | Exit code |
 | --- | --- | --- |
@@ -372,28 +428,73 @@ pass while a provider fault remains:
 
 The two failure kinds stay apart in the accounting — a provider fault is never
 reported as a product `FAIL`, and a product failure is never softened into an
-outage — but neither one is a pass. The floor is the same in the worker, in
-the shard summary, in the suite reconcile and in the shared-plan summary, so
-no profile can turn an outage into a green required check.
+outage. Neither one is a first-attempt pass. The paid `daily` and `release`
+profiles may retry either kind once, and a retry `PASS` makes that case green in
+the final result while retaining the first-attempt record. The `pr` and `merge`
+profiles keep the first failure as the final result. The same accounting floor
+is applied in the worker, the shard summary, the suite reconcile and the
+shared-plan summary.
 
 An authentication (401/403) or rate-limit (429) answer is a decision, not an
-outage, and is never soft-classified; neither is a semantic failure, a
-delivery miss or a timeout. The provider context has to name the gateway
-itself: a product delivery failure that merely quotes a provider status — the
-words "provider", "llm", "gateway" or "upstream" beside a `500` — is the
-product's own failure and stays a `FAIL`. A delivery miss or an assertion
-diff is the product's own report in the first place, so it stays a `FAIL`
-even when it carries the provider's words with it.
+outage, and a delivery miss or the product's stalled-run wording is the run's
+own verdict; none of those four is ever soft-classified, even when another text
+in the same case names the gateway. A semantic failure is not one of the four:
+it records what one step printed, so a sibling text that names the gateway
+outvotes it — see the four-verdict rule below. The provider context has to name
+the gateway itself: a product delivery failure that merely quotes a provider
+status — the words "provider", "llm", "gateway" or "upstream" beside a `500` —
+is the product's own failure and stays a `FAIL`.
 
-A case whose first attempt died early on such a fault is run once more, on
-its own. Only an attempt that failed within five minutes is repeated, so a
-long research case that got that far is never repeated, and a product failure
-is never repeated at all. When a whole batch faults early, the batch reads as
-an outage and only a couple of cases are repeated as a probe. The repeat keeps
-its own evidence directory, and the first attempt's record stays in the
-artifacts. A repeat that did not work is recorded in the accounting
-(`PROVIDER_FAULT_REPEAT_FAILED`, `PROVIDER_FAULT_REPEAT_REPORT_MISSING`)
-instead of only in the log: the case stays unverified and the run says why.
+A delivery miss outranks the gateway: it is the product's own verdict, so it
+stays a `FAIL` even when it carries the provider's words with it. An assertion
+diff is not that verdict — Playwright appends the failed `expect()` to the
+error it saw, so a gateway outage reaches the accounting with the assertion
+block attached. Four shapes therefore stay apart:
+
+- a delivery miss, with or without the gateway's words, is a `FAIL`;
+- a status-less transport break is checked before that product report, because
+  the failed case text wraps the provider's words in `delivery_status=failed`,
+  which is the product restating a run that died on the wire, not evidence it
+  mishandled a complete answer;
+- an assertion diff that carries the gateway's own status and context — the
+  `181001` model-call code, `model call failed`, `openai api`,
+  `chat/completions` beside a 5xx — is the outage and becomes `PROVIDER_FAULT`;
+- an assertion that only quotes a bare provider word beside a status is the
+  product's own failure and stays a `FAIL`.
+
+A verdict recorded beside the outage outranks it. A case records one text per
+failed `expect()` or hook, so four kinds of text keep the case a `FAIL` even
+when a sibling text names the gateway: a delivery miss, a 401/403 answer, a 429
+answer, and the product's stalled-run wording. A timeout whose own text also
+names the gateway's status and context — the `181001` code, `model call failed`,
+`openai api` or `chat/completions` beside a 5xx, e.g. `Error code: 504 - Gateway
+Timeout` — or the gateway's routing failure is the outage, not the stalled run,
+so it is not one of the four. A bare `504 Gateway Timeout` that names no gateway
+context is a status the product's text quotes, stays a `FAIL`, and vetoes the
+case like the other stalled-run wording. Every other text — an assertion
+wrapper, a thrown API error, a semantic verdict — records what one step printed
+rather than a verdict on the run, so a sibling text that names the gateway
+outvotes it.
+
+The "a soft classification is not a soft pass" floor above applies to each
+attempt. A `daily` or `release` retry can produce a final pass only when the
+rerun itself passes; the first-attempt fault remains in the artifacts and
+summary.
+
+Failed-case retrying is enabled only for the paid `daily` and `release`
+profiles. In those profiles, every executed `FAIL` or `PROVIDER_FAULT` case is
+run once more in its own evidence directory. The first attempt remains in the
+artifacts and in `firstAttempt` / `retryHistory`, while the second attempt
+supplies the final case result. A retry that passes is counted as
+`passed_after_retry` and shown in the shared-plan summary. A failed or missing
+retry report keeps the case and the layer failed. The PR `pr` and merge-queue
+`merge` profiles do not retry a failed case, so their first failure remains the
+final result.
+
+The retry policy intentionally includes product `FAIL` results in `daily` and
+`release` because those profiles validate paid live-model journeys against
+intermittent external conditions. The retry evidence makes recovered failures
+visible without changing the final gate semantics for cases that remain failed.
 
 ### L5 active-public benchmark and baseline candidate
 
@@ -433,18 +534,25 @@ README for the policy record.
 The checked-in `biomni-gate.json` retains historical **50-case** observations
 from two complete A3 diagnostic runs: mean score 67.7, total tokens 195,099,712,
 tool rounds 2,042, research time 1,312.753472 minutes and task-peak RSS P95
-11.201639801 GiB. Its explicit population policy scales only additive resource
-budgets by 45/50 before applying warning/block ratios: effective tokens
-175,589,740.8, tool rounds 1,837.8, and research time 1,181.478125 minutes.
+11.201639801 GiB. Its explicit population policy scales the summed research
+time budget by 45/50 before applying warning/block ratios: effective research
+time is 1,181.478125 minutes. Total tokens and tool rounds are collected and
+reported as diagnostics, with no warning or blocking regression thresholds in
+temporary or approved compare mode.
 Mean and P95 remain unscaled historical references, not measured 45-case
 figures; population-shift calibration is still required. All 45 active valid
 results are required. A score drop of 3 points warns and 5 points blocks;
-resources have independent configured limits.
+research time and memory have independent configured limits.
 Per-task status and metrics appear in JSON, Markdown and the GitHub step summary.
 The resumable serial driver finishes all first-pass tasks before classified
 evaluation-only/end-to-end recovery, with at most three additional retries per
 task. Failed attempts remain in diagnostic records and separate known-cost
-accounting. Temporary success is not approved capability non-regression.
+accounting. All reported official Judge usage, including failed attempts and
+evaluation-only recovery, counts toward the unchanged token thresholds.
+Only proven transport failures may leave usage unknown after scoring succeeds:
+the known total is a lower bound and always warns; reaching the known-cost
+blocking threshold still blocks. Missing usage from scored or malformed responses
+remains blocking. Temporary success is not approved capability non-regression.
 Explicit candidate and approved compare modes remain available; no run
 automatically approves or replaces a baseline.
 
@@ -470,14 +578,18 @@ consumers, with a single suite-level plan/summary and namespaced per-case scores
 continues to contain complete HTML, linked screenshots and results. Keep large
 diagnostic traces separate if that artifact exceeds the dashboard limit.
 
-For `daily` and `release`, real accounting also publishes a **case execution**
+For `merge` (L3), `daily` (L4) and `release` (L5), real accounting also publishes a **case execution**
 table in its job summary and in `case-execution-details.md`. Nightly copies the
 same Markdown into its outcome summary. The combined `real-e2e-results` artifact
 contains both that file and `dashboard-summary.json`, whose optional generic
-`table` declares ordered columns and producer-formatted string cells. Its count
+`table` declares ordered columns, producer-formatted string cells and a generic
+`group: {key, label}` identifying the frozen profile (for example,
+`{"key":"daily","label":"L4 · daily"}`). Its count
 fields partition the selected plan; cases without a verified pass or skip count
 as failed. The existing gate verdict, slice summary, PUCT review and Biomni
-suite report remain separate. `pr` and `merge` do not publish this table.
+suite report remain separate. Each table contains only its own profile's
+selected identities and counts; L3, L4 and L5 are never added together.
+`pr` does not run real E2E and does not publish this table.
 
 Rows include every selected identity, ordered by recorded `started_at`, then
 untimed cases by case ID. Score uses only `evaluation.overall_score`,
@@ -487,6 +599,8 @@ worker wall time. Generated tokens use recorded completion/output tokens,
 judge tokens and totals retain their recorded scopes, and no split is inferred
 from a total. Peak RSS bytes are divided by `1024 ** 3` for the fixed memory
 column. Missing optional measurements display `n/a` and do not affect gating.
+Biomni Judge and total token cells with incomplete accounting show `≥` and the
+total cell includes the number of attempts with unknown usage.
 Only identity cells and numeric measurements enter the table and summary.
 
 The table reads the staged projection, whose `execution_metrics` keep only

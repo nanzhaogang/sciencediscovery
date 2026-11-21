@@ -286,19 +286,6 @@ export interface UpdateMemoryGraphSettingsRequest {
   neo4jPassword?: string | null;
 }
 
-/** Idea Tree stages that can think at their own effort; `assess` covers every assessor of the template. */
-export const IDEA_TREE_THINKING_ROLES = ["ideate", "design", "assess", "aggregate", "propagate"] as const;
-
-export type IdeaTreeThinkingRole = typeof IDEA_TREE_THINKING_ROLES[number];
-
-/**
- * Thinking effort per Idea Tree stage. A stage left out keeps the model
- * profile's own thinking setting; a set stage turns thinking on at the nearest
- * stop the research model accepts, and a model without an effort control
- * ignores it. Frozen into each research when it is created.
- */
-export type IdeaTreeRoleThinkingEfforts = Partial<Record<IdeaTreeThinkingRole, ModelThinkingEffort>>;
-
 /**
  * Idea Tree 系统设置。存在于 System Settings 中，不在 Session 级别。
  * 用户输入 /idea-tree 命令触发 idea-tree 功能，参数从此设置注入。
@@ -309,7 +296,6 @@ export interface IdeaTreeSettings {
   templateId: "scientific-hypothesis-general/v1" | "water-treatment-materials/v1";
   explorationIntensity: "quick" | "standard" | "deep";
   maxTokens?: number | null;
-  maxTokensPerCall?: number;
   /** 建树默认参数 */
   maxDepth: number;
   maxNodes: number;
@@ -324,16 +310,12 @@ export interface IdeaTreeSettings {
 
   /** PROPAGATE 阶段 insight 合成指令覆盖。只影响合成指令文本，不触碰 runtime 的 childDigest 校验与逐级传播队列 */
   propagateInsightSystemPrompt?: string;
-
-  /** Per-stage thinking effort; absent when no stage has its own. */
-  roleThinkingEfforts?: IdeaTreeRoleThinkingEfforts;
 }
 
 export const DEFAULT_IDEA_TREE_SETTINGS: IdeaTreeSettings = {
   templateId: "scientific-hypothesis-general/v1",
   explorationIntensity: "standard",
   maxTokens: null,
-  maxTokensPerCall: 32768,
   maxDepth: 5,
   maxNodes: 100,
   scoreDirection: "maximize",
@@ -344,14 +326,12 @@ export interface IdeaTreeSettingsDetails {
   templateId: "scientific-hypothesis-general/v1" | "water-treatment-materials/v1";
   explorationIntensity: "quick" | "standard" | "deep";
   maxTokens?: number | null;
-  maxTokensPerCall?: number;
   maxDepth: number;
   maxNodes: number;
   scoreDirection: "maximize" | "minimize";
   designSystemPrompt?: string;
   aggregatorSystemPrompt?: string;
   propagateInsightSystemPrompt?: string;
-  roleThinkingEfforts?: IdeaTreeRoleThinkingEfforts;
 }
 
 /** Idea Tree 设置写入 payload。每个字段可选，独立更新。空值（空字符串/undefined）即使用默认。 */
@@ -359,15 +339,12 @@ export interface UpdateIdeaTreeSettingsRequest {
   templateId?: "scientific-hypothesis-general/v1" | "water-treatment-materials/v1";
   explorationIntensity?: "quick" | "standard" | "deep";
   maxTokens?: number | null;
-  maxTokensPerCall?: number;
   maxDepth?: number;
   maxNodes?: number;
   scoreDirection?: "maximize" | "minimize";
   designSystemPrompt?: string | null;
   aggregatorSystemPrompt?: string | null;
   propagateInsightSystemPrompt?: string | null;
-  /** Replaces the whole per-stage map; `null` or `{}` returns every stage to inherit. */
-  roleThinkingEfforts?: IdeaTreeRoleThinkingEfforts | null;
 }
 
 export interface RuntimeSessionRun {

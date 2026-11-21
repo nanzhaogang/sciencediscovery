@@ -27,6 +27,8 @@ import { RowMenu, type MenuState } from "./RowMenu.js";
 import { sessionTitle } from "../app/session-title.js";
 import { SidebarToggle } from "./SidebarToggle.js";
 
+const migrationIcon = new URL("../assets/icons/migration.svg", import.meta.url).href;
+
 /** One rename in progress, whichever kind of row it started from. A Project
  *  and a Session both rename from a double-click and from their `⋯` menu, and
  *  only one field is open at a time, so the two share a piece of state. */
@@ -256,12 +258,9 @@ export function Sidebar({
         </svg>
         <span>{TEXT.sidebar.newTask}</span>
       </button>
-        <div className="side-import-dropdown">
-          <button className="side-import-trigger" aria-label={TEXT.researchPackage.newOptions} aria-haspopup="menu" type="button">
-            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><path d="m7 10 5 5 5-5" /></svg>
-          </button>
-          <div className="side-import-menu" role="menu"><button className="ctx-item" role="menuitem" onClick={() => onImportSession?.()} type="button"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v12m-4-4 4 4 4-4M5 16v4h14v-4" /></svg><span>{TEXT.researchPackage.import}</span></button></div>
-        </div>
+        <button className="side-new side-import-button" onClick={() => onImportSession?.()} type="button">
+          <img alt="" aria-hidden="true" src={migrationIcon} /><span>{TEXT.researchPackage.import}</span>
+        </button>
       </div>
 
       <div className="side-scroll">

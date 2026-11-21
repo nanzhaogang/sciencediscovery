@@ -20,8 +20,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import { createTest } from "../../../test/support/tagged/compat.mjs";
 import type { ApiClient } from "../src/api/client.js";
-import { TEXT } from "../src/text.js";
-import { SetupWizard } from "../src/views/SetupWizard.js";
+import { setLanguage, getLanguage, TEXT } from "../src/text.js";
+import { BOOT_CHECK_ITEMS, SetupWizard } from "../src/views/SetupWizard.js";
 
 const { describe, it } = createTest(import.meta.url, {
   tags: ["category:ut", "os:linux", "arch:amd64", "arch:arm64"],
@@ -84,6 +84,33 @@ describe("the first-run setup wizard", () => {
     assert.ok(!markup.includes(TEXT.wizard.testAndContinue));
   });
 
+  it("lists the Seatbelt row as item 0 of the environment check (B2-2)", () => {
+    // Static rendering runs no effect, so the list itself only appears after
+    // the starting phase; the items registry still drives what CAN appear.
+    // The TEXT contract is what the fail-closed page quotes verbatim.
+    assert.ok(TEXT.wizard.boot.items.seatbelt);
+    assert.ok(TEXT.wizard.boot.seatbeltFailedTitle);
+    assert.ok(TEXT.wizard.boot.seatbeltRetryHint.includes("重启"));
+    // Review: pin the RENDER source (BOOT_CHECK_ITEMS drives the list the
+    // component maps over), not the TEXT registry's key order — a reordered
+    // text file must not be able to pass this test while the UI still shows
+    // a different sequence.
+    assert.deepEqual([...BOOT_CHECK_ITEMS], ["seatbelt", "api", "runner", "model"],
+      "Seatbelt is item 0, before API/runner/model");
+    // zh + en both define every rendered row (the shell renders whichever
+    // locale the SPA loaded; a missing key would render "undefined" in one
+    // language).
+    const original = getLanguage();
+    for (const lang of ["zh-CN", "en"] as const) {
+      setLanguage(lang);
+      for (const key of BOOT_CHECK_ITEMS) {
+        assert.ok(TEXT.wizard.boot.items[key], `missing TEXT.wizard.boot.items.${key} in ${lang}`);
+      }
+      assert.ok(TEXT.wizard.boot.seatbeltNotApplicable, `missing seatbeltNotApplicable tip in ${lang}`);
+    }
+    setLanguage(original);
+  });
+
   it("is a model step whose final action waits for a successful test", () => {
     const markup = renderToStaticMarkup(
       <SetupWizard
@@ -102,10 +129,10 @@ describe("the first-run setup wizard", () => {
     assert.ok(markup.includes(TEXT.wizard.testAndContinue));
     assert.ok(markup.includes('data-step="model"'));
     assert.ok(markup.includes(TEXT.wizard.back));
-    // 返回上一步 belongs to the action row, after the continue button — not on
-    // a line of its own below the form.
+    // 返回上一步 belongs to the action row, in the demoted group ahead of the
+    // continue button — not on a line of its own below the form.
     const actions = markup.slice(markup.indexOf('class="form-actions"'));
-    assert.ok(actions.indexOf(TEXT.wizard.testAndContinue) < actions.indexOf(TEXT.wizard.back));
+    assert.ok(actions.indexOf(TEXT.wizard.back) < actions.indexOf(TEXT.wizard.testAndContinue));
     assert.ok(actions.indexOf(TEXT.wizard.back) < actions.indexOf("</div>"));
     // 开始使用 is the continuation, not a second save: it must stay hidden until
     // the connectivity test in this form passes.

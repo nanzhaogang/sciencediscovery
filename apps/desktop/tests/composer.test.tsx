@@ -41,6 +41,8 @@ function render(
     seededCommand?: { command: string; nonce: number; text: string };
     tag?: { kind: "research" | "experiment" | "analysis"; label: string };
     uploading?: boolean;
+    modelName?: string;
+    approvalMode?: "ask_for_dangerous" | "always_allow";
     selectedModelId?: string | null;
     unavailableModel?: boolean;
   } = {},
@@ -48,11 +50,12 @@ function render(
   return renderToStaticMarkup(
     <Composer
       activeProjectId={options.activeProjectId}
+      approvalMode={options.approvalMode}
       attachBlocked={options.blocked}
       attachLimit={options.limit}
       attachments={options.attachments ?? []}
       landing={options.landing}
-      models={[{ id: "m1", name: "测试模型" } as never]}
+      models={[{ id: "m1", name: options.modelName ?? "测试模型" } as never]}
       onApprovalMode={() => {}}
       onClearAttachments={() => {}}
       onCreateProject={() => {}}
@@ -78,18 +81,11 @@ function render(
 
 /** 会话设置's rows are rendered directly, since the menu they belong to is
  *  only mounted while open. */
-function settingsMenu(
-  approvalMode?: "ask_for_dangerous" | "always_allow",
-  running = false,
-  evolve = false,
-): string {
+function settingsMenu(evolve = false): string {
   return renderToStaticMarkup(
     <SessionSettingsMenu
-      approvalMode={approvalMode}
-      onApprovalMode={() => {}}
       onClose={() => {}}
       onEvolve={evolve ? () => {} : undefined}
-      running={running}
     />,
   );
 }
@@ -99,10 +95,16 @@ test("the composer offers the model pill, upload and session settings", () => {
   assert.match(markup, /class="composer-model-pill"/);
   assert.match(markup, /aria-label="上传文件"/);
   assert.match(markup, /aria-label="会话设置"/);
-  // The approval pill moved into 会话设置; a second copy in the footer would
-  // give the same choice two homes.
+  // The footer selector is the only door to the mode (#1204) now that 会话设置
+  // no longer lists it; the retired pilot class must not come back.
   assert.doesNotMatch(markup, /composer-permission-pill/);
   assert.doesNotMatch(markup, /class="composer-options"/);
+  const longName = "Desktop configuration 长模型名称 85fedd8a-9420-47f7-9790-1ece4fd4cfa4";
+  for (const landing of [false, true]) {
+    const longMarkup = render(false, { modelName: longName, landing });
+    assert.ok(longMarkup.includes(`class="model-name" title="${longName}">${longName}</span>`),
+      "Truncation is visual only: the selected model keeps its complete text and tooltip");
+  }
 });
 
 test("the plus uploads and states the per-file ceiling in its tooltip", () => {
@@ -144,22 +146,25 @@ test("the files the turn carries sit above the input, and an empty tray takes no
   assert.match(empty, /class="composer"/u);
 });
 
-test("会话设置 carries 权限模式 and 专家, each with its current value", () => {
-  const markup = settingsMenu("ask_for_dangerous");
-  assert.match(markup, />权限模式</);
-  assert.match(markup, />询问</);
+test("会话设置 carries 专家 and leaves 权限模式 to the footer control", () => {
+  const markup = settingsMenu();
   assert.match(markup, />专家</);
   assert.match(markup, />无</);
-  // Both rows open a panel; neither is a dead end.
+  // The mode has its own control beside these settings (#1204); the row here was
+  // the same two choices behind a second door.
+  assert.doesNotMatch(markup, /权限模式/);
+  assert.doesNotMatch(markup, /询问|完全访问/);
+  assert.doesNotMatch(markup, /编辑外部文件和使用互联网时始终询问/);
+  // The row that is left opens a panel; it is not a dead end.
   assert.match(markup, /aria-haspopup="true"/);
   assert.match(markup, /为此对话绑定一位个人专家。/);
 });
 
 test("会话设置 carries the way into program evolution above its own settings", () => {
-  const markup = settingsMenu("ask_for_dangerous", false, true);
+  const markup = settingsMenu(true);
   assert.match(markup, />程序演进实验</);
   // It is an action, not a setting: it has no current value and no flyout.
-  assert.ok(markup.indexOf("程序演进实验") < markup.indexOf("权限模式"));
+  assert.ok(markup.indexOf("程序演进实验") < markup.indexOf("专家"));
   assert.doesNotMatch(markup, /aria-haspopup="true"[\s\S]*?程序演进实验/);
 
   // Without somewhere to go — a static render — the row is not drawn.
@@ -168,7 +173,7 @@ test("会话设置 carries the way into program evolution above its own settings
 
 test("a permission option says on screen what it allows", () => {
   const markup = renderToStaticMarkup(
-    <PermissionFlyout fullAccess={false} onApprovalMode={() => {}} onClose={() => {}} />,
+    <PermissionFlyout mode="ask_for_dangerous" onApprovalMode={() => {}} onClose={() => {}} />,
   );
   // Both consequences are text in the row. They were `title`s, which only a
   // mouse reaches, and this is the one switch that widens the session's reach.
@@ -219,9 +224,7 @@ test("the 专家 row names the bound expert rather than saying 无", () => {
   const markup = renderToStaticMarkup(
     <SessionSettingsMenu
       experts={EXPERTS}
-      onApprovalMode={() => {}}
       onClose={() => {}}
-      running={false}
       selectedSpecialistId="e2"
     />,
   );
@@ -266,13 +269,12 @@ test("the 专家 row is named by its label and value, and its hint is attached",
   assert.doesNotMatch(markup, /role="tooltip"/);
 });
 
-test("the permission row reads the mode the session is in", () => {
-  assert.match(settingsMenu("always_allow"), />完全访问</);
-  assert.match(settingsMenu("ask_for_dangerous"), />询问</);
-});
-
 test("permission cannot be switched mid-run", () => {
-  assert.match(settingsMenu(undefined, true), /<button[^>]*aria-expanded="false"[^>]*disabled=""/);
+  // The footer control is the only door now, so it is the one that has to lock:
+  // a policy change mid-run would land on a turn already running under the old
+  // one.
+  const markup = render(true);
+  assert.match(markup, /<button[^>]*class="composer-permission[^"]*"[^>]*disabled=""/);
 });
 
 test("the landing arrangement carries the project and the approval mode under the card", () => {
@@ -399,15 +401,58 @@ test("sending a seeded design joins the token to the sentence once", async () =>
         target: { value: "让压缩比更高，并且要快" },
       });
     });
+    // The dialog keeps the last word on the flags, so sending from the composer
+    // carries the token as seeded — there is no second confirmation dialog.
     const send = view.root.findByProps({ "aria-label": "发送" });
     await act(async () => { (send.props.onClick as () => void)(); });
-    // The flags and the sentence travel together, in that order.
     assert.deepEqual(sent, [
       { command: "/evolve-design --algorithm puct", content: "让压缩比更高，并且要快" },
     ]);
     // The token belonged to that message: the next draft starts empty.
     assert.equal(view.root.findByProps({ id: "composer-textarea" }).props.value, "");
     assert.equal(view.root.findAllByType("span").some((node) => node.props.className === "composer-command"), false);
+  } finally {
+    await act(async () => { view.unmount(); });
+  }
+});
+
+test("a seeded design carries the parameters the dialog collected", async () => {
+  // The starting values and the editable set are part of the same message as
+  // the flags: closing the dialog must not leave them behind.
+  const sent: { command?: string; content: string; direction?: unknown }[] = [];
+  const direction = { baseline: '{"ratio": 9}', editable: ["ratio"] };
+  let view;
+  await act(async () => {
+    view = create(
+      <Composer
+        attachments={[]}
+        landing
+        models={[{ id: "m1", name: "测试模型" } as never]}
+        onApprovalMode={() => {}}
+        onClearAttachments={() => {}}
+        onCreateProject={() => {}}
+        onOpenSettings={() => {}}
+        onRemoveAttachment={() => {}}
+        onRetryAttachment={() => {}}
+        onSelectModel={() => {}}
+        onSelectProject={() => {}}
+        onSend={(content, command, carried) => { sent.push({ command, content, direction: carried }); }}
+        onStop={() => {}}
+        onUpload={() => {}}
+        projects={[]}
+        running={false}
+        seededCommand={{ command: "/evolve-design --algorithm puct", direction, nonce: 1, text: "让压缩比更高" }}
+        selectedModelId="m1"
+        uploading={false}
+      />,
+    );
+  });
+  try {
+    const send = view.root.findByProps({ "aria-label": "发送" });
+    await act(async () => { (send.props.onClick as () => void)(); });
+    assert.deepEqual(sent, [
+      { command: "/evolve-design --algorithm puct", content: "让压缩比更高", direction },
+    ]);
   } finally {
     await act(async () => { view.unmount(); });
   }
@@ -466,4 +511,88 @@ test("a deleted model is shown as unavailable instead of selecting the first pro
   const markup = render(false, { selectedModelId: null, unavailableModel: true });
   assert.match(markup, /原模型已删除，请重新选择/u);
   assert.doesNotMatch(markup, /class="model-name">测试模型/u);
+});
+
+test("the permission selector follows the + and settings buttons and names the active mode", () => {
+  const markup = render(false, { approvalMode: "ask_for_dangerous" });
+  const plus = markup.indexOf('class="composer-plus"');
+  const settings = markup.indexOf("composer-settings");
+  const selector = markup.indexOf("composer-permission");
+  assert.ok(plus >= 0 && settings > plus, "+ then settings are drawn first");
+  assert.ok(selector > settings, "the selector is the third control, not tucked into the menu");
+  assert.match(markup, /aria-label="请求批准"/u);
+  assert.match(markup, /composer-permission-label">请求批准</u);
+  assert.doesNotMatch(markup, /composer-permission is-danger/u, "the asking mode is not the warning colour");
+});
+
+test("full access is the one mode drawn in the warning colour", () => {
+  const markup = render(false, { approvalMode: "always_allow" });
+  assert.match(markup, /class="composer-permission is-danger"/u);
+  assert.match(markup, /composer-permission-label">完全访问</u);
+  assert.match(markup, /aria-label="完全访问"/u);
+});
+
+test("the selector opens the two scope explanations and reports the choice", async () => {
+  const chosen: string[] = [];
+  // Opening a composer menu registers a document-level dismissal listener; this
+  // suite mounts React without a DOM, so the one call it makes is stubbed.
+  const originalDocument = (globalThis as { document?: unknown }).document;
+  (globalThis as { document?: unknown }).document = { addEventListener() {}, removeEventListener() {} };
+  let view;
+  await act(async () => {
+    view = create(
+      <Composer
+        approvalMode="always_allow"
+        attachments={[]}
+        models={[{ id: "m1", name: "测试模型" } as never]}
+        onApprovalMode={(mode) => { chosen.push(mode); }}
+        onClearAttachments={() => {}}
+        onCreateProject={() => {}}
+        onOpenSettings={() => {}}
+        onRemoveAttachment={() => {}}
+        onRetryAttachment={() => {}}
+        onSelectModel={() => {}}
+        onSelectProject={() => {}}
+        onSend={() => {}}
+        onStop={() => {}}
+        onUpload={() => {}}
+        projects={[]}
+        running={false}
+        selectedModelId="m1"
+        uploading={false}
+      />,
+    );
+  });
+  try {
+    const trigger = view.root.findByProps({ "aria-label": "完全访问" });
+    await act(async () => {
+      (trigger.props.onClick as (event: { stopPropagation: () => void }) => void)({ stopPropagation() {} });
+    });
+    const opened = JSON.stringify(view.toJSON());
+    assert.match(opened, /编辑外部文件和使用互联网时始终询问/u);
+    assert.match(opened, /可不受限制地访问互联网和您电脑上的任何文件/u);
+    const asking = view.root.findByProps({ "aria-label": "请求批准" });
+    await act(async () => { (asking.props.onClick as () => void)(); });
+    assert.deepEqual(chosen, ["ask_for_dangerous"]);
+  } finally {
+    await act(async () => { view.unmount(); });
+    if (originalDocument === undefined) delete (globalThis as { document?: unknown }).document;
+    else (globalThis as { document?: unknown }).document = originalDocument;
+  }
+});
+
+test("with nothing remembered the control asks for approval", () => {
+  // The shell resolves the effective default (project or global defaultApprovalMode)
+  // before the composer sees it; when nothing is set anywhere that default is asking,
+  // so the closed control never needs a third state (#1204 owner decision).
+  const markup = render();
+  assert.match(markup, /aria-label="请求批准"/u);
+  assert.match(markup, /composer-permission-label">请求批准</u);
+  assert.doesNotMatch(markup, /is-danger/u, "asking is not the warning colour");
+});
+
+test("with no mode chosen neither permission option claims to be the choice", () => {
+  const markup = renderToStaticMarkup(<PermissionFlyout onApprovalMode={() => {}} onClose={() => {}} />);
+  assert.equal(markup.split("is-selected").length - 1, 0, "no row is marked");
+  assert.equal(markup.split("session-flyout-check").length - 1, 0, "no tick is drawn");
 });

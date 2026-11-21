@@ -13,30 +13,104 @@
 // limitations under the License.
 
 
-import { randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile, stat, lstat, readdir, utimes } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
+import { constants as fsConstants } from "node:fs";
+import { mkdir, readFile, writeFile, stat, lstat, readdir, utimes, copyFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { RefStore, VersionStore, withWorkspaceMutation } from "@sciencediscovery/cas";
+import { setImmediate } from "node:timers/promises";
+import { RefStore, VersionStore, withWorkspaceMutation, type ObjectRef } from "@sciencediscovery/cas";
 import { researchPackagePlugin } from "@sciencediscovery/research-package/plugin";
-import { createResearchPackageAsync, estimateResearchPackageBytes, jsonBytes, jsonDigest, sha256, type ExportInput, type ImportedResearchPackage, type ResearchPackageCounts, type ResearchPackageExportProfile } from "@sciencediscovery/research-package";
+import { exportEvolveRuns, restoreEvolveRuns, MAX_RUNS } from "./evolution/package.js";
+import { RESEARCH_PACKAGE_MAX_BYTES, RESEARCH_PACKAGE_MAX_MAX_BYTES, estimateResearchPackageBytes, jsonBytes, jsonByteLength, jsonDigest, researchPackageArchiveBytes, sha256, writeResearchPackage, type ExportInput, type ImportedResearchPackage, type ResearchPackageCounts, type ResearchPackageExportProfile } from "@sciencediscovery/research-package";
 import { contextBlocks, type TrajectoryDetail, type TrajectoryEntry } from "@sciencediscovery/trajectory";
 import type { MemoryGraphSnapshot } from "@sciencediscovery/memory";
-import type { ArtifactAnnotation, ArtifactReviewRun, ChatMessage, EnvironmentRevision, ResearchSnapshot, ReviewRun, ReviewerAuditTask, ReviewFeedback, ScientificArtifact, ScientificArtifactVersion, ScientificMemorySummary, Session, SessionRun, SessionRunEvent, WorkspaceFileProvenance } from "@sciencediscovery/schema";
+import type { ArtifactAnnotation, ArtifactOriginMeta, ArtifactReviewRun, ChatMessage, EnvironmentRevision, ResearchSnapshot, ReviewRun, ReviewerAuditTask, ReviewFeedback, ScientificArtifact, ScientificArtifactVersion, ScientificMemorySummary, Session, SessionRun, SessionRunEvent, WorkspaceFileProvenance } from "@sciencediscovery/schema";
 import { createLocalSessionTitle } from "@sciencediscovery/schema";
 import { resolveWorkspaceFile } from "@sciencediscovery/workspace";
 import { listWorkspaceFiles } from "./artifacts/index.js";
+
+/** What a complete workspace listing returns, derived rather than re-imported. */
+type WorkspaceListing = Awaited<ReturnType<typeof listWorkspaceFiles>>;
+
+/** True for the per-session shell-execution ledger under `execution-runs/`.
+ *  Its content still counts; only its mtime is excluded (see `inspect`). */
+function isExecutionLedgerPath(path: string): boolean {
+  return /[\\/]execution-runs[\\/][^\\/]+\.json$/u.test(path);
+}
 import { SessionStoreHttpError } from "./store.js";
 import type { createPlatformServices } from "./bootstrap/platform.js";
 import { createContinuationOperations } from "./research-continuations.js";
 import { buildConversationBranch } from "./conversation-branches.js";
 import { verifyResearchCopy } from "./research-snapshot-integrity.js";
+import { filterTrajectoryIndex, readTrajectoryDetail } from "./research-trajectory-detail.js";
 import { ResearchExportPreviews } from "./research-export-previews.js";
 import { ResearchPackageExports, type ResearchPackageExportOptions } from "./research-package-exports.js";
 import { sessionTrajectory } from "./trajectory.js";
 import { emptyPackageTrajectory, importedTrajectoryAccess, remapPackageTrajectory, validatePackageTrajectory, writePackageTrajectory, type PackageTrajectory } from "./research-package-trajectory.js";
 import { casHashes, versionRefs, remapRunEvent, remapRunStreamId, remapReferences, remapMessages, exportHistory, ResearchPackageIds, restoreHistory, restoreEvidenceItems, remapMemorySnapshot, remapWorkspaceProvenance, type PackageHistory } from "./research-package-history.js";
 
-type Ports = Pick<ReturnType<typeof createPlatformServices>, "store" | "memoryGraphClient" | "memoryGraphEnabled" | "provenanceRecorder">;
+type Ports = Pick<ReturnType<typeof createPlatformServices>, "store" | "memoryGraphClient" | "memoryGraphEnabled" | "provenanceRecorder" | "evolutionStore" | "evolveCandidates">;
+type PreviewSizing = {
+  objectSizes: Map<string, number>; additionalRecordBytes: number;
+  /**
+   * Sizes of objects the writer will add but whose address the preview cannot know
+   * without reading the payload — a workspace file the exporter copies and hashes
+   * while it writes. They are counted as objects, not as record bytes, so the
+   * estimate keeps matching the archive the same selection produces (#1216 review 4).
+   */
+  unpinnedObjectBytes: number[];
+  hashes: Set<string>; refs: Map<string, ObjectRef>;
+  jsonSizes: WeakMap<object, number>; casVisited: WeakSet<object>; refsVisited: WeakSet<object>;
+  /**
+   * Per-session trail of what the trajectory walk produced, so the two profiles
+   * that both ask for `includeFullTrajectory` walk the closure once instead of
+   * twice (#1140 §7.4).
+   *
+   * Only the measured quantities are kept — one byte count, the CAS hashes and
+   * the version refs per entry — never the details themselves, because #1085 was
+   * lost to keeping entries alive.
+   */
+  trajectorySizing?: Map<string, TrajectorySizingEntry[]>;
+  /**
+   * The complete workspace listing of each session, shared by the profiles of one
+   * dialog request for as long as it is young (#1140 §7.8).
+   *
+   * Each profile used to scan the directory and reconcile the catalog on its own —
+   * five writes to produce one read-only estimate — plus a second scan of the same
+   * session to build its file list. Sharing is bounded in time rather than scoped to
+   * the request, like the bounded UI listing already is, so a file written after the
+   * first profile is still seen by a later request instead of being hidden until the
+   * evidence revision moves.
+   */
+  workspaceListings?: PreviewWorkspaceListings;
+};
+
+/**
+ * The complete listing of one session, cached for the lifetime of a single dialog
+ * request.
+ *
+ * It is deliberately not time-bounded. The five profiles are serialised on the
+ * per-session queue, so on a large workspace the last one starts more than a second
+ * after the first; an age bound would re-scan there and hand the last profiles a
+ * different workspace than the ones before them. Request scope is the right bound:
+ * a new request asks again, and the workspace only has to be consistent within the
+ * one answer the user is waiting for.
+ */
+type PreviewWorkspaceListings = Map<string, Promise<WorkspaceListing>>;
+
+function previewWorkspaceListing(listings: PreviewWorkspaceListings, store: Ports["store"], sessionId: string): Promise<WorkspaceListing> {
+  const shared = listings.get(sessionId);
+  if (shared) return shared;
+  const listing = listWorkspaceFiles(store, sessionId, true);
+  listings.set(sessionId, listing);
+  void listing.catch(() => { if (listings.get(sessionId) === listing) listings.delete(sessionId); });
+  return listing;
+}
+
+type TrajectorySizingEntry =
+  | { unreadable: string }
+  | { bytes: number; hashes: string[]; id: string; refs: Array<[string, ObjectRef]> };
 
 export type ExportSessionRecord = PackageHistory & {
   session: Omit<Session, "settingsOverrides"> & { settingsOverrides?: undefined };
@@ -77,26 +151,34 @@ function necessaryTrajectoryEntries(trajectory: Pick<PackageTrajectory, "index">
   return entries.filter((entry) => entry === latestInput || entry === latestOutput || entry.kind === "tool" || entry.kind === "mcp");
 }
 
+function necessaryTrajectoryDetail(detail: TrajectoryDetail): TrajectoryDetail {
+  const entry = detail.entry;
+  if (entry.kind === "input" && detail.context) {
+    const input = detail.context.input;
+    return { entry, value: { exportSummary: true, summary: "必要导出：最近一次模型输入。" }, context: { input, blocks: contextBlocks(input, {}), assembly: {}, state: {} } };
+  }
+  const serialized = typeof detail.value === "string" ? detail.value : JSON.stringify(detail.value, null, 2) ?? "";
+  const limit = entry.kind === "output" ? serialized.length : 2000;
+  return { entry, value: { exportSummary: true, summary: serialized.slice(0, limit), truncated: serialized.length > limit,
+    note: "必要导出轨迹摘要；完整事件、思考分片及工具原始输出请使用完整导出。" } };
+}
+
 function trimTrajectory(trajectory: PackageTrajectory, runs: Set<string>): PackageTrajectory {
   const selected = necessaryTrajectoryEntries(trajectory, runs);
   const detailsById = new Map(trajectory.details.map((detail) => [detail.entry.id, detail]));
   const details = selected.flatMap<TrajectoryDetail>((entry) => {
     const detail = detailsById.get(entry.id);
     if (!detail) return [];
-    if (entry.kind === "input" && detail.context) {
-      const input = detail.context.input;
-      return [{ entry, value: { exportSummary: true, summary: "必要导出：最近一次模型输入。" }, context: { input, blocks: contextBlocks(input, {}), assembly: {}, state: {} } }];
-    }
-    const serialized = typeof detail.value === "string" ? detail.value : JSON.stringify(detail.value, null, 2) ?? "";
-    const limit = entry.kind === "output" ? serialized.length : 2000;
-    return [{ entry, value: { exportSummary: true, summary: serialized.slice(0, limit), truncated: serialized.length > limit,
-      note: "必要导出轨迹摘要；完整事件、思考分片及工具原始输出请使用完整导出。" } }];
+    return [necessaryTrajectoryDetail(detail)];
   });
   const selectedIds = new Set(selected.map((entry) => entry.id));
   const untimed = (trajectory.index.untimedEntries ?? trajectory.index.historicalEntries ?? []).filter((entry) => selectedIds.has(entry.id));
   return { index: { ...trajectory.index, entries: trajectory.index.entries.filter((entry) => selectedIds.has(entry.id)), untimedEntries: untimed, historicalEntries: untimed,
     warnings: [...trajectory.index.warnings, "必要导出仅包含最近模型输入、最终输出和相关工具摘要；不包含完整思考及事件流。"] }, details, runIds: [...runs] };
 }
+
+/** How many per-entry trajectory omissions a receipt may carry before it is summarised. */
+const TRAJECTORY_OMISSION_LIMIT = 5;
 
 function necessaryHistory(history: PackageHistory, turnIds: Set<string>, executionIds: Set<string>, reviewIds: Set<string>): PackageHistory {
   const claims = (history.claims ?? []).filter((row) => reviewIds.has(row.reviewRunId));
@@ -177,12 +259,98 @@ function summarizeScientificMemory(graph: MemoryGraphSnapshot | undefined): Scie
  * import receipt should report the missing searches, rather than reporting it
  * for every package (#1019 review F1).
  */
+/** The run entries a package carries for one source session. A malformed
+ *  package degrades to "nothing to restore" rather than to a failed import. */
+export function packageEvolveRunsFor(payload: unknown, sourceSessionId: string | undefined): unknown[] {
+  const container = typeof payload === "object" && payload !== null ? payload as { runs?: unknown } : {};
+  const runs = Array.isArray(container.runs) ? container.runs : [];
+  return runs.filter((entry) => {
+    const run = typeof entry === "object" && entry !== null ? (entry as { run?: unknown }).run : undefined;
+    const owner = typeof run === "object" && run !== null ? (run as { sessionId?: unknown }).sessionId : undefined;
+    return typeof owner !== "string" || owner === sourceSessionId;
+  });
+}
+
+/** Whether the package actually carries evolve runs.
+ *
+ *  Counts the run list itself, not the runs that would restore for one source
+ *  session: a package written by this exporter stamps every run with a string
+ *  `sessionId`, so the owner-scoped filter in `packageEvolveRunsFor` would
+ *  report "carries nothing" for the very package it just produced (#1019). */
+export function packagedEvolveRuns(payload: unknown): boolean {
+  const container = typeof payload === "object" && payload !== null ? payload as { runs?: unknown } : {};
+  return Array.isArray(container.runs) && container.runs.length > 0;
+}
+
+/** Whether any carried run has candidates whose source files do not travel.
+ *
+ *  A candidate's source lives outside the package (`evolve-candidates/<runId>/
+ *  <sha256>.py`), so the exporter carries the run record and its event log but
+ *  never the source scripts. A run with candidates therefore comes back with
+ *  references that cannot be inspected or re-run, and the receipt must say so. */
+export function packageCarriesEvolveCandidates(payload: unknown): boolean {
+  const container = typeof payload === "object" && payload !== null ? payload as { runs?: unknown } : {};
+  const runs = Array.isArray(container.runs) ? container.runs : [];
+  return runs.some((entry) => {
+    const run = typeof entry === "object" && entry !== null ? (entry as { run?: unknown }).run : undefined;
+    const candidates = typeof run === "object" && run !== null ? (run as { candidates?: unknown }).candidates : undefined;
+    return typeof candidates === "number" && Number.isInteger(candidates) && candidates > 0;
+  });
+}
+
+/**
+ * Whether the package carries sources for the runs that claim candidates.
+ *
+ * An array being present is not enough: the exporter always emits
+ * `evolve.candidates`, empty included, so a run whose files were pruned or never
+ * written shipped "no sources" as if it had shipped them, and the receipt stayed
+ * silent about a loss (#1136 review 2). A run that claims candidates needs at
+ * least one carried source for the package to count as carrying them.
+ */
+function packageCarriesEvolveCandidateSources(payload: unknown): boolean {
+  const container = typeof payload === "object" && payload !== null ? payload as { candidates?: unknown; runs?: unknown } : {};
+  if (!Array.isArray(container.candidates)) return false;
+  const carried = new Map<string, number>();
+  for (const entry of container.candidates) {
+    const source = typeof entry === "object" && entry !== null ? entry as { runId?: unknown } : undefined;
+    if (!source || typeof source.runId !== "string") continue;
+    carried.set(source.runId, (carried.get(source.runId) ?? 0) + 1);
+  }
+  const runs = Array.isArray(container.runs) ? container.runs : [];
+  return runs.every((entry) => {
+    const run = typeof entry === "object" && entry !== null ? (entry as { run?: unknown }).run : undefined;
+    const candidates = typeof run === "object" && run !== null ? (run as { candidates?: unknown }).candidates : undefined;
+    if (typeof candidates !== "number" || !Number.isInteger(candidates) || candidates <= 0) return true;
+    const id = (run as { id?: unknown }).id;
+    return typeof id === "string" && (carried.get(id) ?? 0) > 0;
+  });
+}
+
+function packageEvolveCandidateSourcesFor(payload: unknown, runIds: Set<string>): Array<{ hash: string; objectPath: string; runId: string }> {
+  const container = typeof payload === "object" && payload !== null ? payload as { candidates?: unknown } : {};
+  if (!Array.isArray(container.candidates)) return [];
+  return container.candidates.flatMap((entry) => {
+    const source = typeof entry === "object" && entry !== null ? entry as { hash?: unknown; objectPath?: unknown; runId?: unknown } : undefined;
+    if (!source || typeof source.runId !== "string" || !runIds.has(source.runId)
+      || typeof source.hash !== "string" || typeof source.objectPath !== "string") return [];
+    return [{ hash: source.hash, objectPath: source.objectPath, runId: source.runId }];
+  });
+}
+
 export function packageRanEvolve(artifacts: Array<{ name?: unknown }> | undefined): boolean {
   return (artifacts ?? []).some((artifact) =>
     typeof artifact.name === "string" && artifact.name.startsWith("evolve/"));
 }
 
-export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphEnabled, provenanceRecorder }: Ports, sessionHasResearchHistory: (sessionId: string) => Promise<boolean>) {
+/**
+ * What a restore receives: a parsed package, the file it arrived as, or its bytes.
+ *
+ * The file form is what a streamed upload produces (#1152 stage 2): the restore reads
+ * the objects from the unpacked directory and copies the archive instead of buffering it.
+ */
+export type ImportedPackageSource = { imported?: ImportedResearchPackage; packageFile?: string; bytes?: Buffer };
+
+export function createResearchSnapshots({ store, evolutionStore, evolveCandidates, memoryGraphClient, memoryGraphEnabled, provenanceRecorder }: Ports, sessionHasResearchHistory: (sessionId: string) => Promise<boolean>) {
   const researchPackageProvider = researchPackagePlugin.create().contribution.provider;
   const previewDependencies = new Map<string, Set<string>>();
   const previewRevision = async (projectId: string, sessionId?: string): Promise<string> => {
@@ -195,14 +363,22 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
     const sessions = store.researchSessions(projectId).filter((session) =>
       (!session.researchSnapshot || session.researchSnapshot.state === "ready") &&
       (!sessionId || session.id === sessionId || dependencies?.has(session.id)));
-    const files: Array<[string, number, number, number]> = [];
+    const files: Array<[string, string]> = [];
     const inspect = async (path: string): Promise<void> => {
       let info;
       try { info = await lstat(path); }
       catch (error) { if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) return; throw error; }
       if (info.isSymbolicLink()) return;
       if (info.isDirectory()) { for (const child of await readdir(path)) await inspect(resolve(path, child)); }
-      else if (info.isFile()) files.push([path, info.size, info.mtimeMs, info.ctimeMs]);
+      else if (info.isFile() && isExecutionLedgerPath(path)) {
+        // The execution ledger is package content, so it must still be able to
+        // invalidate a revision — but its mtime moves when the same bytes are
+        // rewritten, which is how a session got stuck at EXPORT_PREVIEW_PENDING
+        // (#1018). Hash its content instead: an identical rewrite changes
+        // nothing, a real execution change still does.
+        files.push([path, `sha256:${sha256(await readFile(path))}`]);
+      }
+      else if (info.isFile()) files.push([path, `${info.size}:${info.mtimeMs}:${info.ctimeMs}`]);
     };
     for (const session of sessions) {
       for (const path of store.sessionDataPaths(session.id)) await inspect(path);
@@ -218,23 +394,65 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
     return jsonDigest({ project: store.getProject(projectId), sessions, files, heads,
       artifacts: store.listProjectArtifacts(projectId), revisions: sessions.map((session) => [...store.snapshotWorkspaceFileRevisions(session.id)]),
       subagents: sessions.map((session) => store.listSubagents(session.id)),
-      shells: sessions.map((session) => store.shellExecutions.snapshot(session.id)), environments: store.listEnvironmentRevisions(),
+      shells: sessions.map((session) => store.shellExecutions.revisionSnapshot(session.id)), environments: store.listEnvironmentRevisions(),
       memory: [memoryGraphEnabled(), memoryGraphClient.snapshotRevision(sessions.map((session) => session.id))] });
   };
-  const buildResearchPackageInput = async (projectId: string, sessionId?: string, level: "necessary" | "complete" = "necessary", selectedFiles?: Set<string>, cohort?: Set<string>, previewObjectSizes?: Map<string, number>, includeFullTrajectory = true, includeFullMemoryGraph = true): Promise<ExportInput> => {
+  // A corrupt copy is not a missing one. The export reports absent objects as
+  // omissions so a package is still produced, but an object that is present and does
+  // not hash to its address means this installation's evidence is damaged — silently
+  // dropping it would hand back a package that looks complete (#1216 review 4).
+  const isIntegrityFailure = (error: unknown) => error instanceof Error && error.message === "CAS integrity failure";
+  // Reported as a conflict, not a server fault: the request is well formed, the stored
+  // evidence under it is not, and the client should say so instead of retrying blindly.
+  const integrityRefusal = () => new SessionStoreHttpError(
+    "证据包中有对象与其地址不符（CAS integrity failure），导出已中止；请修复存储后重试。", 409);
+
+  const buildResearchPackageInput = async (projectId: string, sessionId?: string, level: "necessary" | "complete" = "necessary", selectedFiles?: Set<string>, cohort?: Set<string>, preview?: PreviewSizing, includeFullTrajectory = true, includeFullMemoryGraph = true, signal: AbortSignal = new AbortController().signal, options: { streamObjects?: boolean } = {}): Promise<ExportInput> => {
+    signal.throwIfAborted();
+    const previewObjectSizes = preview?.objectSizes;
     const project = store.getProject(projectId);
     if (!project) throw new SessionStoreHttpError("Project not found", 404);
     const availableSessions = store.researchSessions(projectId);
     const sessions = availableSessions.filter((item) => cohort ? cohort.has(item.id) : (!item.researchSnapshot || item.researchSnapshot.state === "ready") && (!sessionId || item.id === sessionId));
     if (sessionId && !sessions.length) throw new SessionStoreHttpError("Session not found", 404);
-    const objects = new Map<string, { path: string; bytes: Uint8Array; kind: "artifact" | "evidence" | "log" | "other" }>();
+    const objects = new Map<string, import("@sciencediscovery/research-package").PackageObject | import("@sciencediscovery/research-package").PackageObjectStream>();
     const omissions: string[] = [];
+    // A background export streams from the source instead of holding every object:
+    // the CAS and the workspace file are read once to name the object and again while
+    // the archive is written, so the payload never accumulates in memory.
+    const streamObjects = options.streamObjects === true;
     const addObject = async (bytes: Uint8Array, kind: "artifact" | "evidence" | "log" | "other") => {
       const path = sha256(bytes);
       if (!objects.has(path)) objects.set(path, { path, bytes, kind });
       return path;
     };
-    const addPreviewObject = (path: string, size: number, kind: "artifact" | "evidence") => {
+    const addObjectSource = async (hash: string, kind: "artifact" | "evidence" | "log" | "other") => {
+      // Dedupe before anything else: a reference already in the inventory must not be
+      // probed again (#1216 F1).
+      if (objects.has(hash)) return hash;
+      // A lazy source has no read to fail in: check the address now, or the miss would
+      // surface inside the writer and fail the whole export instead of becoming an
+      // omission like the resident path (#1211 F7). The probe is presence only — the
+      // writer streams these bytes anyway, so reading them here would put the largest
+      // object of the export in memory for an answer nothing uses (#1216 F1).
+      try {
+        if (!(await provenanceRecorder.cas.exists(hash))) throw Object.assign(new Error("CAS object not found"), { code: "ENOENT" });
+      } catch {
+        signal.throwIfAborted();
+        omissions.push(`cas:${hash}:unavailable source object`);
+        return undefined;
+      }
+      objects.set(hash, { path: hash, open: () => provenanceRecorder.cas.stream(hash), kind });
+      return hash;
+    };
+    const addFileSource = async (absolutePath: string, kind: "artifact" | "evidence" | "log" | "other") => {
+      const digest = createHash("sha256");
+      for await (const chunk of createReadStream(absolutePath)) digest.update(chunk as Buffer);
+      const path = digest.digest("hex");
+      if (!objects.has(path)) objects.set(path, { path, open: () => createReadStream(absolutePath) as AsyncIterable<Uint8Array>, kind });
+      return path;
+    };
+    const addPreviewObject = (path: string, size: number, kind: "artifact" | "evidence" | "log") => {
       previewObjectSizes!.set(path, size);
       objects.set(path, { path, bytes: new Uint8Array(), kind });
       return path;
@@ -293,31 +511,103 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
     });
     const sessionRecords: ExportSessionRecord[] = [];
     const trajectoryViews = new Map<string, Awaited<ReturnType<typeof sessionTrajectory>>>();
-    const hydrateTrajectory = async (record: ExportSessionRecord, entries: TrajectoryEntry[]) => {
+    const hydrateTrajectory = async (record: ExportSessionRecord, entries: TrajectoryEntry[], summarize = false) => {
       const view = trajectoryViews.get(record.session.id)!;
       const details: TrajectoryDetail[] = [];
-      for (const entry of entries) {
-        const detail = await view.detail(entry.id);
-        if (!detail) throw new Error(`Missing trajectory detail: ${entry.id}`);
-        details.push(detail);
+      // The exported index and the details must stay 1:1: the importer rejects a
+      // package otherwise (`validatePackageTrajectory` requires
+      // `details.length === entries.length`), so an entry whose record cannot be
+      // read is dropped from the index as well as from the details (#1083).
+      const retained = new Set<string>();
+      const unreadable: string[] = [];
+      let counted = 0;
+      // Keyed by walk shape as well as session: the summarized walk and the full
+      // one measure different byte counts, so replaying across them would
+      // under-count `estimatedBytes`. Only the two `complete` full-trajectory
+      // profiles share a key, which is exactly the pair this cache exists for.
+      const sizingKey = `${summarize ? "summary" : "full"}:${record.session.id}`;
+      const replayed = preview ? preview.trajectorySizing?.get(sizingKey) : undefined;
+      if (replayed) {
+        // This revision's closure was already walked for another profile with the
+        // same shape. Replaying the recorded numbers reproduces `estimatedBytes`
+        // exactly, including the comma accounting that depends on entry order.
+        for (const item of replayed) {
+          if ("unreadable" in item) { unreadable.push(item.unreadable); continue; }
+          retained.add(item.id);
+          if (!preview) continue;
+          preview.additionalRecordBytes += item.bytes + (counted++ ? 1 : 0);
+          for (const hash of item.hashes) preview.hashes.add(hash);
+          for (const [key, ref] of item.refs) preview.refs.set(key, ref);
+        }
+      } else {
+        const measured: TrajectorySizingEntry[] = [];
+        for (const entry of entries) {
+          signal.throwIfAborted();
+          let message: string | undefined;
+          const detail = await readTrajectoryDetail(view, entry, record.session.id, (text) => {
+            // Every walk reports what it could not read, preview or export, replayed
+            // or not: an entry silently dropped from the index with no omission is
+            // the loss #1083 fixed.
+            message = text;
+            unreadable.push(text);
+          }, signal);
+          if (!detail) {
+            if (message) measured.push({ unreadable: message });
+            continue;
+          }
+          retained.add(entry.id);
+          if (preview) {
+            const kept = summarize ? necessaryTrajectoryDetail(detail) : detail;
+            // The records skeleton keeps []; add its elements and commas only.
+            // Retain compact refs and weak size memo entries, never all details.
+            const bytes = jsonByteLength(kept, preview.jsonSizes);
+            const hashes = [...casHashes(kept, preview.casVisited)];
+            const refs: Array<[string, ObjectRef]> = [...versionRefs(kept, preview.refsVisited)]
+              .map((ref): [string, ObjectRef] => [`${ref.pool}:${ref.digest}`, ref]);
+            preview.additionalRecordBytes += bytes + (counted++ ? 1 : 0);
+            for (const hash of hashes) preview.hashes.add(hash);
+            for (const [key, ref] of refs) preview.refs.set(key, ref);
+            measured.push({ bytes, hashes, id: entry.id, refs });
+            if (counted % 32 === 0) await setImmediate();
+          } else details.push(detail);
+        }
+        if (preview) preview.trajectorySizing?.set(sizingKey, measured);
       }
-      return { ...record.trajectory, details };
+      // Bound the receipt: a session whose trajectory store is unavailable would
+      // otherwise add one line per entry to both the package and the preview.
+      for (const message of unreadable.slice(0, TRAJECTORY_OMISSION_LIMIT)) omissions.push(message);
+      if (unreadable.length > TRAJECTORY_OMISSION_LIMIT) {
+        omissions.push(`trajectory:${record.session.id}:${unreadable.length - TRAJECTORY_OMISSION_LIMIT} more entries could not be read; the entries listed above are only the first few.`);
+      }
+      return { ...record.trajectory, index: filterTrajectoryIndex(record.trajectory.index, retained), details };
     };
     for (const session of sessions) {
+      signal.throwIfAborted();
       const messages = await store.readMessages(session.id);
       const runs = await store.listSessionRuns(session.id);
-      const workspaceFiles = await listWorkspaceFiles(store, session.id, true);
+      const workspaceFiles = await (preview?.workspaceListings
+        ? previewWorkspaceListing(preview.workspaceListings, store, session.id)
+        : listWorkspaceFiles(store, session.id, true));
       const workspace = [];
       const workspaceProvenance = [];
       for (const file of workspaceFiles) {
         const provenance = store.getWorkspaceFileProvenance(session.id, file.path);
         if (provenance) workspaceProvenance.push(provenance);
         // A size preview needs metadata, not every workspace payload or its checksum.
-        // Unknown hashes get a preview-only identity. For a real export the payload bytes
-        // are read after the retained files are known, so a deselected file is never read.
-        const objectPath = previewObjectSizes
-          ? addPreviewObject(provenance?.currentRevision.contentHash ?? sha256(Buffer.from(JSON.stringify([session.id, file.path, file.modifiedAt, file.size]))), file.size, "evidence")
-          : "";
+        // When the file has a provenance revision the address is already known, so the
+        // preview can name the object the writer will emit. A file with no revision has
+        // no address yet — the exporter hashes it as it copies — so it contributes its
+        // size without inventing an identity: a preview that names an address no export
+        // can write counts an entry the archive never carries (#1216 review 4).
+        const revision = provenance?.currentRevision;
+        const known = revision?.contentHash;
+        let objectPath = "";
+        if (previewObjectSizes) {
+          if (known) {
+            addPreviewObject(known, file.size, "evidence");
+            objectPath = known;
+          } else preview!.unpinnedObjectBytes.push(file.size);
+        }
         workspace.push({ ...file, objectPath });
       }
       const validations = {
@@ -328,7 +618,7 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
       };
       const history = await exportHistory(store, session.id);
       const runEvents = await Promise.all(runs.map(async (run) => ({ runId: run.id, streams: await store.exportRunStreams(session.id, run.id) })));
-      const view = await sessionTrajectory(store, session.id, new AbortController().signal);
+      const view = await sessionTrajectory(store, session.id, signal);
       trajectoryViews.set(session.id, view);
       const trajectory: PackageTrajectory = { index: view.index, details: [], runIds: runs.map((run) => run.id) };
       sessionRecords.push({
@@ -341,10 +631,15 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
     for (const artifact of artifacts) {
       for (const version of artifact.versions) {
         try {
-          artifactObjectPaths.set(version.id, previewObjectSizes
+          const artifactPath = previewObjectSizes
             ? addPreviewObject(version.content.hash, version.content.size, "artifact")
-            : await addObject(await provenanceRecorder.cas.read(version.content.hash), "artifact"));
+            : streamObjects ? await addObjectSource(version.content.hash, "artifact")
+              : await addObject(await provenanceRecorder.cas.read(version.content.hash), "artifact");
+          // A missing lazy source already recorded its omission; the version then keeps
+          // no objectPath rather than pointing at an address the package will not carry.
+          if (artifactPath) artifactObjectPaths.set(version.id, artifactPath);
         } catch (error) {
+          if (isIntegrityFailure(error)) throw integrityRefusal();
           omissions.push(`artifact:${version.id}:${error instanceof Error ? error.message : "unreadable"}`);
         }
       }
@@ -357,6 +652,42 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
     if (memoryGraphEnabled()) {
       try { memoryGraph = await memoryGraphClient.exportSnapshot(sessions.map((session) => session.id)); }
       catch { omissions.push("Scientific memory could not be exported because the memory graph service is unavailable."); }
+    }
+    // Evolve runs are part of the session's content, not derived data: without
+    // them an imported session shows the candidate files with no search behind
+    // them (#1019). A broken run store must not abort an export, so it costs the
+    // runs only — the same way an unavailable memory graph costs the graph.
+    let evolveRuns: Awaited<ReturnType<typeof exportEvolveRuns>> = { runs: [], truncated: 0 };
+    try {
+      evolveRuns = await exportEvolveRuns(evolutionStore, sessions.map((session) => session.id));
+    } catch {
+      omissions.push("Evolution (evolve) search runs could not be read while exporting; the package does not carry them.");
+    }
+    if (evolveRuns.truncated > 0) {
+      omissions.push(`Evolution (evolve) search runs were capped at ${MAX_RUNS}: ${evolveRuns.truncated} older runs are not carried.`);
+    }
+    const evolveCandidateSources: Array<{ hash: string; objectPath: string; runId: string }> = [];
+    for (const { run } of evolveRuns.runs) {
+      try {
+        const listed = await evolveCandidates.list(run.id);
+        // The run says it produced candidates, so an empty list means the files
+        // are gone (pruned, unreadable, or a digest that no longer matches its
+        // name) rather than that there is nothing to carry. Say so here, where
+        // the reason is still known, instead of leaving the receipt to guess
+        // from an empty array (#1136 review 2).
+        if (!listed.length && run.candidates > 0) {
+          omissions.push(`evolve:${run.id}:candidate source files are no longer on disk; this run's ${run.candidates} candidate(s) are carried as references without their source.`);
+        }
+        for (const candidate of listed) {
+          const bytes = Buffer.from(candidate.source, "utf8");
+          const objectPath = previewObjectSizes
+            ? addPreviewObject(sha256(bytes), bytes.byteLength, "log")
+            : await addObject(bytes, "log");
+          evolveCandidateSources.push({ hash: candidate.hash, objectPath, runId: run.id });
+        }
+      } catch {
+        omissions.push(`evolve:${run.id}:candidate source files could not be read while exporting.`);
+      }
     }
     const inheritedMemorySummary = sessions.map((session) => session.researchSnapshot?.scientificMemorySummary).find((summary): summary is ScientificMemorySummary => Boolean(summary));
     const availableMemoryGraph = memoryGraph?.nodes.length === 0 && inheritedMemorySummary ? undefined : memoryGraph;
@@ -416,7 +747,8 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
       const runIds = new Set(runs.map((run) => run.id));
       const history = necessaryHistory(record, turnIds, executionIds, reviewIds);
       const agentIds = new Set([`main:${record.session.id}`, ...(history.subagents ?? []).map((child) => `subagent:${child.id}`)]);
-      const trajectory = trimTrajectory(await hydrateTrajectory(record, necessaryTrajectoryEntries(record.trajectory, runIds)), runIds);
+      const selectedEntries = necessaryTrajectoryEntries(record.trajectory, runIds).filter(entry => agentIds.has(entry.agentId));
+      const trajectory = trimTrajectory(await hydrateTrajectory(record, selectedEntries, true), runIds);
       trajectory.index.agents = trajectory.index.agents.filter((agent) => agentIds.has(agent.id));
       trajectory.index.entries = trajectory.index.entries.filter((entry) => agentIds.has(entry.agentId));
       trajectory.index.untimedEntries = trajectory.index.untimedEntries?.filter((entry) => agentIds.has(entry.agentId));
@@ -431,9 +763,12 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
         const retained: typeof record.workspace = [];
         for (const file of record.workspace) {
           try {
-            file.objectPath = await addObject(await readFile(resolveWorkspaceFile(store.workspacePath(record.session.id), file.path)), "evidence");
+            const absolute = resolveWorkspaceFile(store.workspacePath(record.session.id), file.path);
+            file.objectPath = streamObjects ? await addFileSource(absolute, "evidence")
+              : await addObject(await readFile(absolute), "evidence");
             retained.push(file);
           } catch (error) {
+            if (isIntegrityFailure(error)) throw integrityRefusal();
             omissions.push(`workspace:${record.session.id}:${file.path}:${error instanceof Error ? error.message : "unreadable"}`);
           }
         }
@@ -461,28 +796,58 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
     if (level === "necessary") omissions.push("必要导出保留当前结果及依赖证据；不包含完整历史版本、思考分片和原始事件流。直接溯源引用的执行代码和日志保留原文，其余历史执行默认不带。继续研究仅复制本包已有内容。");
     const usedEnvironments = new Set(selectedSessionRecords.flatMap((record) => [...(record.executionRuns ?? []), ...(record.shellExecutions ?? []).flatMap((row) => row.result ? [row.result] : [])].flatMap((run) => run.environmentRevisionId ? [run.environmentRevisionId] : [])));
     const environmentRevisions = store.listEnvironmentRevisions().filter((revision) => usedEnvironments.has(revision.id));
-    const needed = new Set([...selectedSessionRecords.flatMap((record) => record.workspace.map((file) => file.objectPath)), ...selectedArtifacts.flatMap((artifact) => artifact.versions.flatMap((version) => version.objectPath ? [version.objectPath] : [])), ...casHashes({ sessionRecords: selectedSessionRecords, environmentRevisions, memoryGraph: packageMemoryGraph })]);
+    const needed = new Set([...selectedSessionRecords.flatMap((record) => record.workspace.map((file) => file.objectPath)), ...selectedArtifacts.flatMap((artifact) => artifact.versions.flatMap((version) => version.objectPath ? [version.objectPath] : [])), ...evolveCandidateSources.map((source) => source.objectPath), ...casHashes({ sessionRecords: selectedSessionRecords, environmentRevisions, memoryGraph: packageMemoryGraph }), ...(preview?.hashes ?? [])]);
     for (const hash of objects.keys()) if (!needed.has(hash)) objects.delete(hash);
     for (const hash of needed) {
+      signal.throwIfAborted();
       if (objects.has(hash)) continue;
-      try { await addObject(await provenanceRecorder.cas.read(hash), "log"); }
-      catch { omissions.push(`cas:${hash}:unavailable source object`); }
+      try {
+        if (previewObjectSizes) {
+          let size = 0;
+          for await (const chunk of provenanceRecorder.cas.stream(hash)) { signal.throwIfAborted(); size += chunk.byteLength; }
+          addPreviewObject(hash, size, "log");
+        } else if (streamObjects) await addObjectSource(hash, "log");
+        else await addObject(await provenanceRecorder.cas.read(hash), "log");
+      }
+      catch (error) {
+        if (isIntegrityFailure(error)) throw integrityRefusal();
+        signal.throwIfAborted();
+        omissions.push(`cas:${hash}:unavailable source object`);
+      }
     }
     const versions = new VersionStore(store.dataDir);
     const versionObjects = new Map<string, ReturnType<typeof versionRefs>[number]>();
-    const pending = versionRefs(selectedSessionRecords);
+    const pending = [...versionRefs(selectedSessionRecords), ...(preview?.refs.values() ?? [])];
     while (pending.length) {
+      signal.throwIfAborted();
       const ref = pending.shift()!;
       const key = `${ref.pool}:${ref.digest}`;
       if (versionObjects.has(key)) continue;
       versionObjects.set(key, ref);
       try {
+        // A JSON object is read anyway: its nested refs are discovered by parsing it. Anything
+        // else only contributes a byte count, which its reference already carries — so the preview
+        // asks for the stored size instead of reading and verifying the whole object (#1140 §7.6).
+        if (previewObjectSizes && !ref.mediaType.includes("json")) {
+          const size = await versions.storedSize(ref);
+          if (size === undefined) throw new Error("version object is not stored");
+          addPreviewObject(ref.digest.slice(7), size, "log");
+          continue;
+        }
+        // Version objects are still read whole here: making them lazy changes which
+        // objects a package carries, and the preview/actual parity case rejects the
+        // naive version (#1216 F2, tracked separately).
         const bytes = await versions.read(ref);
-        await addObject(bytes, "log");
+        if (previewObjectSizes) addPreviewObject(ref.digest.slice(7), bytes.byteLength, "log");
+        else await addObject(bytes, "log");
         if (ref.mediaType.includes("json")) {
           try { pending.push(...versionRefs(JSON.parse(bytes.toString("utf8")))); } catch { /* Opaque evidence remains byte-exact. */ }
         }
-      } catch { omissions.push(`version:${key}:unavailable source object`); }
+      } catch (error) {
+        if (isIntegrityFailure(error)) throw integrityRefusal();
+        signal.throwIfAborted();
+        omissions.push(`version:${key}:unavailable source object`);
+      }
     }
     return {
       source: { projectId, title: project.name, sessionIds: sessions.map((item) => item.id) },
@@ -492,6 +857,7 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
         exportLevel: level, exportProfile,
         project: { ...project, settingsOverrides: undefined }, sessions: selectedSessionRecords, artifacts: selectedArtifacts,
         environmentRevisions, versionObjects: [...versionObjects.values()],
+        ...(evolveRuns.runs.length ? { evolve: { runs: evolveRuns.runs, candidates: evolveCandidateSources } } : {}),
         ...(packageMemoryGraph ? { memoryGraph: packageMemoryGraph } : {}),
         ...(memoryGraphSummary ? { memoryGraphSummary } : {}),
       },
@@ -505,9 +871,30 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
     };
   };
 
-  const exportPreviews = new ResearchExportPreviews(previewRevision, async ({ projectId, sessionId, level, selectedFiles, includeFullTrajectory, includeFullMemoryGraph }, revision) => {
-      const objectSizes = new Map<string, number>();
-      const input = await buildResearchPackageInput(projectId, sessionId, level, selectedFiles, undefined, objectSizes, includeFullTrajectory, includeFullMemoryGraph);
+  // One trajectory walk per (revision, session), shared by the two profiles that
+  // ask for the full trajectory. Entries are measurements, not the details
+  // themselves, and the whole map is dropped as soon as evidence moves on.
+  const trajectorySizing = new Map<string, { revision: string; bySession: Map<string, TrajectorySizingEntry[]> }>();
+  const trajectorySizingFor = (revision: string): Map<string, TrajectorySizingEntry[]> => {
+    const current = trajectorySizing.get("current");
+    if (current && current.revision === revision) return current.bySession;
+    const bySession = new Map<string, TrajectorySizingEntry[]>();
+    trajectorySizing.clear();
+    trajectorySizing.set("current", { revision, bySession });
+    return bySession;
+  };
+  const exportPreviews = new ResearchExportPreviews(previewRevision, async ({ projectId, sessionId, level, selectedFiles, includeFullTrajectory, includeFullMemoryGraph }, revision, signal, scope) => {
+      // `defaults()` owns this map for its five profiles (#1140 §7.8). Keying it on the
+      // revision was wrong: the first profile's reconcile writes the very provenance
+      // rows the revision digests, so the request's own work moved the revision and
+      // dropped the listing for every profile after it. A standalone preview gets a
+      // throwaway map, which is the same behaviour as before the sharing existed.
+      const workspaceListings = (scope ?? new Map()) as PreviewWorkspaceListings;
+      const preview: PreviewSizing = { objectSizes: new Map(), additionalRecordBytes: 0, unpinnedObjectBytes: [], hashes: new Set(), refs: new Map(),
+        jsonSizes: new WeakMap(), casVisited: new WeakSet(), refsVisited: new WeakSet(),
+        trajectorySizing: includeFullTrajectory ? trajectorySizingFor(revision) : undefined,
+        workspaceListings };
+      const input = await buildResearchPackageInput(projectId, sessionId, level, selectedFiles, undefined, preview, includeFullTrajectory, includeFullMemoryGraph, signal);
       const records = input.records as { sessions?: Array<{ session: { id: string }; workspace?: Array<{ path: string }> }> };
       if (sessionId && level === "necessary" && !selectedFiles) {
         previewDependencies.set(sessionId, new Set(records.sessions?.map((record) => record.session.id)));
@@ -515,22 +902,35 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
       }
       const selectedPaths = new Set(records.sessions?.find((record) => record.session.id === sessionId)?.workspace?.map((file) => file.path));
       return {
-        revision, estimatedBytes: estimateResearchPackageBytes(input, objectSizes), estimateKind: "uncompressed" as const,
-        files: sessionId ? (await listWorkspaceFiles(store, sessionId, true)).map((file) => ({ ...file, selected: selectedPaths.has(file.path) })) : [],
+        revision, estimatedBytes: estimateResearchPackageBytes(input, preview.objectSizes, preview.additionalRecordBytes, preview.unpinnedObjectBytes), estimateKind: "uncompressed" as const,
+        // The cap and the exact tar size the export would be refused on. Both are
+        // additive: a client that ignores them keeps the old behaviour, and a client
+        // that uses them gates on the quantity the exporter itself checks rather than
+        // on the approximation above (they differ by a few percent either way).
+        maxBytes: RESEARCH_PACKAGE_MAX_BYTES,
+        archiveBytes: researchPackageArchiveBytes(input, preview.objectSizes, preview.additionalRecordBytes, preview.unpinnedObjectBytes),
+        files: sessionId ? (await (preview.workspaceListings
+          ? previewWorkspaceListing(preview.workspaceListings, store, sessionId)
+          : listWorkspaceFiles(store, sessionId, true))).map((file) => ({ ...file, selected: selectedPaths.has(file.path) })) : [],
         exportProfile: input.exportProfile, omissions: [...(input.omissions ?? [])],
       };
   }, async (_projectId, sessionId) => !(await store.listSessionRuns(sessionId))
     .some((run) => run.status === "queued" || run.status === "running" || run.status === "blocked"));
   const previewResearchPackage = (projectId: string, sessionId: string | undefined, level: "necessary" | "complete", selectedFiles?: Set<string>, includeFullTrajectory = true, includeFullMemoryGraph = true) =>
     exportPreviews.get({ projectId, sessionId, level, selectedFiles, includeFullTrajectory, includeFullMemoryGraph });
-  const packageExports = new ResearchPackageExports(resolve(store.dataDir, "research-package-exports"), previewRevision, async (options: ResearchPackageExportOptions) => {
+  const packageExports = new ResearchPackageExports(resolve(store.dataDir, "research-package-exports"), previewRevision, async (options: ResearchPackageExportOptions, destination) => {
     const input = await buildResearchPackageInput(options.projectId, options.sessionId, options.level,
       options.selectedFiles ? new Set(options.selectedFiles) : undefined, undefined, undefined,
-      options.includeFullTrajectory, options.includeFullMemoryGraph);
-    return (await createResearchPackageAsync(input)).bytes;
+      options.includeFullTrajectory, options.includeFullMemoryGraph, undefined, { streamObjects: true });
+    // An acknowledged over-cap export may use the safe ceiling; nothing beyond it.
+    // Streaming writes tar → gzip → the task's file, so neither whole archive buffer
+    // is ever resident (#1152 stage 2).
+    await writeResearchPackage(input, destination,
+      options.allowOverCap ? RESEARCH_PACKAGE_MAX_MAX_BYTES : RESEARCH_PACKAGE_MAX_BYTES);
   });
 
-  const restorePackage = async (projectId: string, sessionId: string | undefined, bytes: Buffer, options: { operationId: string; sourceSessionId?: string; sourceMessageId?: string; imported?: ImportedResearchPackage }) => {
+  const restorePackage = async (projectId: string, sessionId: string | undefined, source: Buffer | ImportedPackageSource, options: { operationId: string; sourceSessionId?: string; sourceMessageId?: string }) => {
+    const pkg: ImportedPackageSource = Buffer.isBuffer(source) ? { bytes: source } : source;
     const operationId = options.operationId;
     const role = options.sourceSessionId ? "research_copy" as const : "imported_snapshot" as const;
     const restoredSessionIds: string[] = [];
@@ -545,7 +945,7 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
           throw new SessionStoreHttpError("Session not found", 404);
         }
         if (sessionId) store.assertSessionWritable(sessionId);
-        const imported = options.imported ?? researchPackageProvider.importReadOnly(bytes);
+        const imported = pkg.imported ?? researchPackageProvider.importReadOnly(pkg.bytes ?? await readFile(pkg.packageFile!));
         snapshot = { operationId, role, state: "importing", createdAt, sessionIds: restoredSessionIds,
           packageChecksum: imported.receipt.packageChecksum, sourceSnapshotSessionId: options.sourceSessionId,
           exportLevel: imported.manifest.exportProfile?.level,
@@ -595,13 +995,14 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
         await writeFile(resolve(root, "README.md"), imported.readme, { flag: "wx" }).catch((error: NodeJS.ErrnoException) => {
           if (error.code !== "EEXIST") throw error;
         });
-        const importedObjects = [...imported.objects];
-        for (let offset = 0; offset < importedObjects.length; offset += 16) {
-          await Promise.all(importedObjects.slice(offset, offset + 16).map(async ([hash, object]) => {
-            await writeFile(resolve(root, "objects", hash), object, { flag: "wx" }).catch((error: NodeJS.ErrnoException) => {
-              if (error.code !== "EEXIST") throw error;
-            });
-          }));
+        // One object at a time: the map can be directory-backed, where a spread would
+        // read every object into memory before the first write (#1200 review 1).
+        for (const hash of imported.objects.keys()) {
+          const object = imported.objects.get(hash);
+          if (!object) continue;
+          await writeFile(resolve(root, "objects", hash), object, { flag: "wx" }).catch((error: NodeJS.ErrnoException) => {
+            if (error.code !== "EEXIST") throw error;
+          });
         }
         const receipt = {
           ...imported.receipt,
@@ -630,10 +1031,14 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
           sessions?: PackageSessionRecord[];
           artifacts?: PackageArtifact[];
           environmentRevisions?: EnvironmentRevision[];
+          evolve?: unknown;
           memoryGraph?: MemoryGraphSnapshot;
           memoryGraphSummary?: ScientificMemorySummary;
           versionObjects?: ReturnType<typeof versionRefs>;
         };
+        /** Source run id -> restored run id; filled by the evolve restore and
+         *  read by the artifact pass, which runs after the session loop. */
+        const evolveRunIdMap = new Map<string, string>();
         const sourceSessions = Array.isArray(records.sessions) ? records.sessions : [];
         const targetBySource = new Map<string, string>();
         const omissions = [...imported.receipt.omissions];
@@ -643,9 +1048,12 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
         // to report the searches themselves as not carried: a package from a
         // session that never ran one has no such loss, and saying so for every
         // import would make the omission list untrustworthy (#1019 review F1).
+        const carriedEvolveRuns = packagedEvolveRuns(records.evolve);
         const ranEvolve = packageRanEvolve(records.artifacts);
-        if (ranEvolve && !omissions.some((item) => item.includes("does not carry evolution (evolve) search runs"))) {
+        if (ranEvolve && !carriedEvolveRuns && !omissions.some((item) => item.includes("does not carry evolution (evolve) search runs"))) {
           omissions.push("This package does not carry evolution (evolve) search runs: their candidate trees, scores and budgets are not restored. Re-run the search at the source, or export again from a version that includes them.");
+        } else if (carriedEvolveRuns && packageCarriesEvolveCandidates(records.evolve) && !packageCarriesEvolveCandidateSources(records.evolve) && !omissions.some((item) => item.includes("candidate source"))) {
+          omissions.push("Evolution (evolve) candidate source files are not carried in this package: their candidates are restored as references without the source code.");
         }
         if (!records.memoryGraph && !records.memoryGraphSummary) omissions.push("This package contains no scientific memory snapshot; export it again from the source with the updated version to restore scientific memory.");
         else if (!records.memoryGraph && records.memoryGraphSummary) omissions.push("This package contains a scientific memory summary, not the full graph; its nodes and relationships cannot be restored.");
@@ -660,15 +1068,18 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
           ids.id(artifact.id);
           for (const version of artifact.versions ?? []) ids.id(version.id);
         }
-        // CAS addresses are content identities and remain stable across imports.
-        const casObjects = [...imported.objects.values()];
-        for (let offset = 0; offset < casObjects.length; offset += 16) {
-          await Promise.all(casObjects.slice(offset, offset + 16).map((object) => provenanceRecorder.cas.put(Buffer.from(object))));
+        // CAS addresses are content identities and remain stable across imports. Put one
+        // object at a time: a directory-backed map would materialise the whole package.
+        for (const hash of imported.objects.keys()) {
+          const object = imported.objects.get(hash);
+          // Hand the buffer over as it is: a directory-backed object is already a Buffer,
+          // and copying it would double the peak for this object (#1200 review 2, optional).
+          if (object) await provenanceRecorder.cas.put(Buffer.isBuffer(object) ? object : Buffer.from(object));
         }
         const versions = new VersionStore(store.dataDir);
         for (const ref of records.versionObjects ?? []) {
           const object = imported.objects.get(ref.digest.slice(7));
-          if (object) await versions.put(ref.pool, Buffer.from(object), ref.mediaType);
+          if (object) await versions.put(ref.pool, Buffer.isBuffer(object) ? object : Buffer.from(object), ref.mediaType);
         }
         const environmentRevisions = (records.environmentRevisions ?? []).map((revision) => ({
           ...revision, id: ids.id(revision.id), environmentId: ids.id(revision.environmentId),
@@ -717,16 +1128,31 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
               omissions.push(`run:${run.id}:${error instanceof Error ? error.message : "restore failed"}`);
             }
           }
-          const workspaceFiles = (source?.workspace ?? []).flatMap((file) => {
+          // Names only: the earlier version read every workspace object here, so a whole
+          // session's workspace was resident before the first file was written (#1211 F1).
+          // A legacy package leaves `objectPath` off the records row and only names it in
+          // the manifest, so both are consulted; without that the file was neither
+          // restored nor reported.
+          const manifestWorkspaceObjects = new Map<string, string>();
+          for (const file of (imported.manifest.source as { workspace?: Array<{ path?: string; objectPath?: string }> }).workspace ?? []) {
             const objectPath = file.objectPath?.replace(/^objects\//, "");
-            const object = objectPath ? imported.objects.get(objectPath) : undefined;
-            if (!object) {
-              omissions.push(`workspace:${target.id}:${file.path}:missing object`);
-              return [];
-            }
-            return [{ file, object }];
+            if (file.path && objectPath) manifestWorkspaceObjects.set(file.path, objectPath);
+          }
+          const workspaceEntries = (source?.workspace ?? []).flatMap((file) => {
+            const objectPath = file.objectPath?.replace(/^objects\//, "") ?? manifestWorkspaceObjects.get(file.path);
+            return objectPath ? [{ file, objectPath }] : [];
           });
-          if (workspaceFiles.length) {
+          // Every unresolved entry is an omission, even when none resolves: a package whose
+          // workspace digests the archive does not carry must be refused by the fatal
+          // omission rule, not silently import an empty workspace. Gating the omission
+          // push on "some object is present" lost that case (#1216 review 2).
+          const presentObjects = new Set(workspaceEntries
+            .filter((entry) => imported.objects.has(entry.objectPath))
+            .map((entry) => entry.objectPath));
+          for (const { file, objectPath } of workspaceEntries) {
+            if (!presentObjects.has(objectPath)) omissions.push(`workspace:${target.id}:${file.path}:missing object`);
+          }
+          if (presentObjects.size) {
             const workspaceRoot = store.workspacePath(target.id);
             // Acquire the workspace mutation lease once per restored session.
             // Large evidence packages often contain many files; taking the
@@ -734,7 +1160,11 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
             // import time grow linearly with avoidable transaction overhead.
             await withWorkspaceMutation(new VersionStore(store.dataDir), workspaceRoot, async () => {
               const revisions: Array<Parameters<typeof store.recordWorkspaceFileRevisions>[1][number]> = [];
-              for (const { file, object } of workspaceFiles) {
+              for (const { file, objectPath } of workspaceEntries) {
+                const object = imported.objects.get(objectPath);
+                // The pre-pass above already recorded this entry's omission; reading can
+                // still fail if the unpacked file vanished, which throws instead.
+                if (!object) continue;
                 const targetPath = resolveWorkspaceFile(workspaceRoot, file.path);
                 await mkdir(dirname(targetPath), { recursive: true });
                 await writeFile(targetPath, object);
@@ -757,8 +1187,51 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
             }, { kind: "research-package-import" });
           }
           if (source) await restoreHistory(store, target.id, source, ids);
+          const packedEvolve = packageEvolveRunsFor(records.evolve, source?.session?.id);
+          if (packedEvolve.length) {
+            const restoredEvolve = await restoreEvolveRuns(evolutionStore, { projectId, sessionId: target.id }, { runs: packedEvolve });
+            // A colliding run gets a fresh id; its result artifact has to carry
+            // that id, because `get_evolve_run` recomputes the artifact name from
+            // the restored run (#1176 review F3).
+            for (const [sourceRunId, restoredRunId] of restoredEvolve.runIds) {
+              evolveRunIdMap.set(sourceRunId, restoredRunId);
+            }
+            omissions.push(...restoredEvolve.omissions);
+            const restoredRunIds = new Set(restoredEvolve.runIds.keys());
+            for (const candidate of packageEvolveCandidateSourcesFor(records.evolve, restoredRunIds)) {
+              const object = imported.objects.get(candidate.objectPath.replace(/^objects\//, ""));
+              if (!object) {
+                omissions.push(`evolve:${candidate.runId}:${candidate.hash}:missing candidate source object`);
+                continue;
+              }
+              if (!await evolveCandidates.write(restoredEvolve.runIds.get(candidate.runId)!, candidate.hash, Buffer.from(object).toString("utf8"))) {
+                omissions.push(`evolve:${candidate.runId}:${candidate.hash}:invalid candidate source record`);
+              }
+            }
+          }
         }
 
+        /** Rewrites the `evolve/<run>/` prefix of an artifact name when that run
+         *  was restored under a fresh id. */
+        const remapEvolveName = (value: string): string => {
+          if (!value) return value;
+          const match = /^evolve\/([^/]+)\//.exec(value);
+          if (!match) return value;
+          // The published prefix is the run id's first 8 characters.
+          const sourcePrefix = match[1]!;
+          let mapped: string | undefined;
+          for (const [sourceRunId, restoredRunId] of evolveRunIdMap) {
+            if (sourceRunId.slice(0, 8) === sourcePrefix) { mapped = restoredRunId; break; }
+          }
+          if (!mapped || mapped.slice(0, 8) === sourcePrefix) return value;
+          return value.replace(`evolve/${sourcePrefix}/`, `evolve/${mapped.slice(0, 8)}/`);
+        };
+        const remapEvolveMeta = (meta: ArtifactOriginMeta | undefined): ArtifactOriginMeta | undefined => {
+          if (!meta) return meta;
+          const id = meta.evolveRunId;
+          const mapped = typeof id === "string" ? evolveRunIdMap.get(id) : undefined;
+          return mapped && mapped !== id ? { ...meta, evolveRunId: mapped } : meta;
+        };
         const artifactIdMap = new Map<string, string>();
         const versionIdMap = new Map<string, string>();
         for (const artifact of Array.isArray(records.artifacts) ? records.artifacts : []) {
@@ -786,14 +1259,14 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
               executionRunIds: version.executionRunIds.map((id) => ids.id(id)),
               inputArtifactVersionIds: dependencies,
               kind: artifact.kind,
-              logicalName: artifact.logicalName || artifact.name,
+              logicalName: remapEvolveName(artifact.logicalName || artifact.name),
               mediaType: version.mediaType,
               origin: artifact.origin,
-              originMeta: artifact.originMeta,
+              originMeta: remapEvolveMeta(artifact.originMeta),
               references: remapReferences(version.references, ids, projectId) ?? [],
               restorationIds: { artifactId: ids.id(artifact.id), versionId: ids.id(version.id) },
               sessionId: targetBySource.get(version.sessionId) ?? targetSessionId,
-              sourcePath: version.sourcePath,
+              sourcePath: version.sourcePath === undefined ? undefined : remapEvolveName(version.sourcePath),
               title: artifact.title,
               turnId: ids.optional(version.turnId),
               forceNewArtifact: true,
@@ -895,7 +1368,8 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
           && !item.startsWith("This package contains no scientific memory snapshot")
           && isFatalRestoreOmission(item));
         if (options.sourceSessionId && restoreFailures.length) throw new Error(`研究记录复制未完整恢复：${restoreFailures.join("; ")}`);
-        let frozenBytes: Uint8Array = bytes;
+        let frozenBytes: Uint8Array | undefined = pkg.bytes;
+        let frozenFile: string | undefined = pkg.packageFile;
         let frozenChecksum = imported.receipt.packageChecksum;
         if (options.sourceSessionId) {
           const captured = await buildResearchPackageInput(projectId, undefined, "complete", undefined, new Set(restoredSessionIds));
@@ -904,17 +1378,19 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
           if (records.memoryGraph && !(captured.records as { memoryGraph?: MemoryGraphSnapshot }).memoryGraph) {
             throw new Error("无法核对已恢复的科学记忆，请检查图谱服务后重新导入。");
           }
-          verifyResearchCopy(imported.records, captured.records, ids, targetBySource, projectId);
+          verifyResearchCopy(imported.records, captured.records, ids, targetBySource, projectId, evolveRunIdMap);
           // Internal capture preserves every restored record; it must not relabel a necessary package as complete.
           const sourceProfile = imported.manifest.exportProfile;
           const frozen = researchPackageProvider.export({ ...captured, omissions, exportProfile: sourceProfile,
             records: { ...captured.records as Record<string, unknown>, exportLevel: sourceProfile?.level, exportProfile: sourceProfile } });
           frozenBytes = frozen.bytes;
+          frozenFile = undefined;
           frozenChecksum = frozen.receipt.packageChecksum;
         }
-        // A read-only import already has an immutable, checksummed package.
-        // Reusing its bytes avoids rebuilding and recompressing a large archive.
-        await writeFile(resolve(root, "snapshot.sdresearch"), frozenBytes, { flag: "wx" });
+        // A read-only import already has an immutable, checksummed package on disk:
+        // copying it keeps the snapshot byte-identical without holding it in memory.
+        if (frozenFile) await copyFile(frozenFile, resolve(root, "snapshot.sdresearch"), fsConstants.COPYFILE_EXCL);
+        else await writeFile(resolve(root, "snapshot.sdresearch"), frozenBytes!, { flag: "wx" });
         const continuationAvailable = restoreFailures.length === 0;
         const result = {
           ...imported.receipt,
@@ -948,11 +1424,11 @@ export function createResearchSnapshots({ store, memoryGraphClient, memoryGraphE
   };
 
   const activeImports = new Set<string>();
-  const persistImportedResearchPackage = async (projectId: string, sessionId: string | undefined, bytes: Buffer, imported?: ImportedResearchPackage) => {
+  const persistImportedResearchPackage = async (projectId: string, sessionId: string | undefined, source: Buffer | ImportedPackageSource) => {
     const key = sessionId ?? projectId;
     if (activeImports.has(key)) throw new SessionStoreHttpError("Research package import is already in progress", 409);
     activeImports.add(key);
-    try { return await restorePackage(projectId, sessionId, bytes, { operationId: randomUUID(), imported }); }
+    try { return await restorePackage(projectId, sessionId, source, { operationId: randomUUID() }); }
     finally { activeImports.delete(key); }
   };
   const continuations = createContinuationOperations({ store, memoryGraphClient }, restorePackage,

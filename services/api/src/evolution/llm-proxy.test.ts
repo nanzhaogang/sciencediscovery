@@ -146,6 +146,45 @@ test("a run token buys exactly one run's completions and nothing else", async ()
   assert.equal(recorded[0]?.usageStatus, "reported");
 });
 
+test("every proxied completion of one run keeps its own ledger identity", async () => {
+  // The ledger's idempotency key is
+  // (sessionId, invocationId, invocationKind, attemptIndex), so a run-scoped
+  // `invocationId` at a constant `attemptIndex` made calls 2..N indistinguishable
+  // from a replay of call 1: an Evolve run recorded 1 row for 73 calls and 0.83%
+  // of its tokens, with nothing logged (#1132). The axis that has to differ per
+  // call is `invocationId`; `runId` is what keeps the spend attributable to the
+  // run.
+  const tokens = new RunTokenRegistry();
+  const { recorded, store } = fakeStore();
+  const { origin } = await mount({
+    fetchImpl: (async () => new Response(JSON.stringify({
+      choices: [{ message: { content: "```python\nprint(1)\n```" } }],
+      usage: { completion_tokens: 40, prompt_tokens: 100, total_tokens: 140 },
+    }), { headers: { "content-type": "application/json" }, status: 200 })) as never,
+    store,
+    tokens,
+  });
+
+  const token = tokens.issue("run-1", "s1", "model-1");
+  for (let call = 0; call < 3; call += 1) {
+    assert.equal((await completion(origin, "run-1", token)).status, 200);
+  }
+
+  assert.equal(recorded.length, 3, "one row per proxied completion, not one per run");
+  // The fake store only records; the real ledger keeps one row per distinct key,
+  // so the number of distinct keys is the number of rows a real session would
+  // hold. That is the quantity the defect made 1 for 73 calls.
+  const keys = new Set(recorded.map((row) => `${row.sessionId}|${row.invocationId}|${row.invocationKind}|${row.attemptIndex}`));
+  assert.equal(keys.size, 3, "each call carries its own ledger identity, so no call is read as a replay");
+  assert.deepEqual(recorded.map((row) => row.runId), ["run-1", "run-1", "run-1"]);
+  assert.deepEqual(recorded.map((row) => row.sessionId), ["s1", "s1", "s1"]);
+  assert.deepEqual([...new Set(recorded.map((row) => row.invocationKind))], ["evolve"]);
+  // The attempt axis stays at the first attempt: these are distinct calls, not
+  // retries of one call, and inventing an attempt index for a call would say
+  // otherwise.
+  assert.deepEqual(recorded.map((row) => row.attemptIndex), [0, 0, 0]);
+});
+
 test("no token, a wrong token and a revoked token are the same answer", async () => {
   const tokens = new RunTokenRegistry();
   const { store } = fakeStore();
@@ -240,6 +279,28 @@ test("the provider's own error is forwarded rather than flattened", async () => 
   // wrong" would make a bad key indistinguishable from a bad prompt.
   assert.equal(response.status, 400);
   assert.match(JSON.stringify(await response.json()), /context length exceeded/);
+  assert.equal(recorded.length, 0, "a failed call is not recorded as spend");
+});
+
+test("a provider 429 forwards its retry delay to the sidecar", async () => {
+  const tokens = new RunTokenRegistry();
+  const { recorded, store } = fakeStore();
+  const { origin } = await mount({
+    fetchImpl: (async () => new Response(
+      JSON.stringify({ error: { type: "rate_limit_exceeded", message: "too many requests" } }),
+      { headers: { "content-type": "application/json", "retry-after": "2" }, status: 429 },
+    )) as never,
+    store,
+    tokens,
+  });
+
+  const response = await completion(origin, "run-1", tokens.issue("run-1", "s1", "model-1"));
+
+  // Issue #1232: the sidecar owns the retry for Idea Tree research, so the
+  // provider's delay must reach it instead of being dropped in the proxy.
+  assert.equal(response.status, 429);
+  assert.equal(response.headers.get("retry-after"), "2");
+  assert.match(JSON.stringify(await response.json()), /too many requests/);
   assert.equal(recorded.length, 0, "a failed call is not recorded as spend");
 });
 

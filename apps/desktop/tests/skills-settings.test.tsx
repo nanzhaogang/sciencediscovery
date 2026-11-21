@@ -35,14 +35,45 @@ Object.defineProperty(globalThis, "document", { configurable: true, writable: tr
   addEventListener() {}, removeEventListener() {},
 } });
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { configurable: true, writable: true, value: true });
-const noChange = () => {};
 const text = (view: ReactTestRenderer) => JSON.stringify(view.toJSON());
 
 async function mount(client: ApiClient): Promise<ReactTestRenderer> {
   let view: ReactTestRenderer | undefined;
-  await act(async () => { view = create(<SkillsSettings adding client={client} onAddingChange={noChange} />); });
+  await act(async () => { view = create(<SkillsSettings client={client} />); });
   assert.ok(view);
   return view;
+}
+
+/**
+ * The authoring form is a page of 技能 now, so the tests that drive its
+ * `onSaved` reach it the way a user does: 添加技能, then 从零开始写.
+ */
+/** A card now opens its own page; the list's controls live behind the back
+ *  control above every page below it. */
+async function backToList(view: ReactTestRenderer): Promise<void> {
+  await act(async () => {
+    const back = view.root.findAllByType("button")
+      .find((node) => node.props["aria-label"] === TEXT.settings.skills.backToList);
+    assert.ok(back, "the page has no back control");
+    back.props.onClick();
+  });
+}
+
+async function openAuthoringForm(view: ReactTestRenderer): Promise<void> {
+  await act(async () => {
+    const trigger = view.root.findAllByType("button")
+      .find((node) => node.props.className?.includes?.("skill-add-trigger"));
+    assert.ok(trigger, "the list has no 添加技能");
+    trigger.props.onClick();
+  });
+  await act(async () => {
+    const item = view.root.findAllByType("button").find((node) => node
+      .findAllByType("strong")
+      .some((label) => label.children.includes(TEXT.settings.skills.addMenu.scratch)));
+    assert.ok(item, "添加技能 does not offer 从零开始写");
+    item.props.onClick();
+  });
+  assert.ok(view.root.findByType(SkillForm), "从零开始写 did not open the authoring form");
 }
 
 for (const backend of ["native", "unavailable"] as const) {
@@ -67,9 +98,11 @@ for (const backend of ["native", "unavailable"] as const) {
         onClick();
       });
       assert.match(text(view), /Review carefully/);
+      await backToList(view);
       stub.reply([skill]);
       if (backend === "native") stub.reply({ backend: "native", skills: [] });
       else stub.fail(new Error("skill adapter unavailable"));
+      await openAuthoringForm(view);
       await act(async () => {
         const onSaved = view.root.findByType(SkillForm).props.onSaved;
         assert.ok(typeof onSaved === "function");
@@ -98,6 +131,7 @@ test("a failed first enable stays visible even when the refreshed catalog is emp
   const view = await mount(stub.asClient());
   try {
     stub.fail(new Error("first enable refused")).reply([]).reply({ backend: "jiuwenswarm", skills: [] });
+    await openAuthoringForm(view);
     await act(async () => {
       const onSaved = view.root.findByType(SkillForm).props.onSaved;
       assert.ok(typeof onSaved === "function");
@@ -105,5 +139,45 @@ test("a failed first enable stays visible even when the refreshed catalog is emp
     });
     assert.match(text(view), /first enable refused/);
     assert.ok(view.root.findAllByProps({ role: "alert" }).length > 0);
+  } finally { await act(async () => { view.unmount(); }); }
+});
+
+test("the search field narrows the installed list", async () => {
+  const other = { ...skill, id: "draft", name: "draft", description: "A different package." };
+  const stub = new StubClient().reply([skill, other]).reply({ backend: "jiuwenswarm", skills: [] });
+  const view = await mount(stub.asClient());
+  try {
+    assert.match(text(view), /Review a draft/);
+    assert.match(text(view), /A different package/);
+    const input = view.root.findAllByType("input")
+      .find((node) => node.props["aria-label"] === TEXT.settings.skills.search);
+    assert.ok(input);
+    await act(async () => { input.props.onChange({ target: { value: "different" } }); });
+    assert.match(text(view), /A different package/);
+    assert.ok(!text(view).includes("Review a draft"), "the non-matching row stayed");
+  } finally { await act(async () => { view.unmount(); }); }
+});
+
+test("bundled skills default on while saved disables and managed defaults remain off", async () => {
+  const bundled = { ...skill, id: "evolve-design", source: "built-in" as const };
+  const disabled = { ...skill, id: "literature-searcher", source: "built-in" as const };
+  const saved = { name: disabled.id, skillId: disabled.id, enabled: false, source: "sciencediscovery" };
+  const catalog = [bundled, disabled, skill];
+  const stub = new StubClient().reply(catalog).reply({ backend: "jiuwenswarm", skills: [saved] });
+  const view = await mount(stub.asClient());
+  try {
+    assert.deepEqual(view.root.findAllByProps({ role: "switch" }).map((node) => node.props["aria-checked"]), [true, false, false]);
+    stub.reply({}).reply(catalog).reply({ backend: "jiuwenswarm", skills: [saved,
+      { name: bundled.id, skillId: bundled.id, enabled: false, source: "sciencediscovery" },
+    ] });
+    await act(async () => {
+      const toggle = view.root.findAllByProps({ role: "switch" })[0];
+      assert.ok(toggle);
+      toggle.props.onClick();
+    });
+    const write = stub.calls.find((call) => call.path.includes("skills-by-id"));
+    assert.equal(write?.path, "/api/jiuwenswarm/skills-by-id/evolve-design");
+    assert.deepEqual(JSON.parse(String(write?.init.body)), { enabled: false });
+    assert.deepEqual(view.root.findAllByProps({ role: "switch" }).map((node) => node.props["aria-checked"]), [false, false, false]);
   } finally { await act(async () => { view.unmount(); }); }
 });

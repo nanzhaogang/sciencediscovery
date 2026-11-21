@@ -4,13 +4,14 @@ import { createTest } from "../../../test/support/tagged/compat.mjs";
 const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:linux", "arch:amd64", "arch:arm64"] });
 import assert from "node:assert/strict";
 import { EventEmitter, once } from "node:events";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import type { AddressInfo } from "node:net";
 import type { TestContext } from "node:test";
-import { createResearchPackage, importResearchPackage, sha256, type ResearchPackageExportProfile } from "@sciencediscovery/research-package";
+import { RESEARCH_PACKAGE_MAX_BYTES, RESEARCH_PACKAGE_MAX_MAX_BYTES, createResearchPackage, importResearchPackage, estimateResearchPackageBytes, researchPackageArchiveBytes, sha256, type ResearchPackageExportProfile } from "@sciencediscovery/research-package";
 import { createApiServer, closeApiServer } from "./http/index.js";
+import type { ApiServerDependencies } from "./http/index.js";
 import { ApiStatusError } from "./http/api-status-error.js";
 import { ResearchExportPreviews } from "./research-export-previews.js";
 import { offlineMcpTransport } from "./mcp/offline-transport.fixture.js";
@@ -21,7 +22,7 @@ import type { ServerConfig } from "./bootstrap/config.js";
 import type { ArtifactVersionProvenance, WorkspaceFileProvenance, SessionRun, AgentShellExecution, SessionRunEvent, ArtifactReviewRun, Claim, EvidenceItem, EvidenceLink } from "@sciencediscovery/schema";
 import type { SessionDetail, ResearchContinuationOperation } from "@sciencediscovery/schema";
 
-async function fixture(context: TestContext, graphAvailable = false, sampleSession = false) {
+async function fixture(context: TestContext, graphAvailable = false, sampleSession = false, dependencies: Partial<ApiServerDependencies> = {}) {
   const root = await mkdtemp(resolve(tmpdir(), "research-package-http-"));
   const snapshots: ReturnType<typeof researchHistoryFixture>["records"]["memoryGraph"][] = [];
   let graphExports = 0;
@@ -54,13 +55,31 @@ async function fixture(context: TestContext, graphAvailable = false, sampleSessi
     workspaceUpload: { maxFileBytes: 1_000_000, maxRequestBytes: 10_000_000, maxWorkspaceBytes: 10_737_418_240 },
     memoryGraph: { url: `http://127.0.0.1:${(graph.address() as AddressInfo).port}`, internalToken: "test" }, evolve: { url: "http://127.0.0.1:1", internalToken: "test" },
   };
-  let server = createApiServer(config, { mcpTransport: offlineMcpTransport });
+  let server = createApiServer(config, {
+    mcpTransport: offlineMcpTransport,
+    // These tests exercise HTTP/package semantics. Use an ample synthetic capacity
+    // so a small CI runner cannot turn the over-cap acknowledgement case into a
+    // 507 before the request reaches the behavior under test; a case that cares
+    // about the charge overrides it through `dependencies`.
+    measureResearchPackageCapacity: async () => ({
+      freeDiskBytes: Number.POSITIVE_INFINITY,
+      freeMemoryBytes: Number.POSITIVE_INFINITY,
+    }),
+    ...dependencies,
+  });
   await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
   context.after(async () => { await closeApiServer(server); await new Promise<void>((done) => graph.close(() => done())); await rm(root, { force: true, recursive: true }); });
   let origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const restart = async () => {
     await closeApiServer(server);
-    server = createApiServer(config, { mcpTransport: offlineMcpTransport });
+    server = createApiServer(config, {
+      mcpTransport: offlineMcpTransport,
+      measureResearchPackageCapacity: async () => ({
+        freeDiskBytes: Number.POSITIVE_INFINITY,
+        freeMemoryBytes: Number.POSITIVE_INFINITY,
+      }),
+      ...dependencies,
+    });
     await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
     origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   };
@@ -83,6 +102,80 @@ async function fixture(context: TestContext, graphAvailable = false, sampleSessi
 
 const date = "2026-10-20T10:00:00.000Z";
 
+test("incremental previews match exported evidence and profile sizes", async (context) => {
+  const { request, project } = await fixture(context, true);
+  const target = await project();
+  const historical = researchTrajectoryFixture();
+  await request(`/api/projects/${target.id}/research-package/import?sessionId=${target.firstSession.id}`, { method: "POST", body: Buffer.from(historical.bytes) });
+  for (const level of ["necessary", "complete"]) for (const trajectory of [false, true]) for (const memory of [false, true]) {
+    const query = `sessionId=${target.firstSession.id}&level=${level}&includeFullTrajectory=${Number(trajectory)}&includeFullMemoryGraph=${Number(memory)}`;
+    const base = `/api/projects/${target.id}/research-package`;
+    const preview = await (await request(`${base}/preview?${query}`)).json() as {
+      estimatedBytes: number; maxBytes?: number; archiveBytes?: number };
+    const exported = importResearchPackage(new Uint8Array(await (await request(`${base}?${query}`)).arrayBuffer()));
+    const exportedInput = {
+      source: exported.manifest.source, records: exported.records, readme: Buffer.from(exported.readme).toString(),
+      omissions: exported.manifest.omissions, exportProfile: exported.manifest.exportProfile,
+      objects: [...exported.objects].map(([path, bytes]) => ({ path, bytes })),
+    };
+    assert.equal(preview.estimatedBytes, estimateResearchPackageBytes(exportedInput), query);
+    // The dialog gates on these two fields: the shared cap, and the exact tar size
+    // the exporter refuses on (which is not the same number as the estimate above).
+    assert.equal(preview.maxBytes, RESEARCH_PACKAGE_MAX_BYTES, query);
+    assert.equal(preview.archiveBytes, researchPackageArchiveBytes(exportedInput), query);
+    // A package this fixture just exported cannot be over its own cap: a mismatch
+    // here would mean the dialog refuses work the server would happily do.
+    assert.ok(preview.archiveBytes! <= preview.maxBytes!, query);
+  }
+});
+
+test("an absent object is an omission while a corrupt one fails the export", async (context) => {
+  // #1216 review 4 pins both halves of the probe's contract: presence is decided
+  // without reading the payload, so an object that is gone is reported as an omission
+  // and the package is still produced, while a copy that is present and does not hash
+  // to its address fails the export instead of being dropped as if it were missing.
+  const { rawRequest, request, project, root } = await fixture(context, true);
+  const target = await project();
+  await request(`/api/projects/${target.id}/research-package/import?sessionId=${target.firstSession.id}`, {
+    method: "POST", body: Buffer.from(researchTrajectoryFixture().bytes),
+  });
+  const base = `/api/projects/${target.id}/research-package?sessionId=${target.firstSession.id}&level=complete`;
+  const baseline = importResearchPackage(new Uint8Array(await (await request(base)).arrayBuffer()));
+  // Every file whose name carries the address: the store keeps the object under more
+  // than one layout (blob pool, legacy sha256 tree, version objects) and `read()`
+  // falls through to the next copy, so removing one would leave it readable.
+  const stored = async (hash: string) => {
+    const listed = await readdir(root, { recursive: true });
+    return listed.filter((entry): entry is string => typeof entry === "string" && entry.includes(hash)).map((entry) => resolve(root, entry));
+  };
+  // An artifact payload lives only in the CAS (a workspace payload is re-read from the
+  // workspace file and re-added with the same address, so deleting its blob proves
+  // nothing). Take the address the records name for an artifact version.
+  const artifactRecords = (baseline.records as { artifacts?: Array<{ versions?: Array<{ objectPath?: string }> }> }).artifacts ?? [];
+  const candidates = artifactRecords.flatMap((artifact) => (artifact.versions ?? []).map((version) => version.objectPath)).filter((path): path is string => Boolean(path));
+  assert.ok(candidates.length, "the fixture exports at least one artifact payload from the CAS");
+  let victim: { hash: string; layouts: string[] } | undefined;
+  for (const hash of candidates) {
+    const layouts = await stored(hash);
+    if (layouts.length) { victim = { hash, layouts }; break; }
+  }
+  assert.ok(victim, "at least one carried artifact object lives in the CAS");
+
+  // Every copy has to go: `read()` falls through to the next layout, so removing one
+  // would leave the object readable and the omission would be a false pass.
+  for (const layout of victim.layouts) await rm(layout, { force: true });
+  const missing = importResearchPackage(new Uint8Array(await (await request(base)).arrayBuffer()));
+  assert.ok(missing.manifest.omissions.some((item) => item.includes("CAS object not found") || item.includes(`cas:${victim.hash}:unavailable source object`)),
+    `the absent object is named, not silently dropped: ${JSON.stringify(missing.manifest.omissions)}`);
+
+  await writeFile(victim.layouts[0]!, "bytes that do not hash to this address");
+  // The archive is written into the response as it packs, so a corrupt object aborts
+  // the download instead of delivering a package with the object quietly dropped. The
+  // store-level half of this contract — present for the probe, refused by `stream()`
+  // with the integrity error — is pinned in packages/cas/src/index.test.ts.
+  await assert.rejects(rawRequest(base), TypeError, "a corrupt-only object must not produce a package");
+});
+
 test("pending export previews return HTTP 409 for single and default profiles", async (context) => {
   const { rawRequest, project } = await fixture(context);
   const target = await project();
@@ -95,6 +188,27 @@ test("pending export previews return HTTP 409 for single and default profiles", 
     assert.equal(response.status, 409);
     assert.equal((await response.json() as { code: string }).code, "EXPORT_PREVIEW_PENDING");
   }
+});
+
+test("a preview poll of a deleted project ends as gone instead of a 404", async (context) => {
+  const { rawRequest, request, project } = await fixture(context);
+  const target = await project();
+  const endpoint = `/api/projects/${target.id}/research-package/preview?sessionId=${target.firstSession.id}`;
+  assert.equal((await rawRequest(`${endpoint}&defaults=1`)).status, 200);
+  await request(`/api/projects/${target.id}`, {
+    method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirmationId: target.id }),
+  });
+  // The panel still has the Session on screen; its poll must end quietly, not
+  // raise a browser resource error the mocked journey records (#1072).
+  const gone = await rawRequest(`${endpoint}&defaults=1`);
+  assert.equal(gone.status, 200);
+  assert.deepEqual(await gone.json(), { state: "deleted" });
+  // A one-shot preview read keeps reporting that its scope is gone.
+  const single = await rawRequest(`${endpoint}&level=complete`);
+  assert.equal(single.status, 404);
+  // A download of a package that is gone is still a mistake worth reporting.
+  const missingPackage = await rawRequest(`/api/projects/${target.id}/research-package?sessionId=${target.firstSession.id}`);
+  assert.equal(missingPackage.status, 404);
 });
 
 test("async preview clients receive accepted pending state and recover for single and default profiles", async (context) => {
@@ -126,6 +240,30 @@ test("async preview clients receive accepted pending state and recover for singl
   assert.equal((await failed.json() as { code: string }).code, "EXPORT_STORAGE_UNAVAILABLE");
 });
 
+test("preview deletion ends the poll quietly while shutdown and the one-shot read keep their status", async (context) => {
+  const { rawRequest, project } = await fixture(context);
+  const target = await project();
+  let failure: ApiStatusError;
+  context.mock.method(ResearchExportPreviews.prototype, "get", async () => { throw failure; });
+  const endpoint = `/api/projects/${target.id}/research-package/preview?sessionId=${target.firstSession.id}`;
+  for (const [status, code] of [[404, "EXPORT_PREVIEW_RESOURCE_DELETED"], [503, "EXPORT_PREVIEW_SERVICE_CLOSED"]] as const) {
+    failure = new ApiStatusError(status, "Preview intentionally stopped", code);
+    // The one-shot read keeps its status; the polling shape ends as `gone`
+    // because that is what a mounted panel asks and repeats (#1072).
+    const single = await rawRequest(`${endpoint}&level=complete`, { headers: { Prefer: "respond-async" } });
+    assert.equal(single.status, status);
+    assert.equal((await single.json() as { code: string }).code, code);
+    const polled = await rawRequest(`${endpoint}&defaults=1`, { headers: { Prefer: "respond-async" } });
+    if (code === "EXPORT_PREVIEW_RESOURCE_DELETED") {
+      assert.equal(polled.status, 200);
+      assert.deepEqual(await polled.json(), { state: "deleted" });
+    } else {
+      assert.equal(polled.status, status);
+      assert.equal((await polled.json() as { code: string }).code, code);
+    }
+  }
+});
+
 test("the first-install sample supports all five preview profiles without unshipped state objects", async (context) => {
   const f = await fixture(context, false, true);
   const projects = await (await f.request("/api/projects")).json() as { id: string }[];
@@ -139,17 +277,17 @@ test("the first-install sample supports all five preview profiles without unship
   assert.ok(previews.completeWithTrajectory.estimatedBytes > previews.complete.estimatedBytes, "the recorded trajectory remains in the complete preview");
 });
 
-test("viewing a conversation prewarms default sizes and workspace changes invalidate the cached evidence revision", async (context) => {
+test("viewing a conversation does not warm previews; the export dialog computes the five profiles on demand", async (context) => {
   const f = await fixture(context, true);
   const target = await f.project();
   const sessionId = target.firstSession.id;
   await f.request(`/api/sessions/${sessionId}`);
-  await f.waitForGraphExports(5);
-  assert.ok(f.graphExports() >= 5, "session viewing computes all five profiles before any export request");
+  assert.equal(f.graphExports(), 0, "viewing a session must not start any export build");
   const endpoint = `/api/projects/${target.id}/research-package/preview?sessionId=${sessionId}`;
   const defaults = async () => await (await f.request(`${endpoint}&defaults=1`)).json() as { revision: string; complete: { estimatedBytes: number; files: { path: string; selected: boolean }[] } };
   const warmed = await defaults();
   const exports = f.graphExports();
+  assert.ok(exports >= 5, "the export dialog computes the profiles it shows");
   await f.request(`${endpoint}&level=necessary&includeFullTrajectory=0`);
   await f.request(`${endpoint}&level=complete&includeFullTrajectory=0`);
   await f.request(`${endpoint}&level=complete&includeFullTrajectory=1`);
@@ -196,11 +334,12 @@ test("complete preview and download avoid aggregate record strings and retain im
   }
 });
 
-function evidencePackage(legacy = false, withEvolve = false) {
+function evidencePackage(legacy = false, withEvolve = false, withEvolveRuns = false, withEvolveCandidateSource = false, completedRun = false) {
   const first = Buffer.from("value\n1\n");
   const latest = Buffer.from("value\n2\n");
   const notebook = Buffer.from('{"cells":[],"metadata":{},"nbformat":4,"nbformat_minor":5}');
   const evolveSource = Buffer.from("print(1)\n");
+  const evolveCandidateSource = Buffer.from("print('candidate source')\n");
   const version = (id: string, index: number, object: Buffer) => ({
     id, artifactId: "artifact-source", sessionId: "source-one", projectId: "source-project", version: index,
     createdAt: date, content: { hash: sha256(object), size: object.length }, mediaType: "text/csv", sourcePath: "results/result.csv",
@@ -209,10 +348,31 @@ function evidencePackage(legacy = false, withEvolve = false) {
   return createResearchPackage({ source: { projectId: "source-project", title: "科研项目", sessionIds: ["source-one", "source-two"] }, records: {
     sessions: [{ session: { id: "source-one", title: "原始研究", specialistId: "unavailable-specialist" },
       messages: [{ id: "prompt-one", role: "user", content: "第一轮科研问题", createdAt: date }, { id: "answer-one", role: "assistant", content: "第一轮结论", createdAt: date }, { id: "prompt-two", role: "user", content: "第二轮科研问题", createdAt: date }, { id: "answer-two", role: "assistant", content: "第二轮结论", createdAt: date }],
-      runs: [{ id: "run-source", sessionId: "source-one", prompt: "第一轮科研问题", createdAt: date, status: "running", queueOrder: 1, annotationIds: [], references: [], settingsSnapshot: {}, userMessageId: "prompt-one", assistantMessageId: "answer-one" }],
+      runs: [{ id: "run-source", sessionId: "source-one", prompt: "第一轮科研问题", createdAt: date, status: completedRun ? "completed" : "running", queueOrder: 1, annotationIds: [], references: [], settingsSnapshot: {}, userMessageId: "prompt-one", assistantMessageId: "answer-one" }],
       workspace: [{ path: "results/result.csv", objectPath: sha256(latest), size: latest.length, modifiedAt: date }, { path: "analysis.ipynb", objectPath: sha256(notebook), size: notebook.length, modifiedAt: date }],
       validations: { reviews: [{ id: "review-source", sessionId: "source-one", kind: "integrity", status: "passed", turnId: "run-source", createdAt: date, finishedAt: date, findings: [] }], artifactReviews: [{ id: "artifact-review-source", sessionId: "source-one", artifactId: "artifact-source", artifactVersionId: "version-two", artifactContentHash: sha256(latest), artifactLogicalName: "results/result.csv", checkpointId: "checkpoint-source", decision: "ACCEPT_AND_PROCEED", createdAt: date, finishedAt: date, findings: [], reviewerSpecialistVersion: "1", status: "completed" }] },
     }, { session: { id: "source-two", title: "分支会话", specialistId: "unavailable-specialist" }, messages: [{ id: "branch-prompt", role: "user", content: "分支研究", createdAt: date }], workspace: [] }],
+    // A package that really ran a search carries both the `evolve/<run>/` artifact
+    // and the run records with their event log; only then is the "searches were not
+    // carried" loss absent from the receipt.
+    ...(withEvolveRuns ? { evolve: { runs: [{
+      run: {
+        id: "evolve-run-source", sessionId: "source-one", algorithm: "puct",
+        goal: {
+          algorithm: "puct",
+          baselineProgramCas: "sha256:baseline",
+          budget: { candidateTimeoutSeconds: 60, expansions: 6, maxCostCents: 500, maxSeconds: 1_800, maxTokens: 200_000, maxTokensPerCall: 16_000, workers: 1 },
+          frozen: ["score.py"],
+          modelId: "model-1",
+          scorecard: { aggregate: "weighted_sum", confirmedAt: date, confirmedBy: "tester", constraints: [], criteria: [], derivedFrom: { draftRunId: "draft-1", statement: "Search for candidate genes" }, hash: "sha256:card", schemaVersion: 1, solvedThreshold: 0.999 },
+          schemaVersion: 2,
+          statement: "Search for candidate genes",
+          target: { entrypoint: "classify.py", kind: "program", programId: "p1" },
+        },
+        status: "succeeded", startedAt: date, finishedAt: date, candidates: 2, costCents: 0, tokens: 0, createdAt: date,
+      },
+      events: [{ sequence: 1, createdAt: date, event: { type: "log", level: "info", message: "started" } }],
+    }], ...(withEvolveCandidateSource ? { candidates: [{ runId: "evolve-run-source", hash: sha256(evolveCandidateSource), objectPath: sha256(evolveCandidateSource) }] } : {}) } } : {}),
     artifacts: [
       { id: "artifact-source", projectId: "source-project", createdInSessionId: "source-one", createdInSessionTitle: "原始研究", sessionId: "source-one", name: "results/result.csv", logicalName: "results/result.csv", kind: "dataset", origin: "user_upload", currentVersion: 2, createdAt: date, updatedAt: date, versions: [version("version-one", 1, first), version("version-two", 2, latest)] },
       // A run's result is published as `evolve/<run>/<entrypoint>` with
@@ -221,20 +381,21 @@ function evidencePackage(legacy = false, withEvolve = false) {
       // import rejects the kind as unsupported.
       ...(withEvolve ? [{
         id: "artifact-evolve", projectId: "source-project", createdInSessionId: "source-one",
-        createdInSessionTitle: "原始研究", sessionId: "source-one", name: "evolve/83cbb6de/main.py",
-        logicalName: "evolve/83cbb6de/main.py", kind: "other", origin: "llm_declared", currentVersion: 1,
+        createdInSessionTitle: "原始研究", sessionId: "source-one", name: "evolve/evolve-r/main.py",
+        logicalName: "evolve/evolve-r/main.py", kind: "other", origin: "llm_declared", currentVersion: 1,
+        originMeta: { evolveRunId: "evolve-run-source" },
         createdAt: date, updatedAt: date,
         versions: [{
           id: "version-evolve", artifactId: "artifact-evolve", sessionId: "source-one",
           projectId: "source-project", version: 1, createdAt: date,
           content: { hash: sha256(evolveSource), size: evolveSource.length },
           mediaType: "text/plain; charset=utf-8",
-          sourcePath: "evolve/83cbb6de/main.py", inputArtifactVersionIds: [], executionRunIds: [],
+          sourcePath: "evolve/evolve-r/main.py", inputArtifactVersionIds: [], executionRunIds: [],
           turnId: "run-source", ...(legacy ? {} : { objectPath: sha256(evolveSource) }),
         }],
       }] : []),
     ],
-  }, objects: [first, latest, notebook, ...(withEvolve ? [evolveSource] : [])].map((bytes) => ({ path: sha256(bytes), bytes })) }).bytes;
+  }, objects: [first, latest, notebook, ...(withEvolve ? [evolveSource] : []), ...(withEvolveCandidateSource ? [evolveCandidateSource] : [])].map((bytes) => ({ path: sha256(bytes), bytes })) }).bytes;
 }
 
 test("complete package restores conversations, files, versions and reviews across projects without leaking into sibling sessions", async (context) => {
@@ -307,6 +468,96 @@ test("a package carrying an evolve result reports that the searches themselves w
   assert.equal(receipt.artifactCount, 2);
   assert.ok(receipt.omissions.some((item) => item.includes("does not carry evolution (evolve) search runs")),
     "the receipt names the searches it could not carry");
+});
+
+test("a package carrying the evolve runs and their artifact reports no search loss", async (context) => {
+  // The import layer must agree with the predicate: a package that ran a search
+  // AND carries the run records is restored, so the "searches were not carried"
+  // omission is absent — this is the path #1019 review F1 found was never tested
+  // at the import boundary.
+  const { request, project } = await fixture(context);
+  const target = await project();
+  const receipt = await (await request(`/api/projects/${target.id}/research-package/import?sessionId=${target.firstSession.id}`, {
+    method: "POST", body: Buffer.from(evidencePackage(false, true, true)),
+  })).json() as { artifactCount: number; omissions: string[] };
+  assert.equal(receipt.artifactCount, 2);
+  assert.equal(receipt.omissions.some((item) => item.includes("does not carry evolution (evolve) search runs")), false,
+    "the carried run records make the search loss untrue");
+  // The runs travel, but their candidate *sources* (`evolve-candidates/<run>/
+  // <sha256>.py`) never enter the package, so a run that has candidates must
+  // still be told it came back without their code.
+  assert.ok(receipt.omissions.some((item) => item.includes("candidate source")),
+    "the receipt names the candidate sources it could not carry");
+  // The /api/evolve/runs route answers while the evolve service is not
+  // initialized, so the restoration is read back through the same endpoint the
+  // session view uses rather than off disk.
+  const restored = await (await request(`/api/evolve/runs?sessionId=${target.firstSession.id}`)).json() as Array<{ id: string; sessionId: string }>;
+  const restoredRun = restored.find((run) => run.id === "evolve-run-source");
+  assert.ok(restoredRun, "the carried run is restored under the imported session");
+  assert.equal(restoredRun.sessionId, target.firstSession.id, "the carried run is restored under the imported session");
+});
+
+test("a package carrying evolve candidate source restores it beside the imported run", async (context) => {
+  const { request, project, root } = await fixture(context);
+  const target = await project();
+  const receipt = await (await request(`/api/projects/${target.id}/research-package/import?sessionId=${target.firstSession.id}`, {
+    method: "POST", body: Buffer.from(evidencePackage(false, true, true, true, true)),
+  })).json() as { omissions: string[] };
+  assert.equal(receipt.omissions.some((item) => item.includes("candidate source files are not carried")), false);
+  const digest = sha256(Buffer.from("print('candidate source')\n")).replace(/^sha256:/, "");
+  assert.equal(await readFile(resolve(root, "evolve-candidates", "evolve-run-source", `${digest}.py`), "utf8"), "print('candidate source')\n");
+  const exported = importResearchPackage(new Uint8Array(await (await request(`/api/projects/${target.id}/research-package?sessionId=${target.firstSession.id}&level=complete`)).arrayBuffer()));
+  const evolve = (exported.records as { evolve?: { candidates?: Array<{ hash: string; objectPath: string; runId: string }> } }).evolve;
+  assert.deepEqual(evolve?.candidates, [{ hash: `sha256:${digest}`, objectPath: digest, runId: "evolve-run-source" }]);
+  assert.equal(Buffer.from(exported.objects.get(digest)!).toString("utf8"), "print('candidate source')\n");
+
+  // Import into the same data directory again: both sessions must own a run
+  // and the remapped run must still serve its candidate source.
+  const second = await project();
+  const secondReceipt = await (await request(`/api/projects/${second.id}/research-package/import?sessionId=${second.firstSession.id}`, {
+    method: "POST", body: Buffer.from(evidencePackage(false, true, true, true, true)),
+  })).json() as { omissions: string[] };
+  assert.equal(secondReceipt.omissions.some((item) => item.includes("run id already exists")), false);
+  const secondRuns = await (await request(`/api/evolve/runs?sessionId=${second.firstSession.id}`)).json() as Array<{ id: string }>;
+  assert.equal(secondRuns.length, 1);
+  assert.notEqual(secondRuns[0]!.id, "evolve-run-source");
+  assert.equal(await readFile(resolve(root, "evolve-candidates", secondRuns[0]!.id, `${digest}.py`), "utf8"), "print('candidate source')\n");
+  // A remapped run's result artifact must carry the restored id, in its name and
+  // in its origin: `get_evolve_run` recomputes that name from the restored run,
+  // so a prefix left on the source id would point at a file this session has no
+  // artifact for (#1176 review F3).
+  const secondOutputs = await (await request(`/api/sessions/${second.firstSession.id}/artifact-outputs`)).json() as Array<{
+    artifact: { logicalName?: string; name: string; originMeta?: Record<string, unknown> };
+  }>;
+  const remappedArtifact = secondOutputs.find((entry) => String(entry.artifact.logicalName ?? entry.artifact.name).startsWith("evolve/"));
+  assert.ok(remappedArtifact, "the restored session carries the run's result artifact");
+  assert.equal(remappedArtifact.artifact.logicalName, `evolve/${secondRuns[0]!.id.slice(0, 8)}/main.py`);
+  assert.equal(remappedArtifact.artifact.originMeta?.evolveRunId, secondRuns[0]!.id);
+
+  const operation = await (await request(`/api/sessions/${second.firstSession.id}/research-continuations`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestId: "evolve-copy-regression" }),
+  })).json() as { id: string; state: string; entrySessionId?: string; error?: string };
+  let completed = operation;
+  for (let attempt = 0; attempt < 100 && !["ready", "failed"].includes(completed.state); attempt++) {
+    await new Promise((done) => setTimeout(done, 50));
+    completed = await (await request(`/api/sessions/${second.firstSession.id}/research-continuations/${operation.id}`)).json() as typeof operation;
+  }
+  assert.equal(completed.state, "ready", completed.error ?? "Research continuation did not finish");
+  const copyRuns = await (await request(`/api/evolve/runs?sessionId=${completed.entrySessionId}`)).json() as Array<{ id: string }>;
+  assert.equal(copyRuns.length, 1);
+  assert.notEqual(copyRuns[0]!.id, secondRuns[0]!.id);
+  assert.equal(await readFile(resolve(root, "evolve-candidates", copyRuns[0]!.id, `${digest}.py`), "utf8"), "print('candidate source')\n");
+  const copiedOutputs = await (await request(`/api/sessions/${completed.entrySessionId}/artifact-outputs`)).json() as Array<{
+    artifact: { logicalName?: string; name: string; originMeta?: Record<string, unknown> };
+  }>;
+  const copiedArtifact = copiedOutputs.find((entry) => String(entry.artifact.logicalName ?? entry.artifact.name).startsWith("evolve/"));
+  assert.ok(copiedArtifact, "the writable copy carries the run's result artifact");
+  assert.equal(copiedArtifact.artifact.logicalName, `evolve/${copyRuns[0]!.id.slice(0, 8)}/main.py`);
+  assert.equal(copiedArtifact.artifact.originMeta?.evolveRunId, copyRuns[0]!.id);
+  const events = await (await request(`/api/evolve/runs/${copyRuns[0]!.id}/events`)).json() as Array<{ event: { type: string } }>;
+  assert.equal(events[0]?.event.type, "log");
+  const candidate = await (await request(`/api/evolve/runs/${copyRuns[0]!.id}/candidates/sha256:${digest}`)).json() as { source: string };
+  assert.equal(candidate.source, "print('candidate source')\n");
 });
 
 test("a package without an evolve artifact reports no such loss", async (context) => {
@@ -649,4 +900,147 @@ test("a finished continuation stays readable after its source session is deleted
   assert.equal(afterDelete.state, "ready");
   assert.equal(afterDelete.id, operation.id);
   assert.equal(afterDelete.entrySessionId, last.entrySessionId);
+});
+
+test("the preview reports the cap and the tar size the exporter refuses on", async (context) => {
+  const { request, project } = await fixture(context);
+  const target = await project();
+  const query = `sessionId=${target.firstSession.id}&level=complete`;
+  const base = `/api/projects/${target.id}/research-package`;
+  const preview = await (await request(`${base}/preview?${query}`)).json() as {
+    estimatedBytes: number; maxBytes?: number; archiveBytes?: number };
+  assert.equal(preview.maxBytes, RESEARCH_PACKAGE_MAX_BYTES);
+  assert.equal(typeof preview.archiveBytes, "number");
+  assert.ok((preview.archiveBytes ?? 0) > 0);
+  // The dialog refuses work on this number, so it must be the tar the exporter builds.
+  const exported = importResearchPackage(new Uint8Array(await (await request(`${base}?${query}`)).arrayBuffer()));
+  const rebuilt = {
+    source: exported.manifest.source, records: exported.records, readme: Buffer.from(exported.readme).toString(),
+    omissions: exported.manifest.omissions, exportProfile: exported.manifest.exportProfile,
+    objects: [...exported.objects].map(([path, bytes]) => ({ path, bytes })),
+  };
+  assert.equal(preview.archiveBytes, researchPackageArchiveBytes(rebuilt));
+});
+
+test("an over-cap export is refused before it starts, and accepted once acknowledged", async (context) => {
+  const { rawRequest, project } = await fixture(context);
+  const target = await project();
+  const sessionId = target.firstSession.id;
+  const base = `/api/projects/${target.id}/research-package`;
+  const sized = (archiveBytes: number) => ({
+    revision: "sized", estimatedBytes: archiveBytes, estimateKind: "uncompressed" as const,
+    files: [], omissions: [], maxBytes: RESEARCH_PACKAGE_MAX_BYTES, archiveBytes,
+  });
+  context.mock.method(ResearchExportPreviews.prototype, "get",
+    async () => sized(RESEARCH_PACKAGE_MAX_BYTES + 1));
+
+  const body = { level: "complete", sessionId, revision: "sized" };
+  const refusedTask = await rawRequest(`${base}/exports`, { method: "POST", body: JSON.stringify(body) });
+  assert.equal(refusedTask.status, 413);
+  assert.equal((await refusedTask.json() as { code: string }).code, "RESEARCH_PACKAGE_TOO_LARGE");
+
+  const refusedStream = await rawRequest(`${base}?level=complete&sessionId=${sessionId}`);
+  assert.equal(refusedStream.status, 413);
+  assert.equal((await refusedStream.json() as { code: string }).code, "RESEARCH_PACKAGE_TOO_LARGE");
+
+  // The same request with the acknowledgement: the task is accepted, the stream packs.
+  const acceptedTask = await rawRequest(`${base}/exports`, { method: "POST", body: JSON.stringify({ ...body, allowOverCap: true }) });
+  assert.equal(acceptedTask.status, 202);
+  const acknowledged = await rawRequest(`${base}?level=complete&sessionId=${sessionId}&allowOverCap=1`);
+  assert.equal(acknowledged.status, 200);
+
+  // Nothing may cross the hard ceiling, acknowledgement or not.
+  context.mock.method(ResearchExportPreviews.prototype, "get",
+    async () => sized(RESEARCH_PACKAGE_MAX_MAX_BYTES + 1));
+  const beyond = await rawRequest(`${base}/exports`, { method: "POST", body: JSON.stringify({ ...body, allowOverCap: true }) });
+  assert.equal(beyond.status, 413);
+  assert.equal((await beyond.json() as { code: string }).code, "RESEARCH_PACKAGE_TOO_LARGE");
+});
+
+test("the streamed export is not refused when only the data volume is short", async (context) => {
+  // The GET route writes the HTTP response, not a file under dataDir, so a full data
+  // volume must not turn a download the client has room for into a 507 (#1216 review 1).
+  const { request, project } = await fixture(context, false, false, {
+    measureResearchPackageCapacity: async () => ({ freeDiskBytes: 0, freeMemoryBytes: 8 * 1024 * 1024 * 1024 }),
+  });
+  // Size the package explicitly: the point is the capacity charge, not the preview.
+  context.mock.method(ResearchExportPreviews.prototype, "get", async () => ({
+    revision: "small", estimatedBytes: 1024, estimateKind: "uncompressed" as const,
+    files: [], omissions: [], maxBytes: RESEARCH_PACKAGE_MAX_BYTES, archiveBytes: 1024,
+  }));
+  const target = await project();
+  const exported = await request(`/api/projects/${target.id}/research-package?sessionId=${target.firstSession.id}`);
+  assert.equal(exported.status, 200);
+  assert.equal(exported.headers.get("content-type"), "application/octet-stream");
+  const bytes = Buffer.from(await exported.arrayBuffer());
+  assert.equal(bytes[0], 0x1f, "the body is the gzip archive, not an error document");
+  assert.equal(bytes[1], 0x8b);
+  const parsed = importResearchPackage(new Uint8Array(bytes));
+  assert.equal(parsed.manifest.source.projectId, target.id);
+});
+
+test("the inspected package is admitted where the same volume refuses a restore", async (context) => {
+  const payload = Buffer.alloc(2 * 1024 * 1024, 7);
+  const digest = sha256(payload);
+  const pkg = createResearchPackage({
+    source: { projectId: "p", title: "inspect budget" },
+    records: { sessions: [{ session: { id: "s" }, messages: [], workspace: [{ path: "results/a.bin", objectPath: digest, size: payload.length }] }] },
+    objects: [{ path: digest, bytes: payload }],
+  }).bytes;
+  const parsed = importResearchPackage(new Uint8Array(pkg));
+  // The parser counts every unpacked entry (objects, records, readme).
+  const unpacked = parsed.manifest.inventory.reduce((sum, entry) => sum + entry.sizeBytes, 0);
+  // Inspect packs one copy (`free / 2`), while a restore adds three more
+  // (`3 × objects + records`), so this volume admits the inspect and refuses the
+  // restore (#1216 review 3).
+  const capacity = { freeDiskBytes: unpacked * 2 + 4096, freeMemoryBytes: 8 * 1024 * 1024 * 1024 };
+  const { rawRequest, project } = await fixture(context, false, false, { measureResearchPackageCapacity: async () => capacity });
+  const target = await project();
+  const inspected = await rawRequest(`/api/projects/${target.id}/research-package/inspect`, { method: "POST", body: Buffer.from(pkg) });
+  assert.equal(inspected.status, 200, `inspect must be admitted at one copy: ${await inspected.text()}`);
+  const imported = await rawRequest(`/api/projects/${target.id}/research-package/import?sessionId=${target.firstSession.id}`, { method: "POST", body: Buffer.from(pkg) });
+  assert.equal(imported.status, 507, "the same volume cannot hold the restore's three copies");
+  assert.equal((await imported.json() as { code: string }).code, "RESEARCH_PACKAGE_INSUFFICIENT_DISK");
+});
+
+test("the background export still charges the archive it writes", async (context) => {
+  const { rawRequest, project } = await fixture(context, false, false, {
+    measureResearchPackageCapacity: async () => ({ freeDiskBytes: 0, freeMemoryBytes: 8 * 1024 * 1024 * 1024 }),
+  });
+  context.mock.method(ResearchExportPreviews.prototype, "get", async () => ({
+    revision: "small", estimatedBytes: 1024, estimateKind: "uncompressed" as const,
+    files: [], omissions: [], maxBytes: RESEARCH_PACKAGE_MAX_BYTES, archiveBytes: 1024,
+  }));
+  const target = await project();
+  const sessionId = target.firstSession.id;
+  const base = `/api/projects/${target.id}/research-package`;
+  const task = await rawRequest(`${base}/exports`, { method: "POST", body: JSON.stringify({ level: "necessary", sessionId, revision: "small" }) });
+  assert.equal(task.status, 507, "this route writes the archive under dataDir, so the disk is charged");
+  assert.equal((await task.json() as { code: string }).code, "RESEARCH_PACKAGE_INSUFFICIENT_DISK");
+});
+
+test("a package whose workspace objects are all absent reports the loss instead of importing empty", async (context) => {
+  // Legacy-shaped package: the manifest still names the workspace object, the records
+  // row has no `objectPath`, and the archive carries neither — so the earlier
+  // "missing workspace object" pre-flight does not see it. That used to import an empty
+  // workspace with no omission at all (#1216 review 2).
+  const { rawRequest, request, project } = await fixture(context);
+  const target = await project();
+  const absent = sha256(Buffer.from("payload the archive does not carry"));
+  const pkg = createResearchPackage({
+    source: { projectId: "p", title: "absent workspace", workspace: [{ path: "results/absent.csv", objectPath: absent, size: 31 }] } as never,
+    records: { sessions: [{ session: { id: "s" }, messages: [], workspace: [{ path: "results/absent.csv", size: 31 }] }] },
+    objects: [],
+  }).bytes;
+  const response = await rawRequest(`/api/projects/${target.id}/research-package/import?sessionId=${target.firstSession.id}`, {
+    method: "POST", body: Buffer.from(pkg),
+  });
+  const text = await response.text();
+  assert.equal(response.status, 201, text);
+  const receipt = JSON.parse(text) as { omissions: string[]; continuationAvailable: boolean };
+  assert.ok(receipt.omissions.some((item) => /^workspace:.*:results\/absent\.csv:missing object$/.test(item)),
+    `the empty workspace must be reported: ${JSON.stringify(receipt.omissions)}`);
+  assert.equal(receipt.continuationAvailable, false, "a copy with a missing object cannot be continued");
+  const detail = await (await request(`/api/sessions/${target.firstSession.id}`)).json() as { messages: unknown[] };
+  assert.deepEqual(detail.messages, []);
 });

@@ -40,6 +40,7 @@ import {
 } from "./helpers/desktop-evolve.ts";
 import { positiveNumber } from "./helpers/deepresearchbench.ts";
 import { evolutionScorecard } from "./helpers/evolve-result.mjs";
+import { realModelApiVariant, realModelThinking } from "./helpers/real-model-thinking.ts";
 
 /**
  * The problem statement, verbatim. It is the user's input to the design
@@ -83,7 +84,8 @@ problem_seconds=20；candidate_timeout=120。
 algorithm=puct
 expansions=24
 workers=3
-thinking=disabled
+thinking=enabled
+thinking_effort=low
 search.cPuct=1.0
 priorExponent 省略
 split: gateShards=8, rolloutShards=4, testShards=2, seed=0
@@ -91,6 +93,12 @@ split: gateShards=8, rolloutShards=4, testShards=2, seed=0
 packages=["numpy","scipy"]
 temperature=0.7, max_tokens=12000, reply_attempts=4, staleness=guarded
 模型偏好 deepseek-v4-flash
+
+【运行边界】
+运行时和依赖已经由测试栈准备好。不要安装 pip、执行 get-pip.py 或联网下载依赖；
+可以用 read_file/list_files 读取工作区中已经预置的数据文件并按 evolve-design skill 完成 evaluator 设计；
+不要调用 run_shell、安装依赖、执行临时 Python 或 shell 评分脚本，也不要新建 evaluator.py 或复制评分器；
+由 create_evolve_run 的 packages 提供依赖，完成设计后立即调用它。
 
 【验收对照】
 记录：linear baseline digits≈1.58 → best digits=12、acc=1。你的 run 在 id_test 上报告同样指标。”`;
@@ -108,7 +116,8 @@ const CONTINUATION = "你决定，按文档推荐规模直接跑；使用 PUCT�
  * second "you decide" invites the same. A person watching it would stop the
  * checking and say start with what is in the workspace.
  */
-const START_NOW = "不要再核对评估器或候选程序的细节，用工作区里现有的 evaluator 和 candidate 立即调用 create_evolve_run，"
+const START_NOW = "不要再核对评估器或候选程序的细节，也不要调用 run_shell 做临时 Python 验证；"
+  + "用工作区里现有的 evaluator 和 candidate 立即调用 create_evolve_run，"
   + "按文档推荐规模启动 lsr_transform_i.34.1_2_0 的 PUCT 搜索。只跑这一道题。";
 
 /**
@@ -221,7 +230,11 @@ test("desktop /evolve-design reaches three PUCT expansions on an LLM-SRBench pro
 
   try {
     await journey.step("Open a desktop Session with the real model", "The new entry reaches the workspace, not the wizard.", async () => {
-      fixture = await createDesktopFixture(page);
+      const thinking = realModelThinking();
+      fixture = await createDesktopFixture(page, {
+        model: { apiVariant: realModelApiVariant(), ...thinking },
+        session: thinking,
+      });
       metrics.session_id = fixture.session.id;
       metrics.model = fixture.model?.model ?? null;
       await openDesktopSession(page, fixture);
@@ -258,6 +271,11 @@ test("desktop /evolve-design reaches three PUCT expansions on an LLM-SRBench pro
       await expect(dialog).toContainText("新建程序演进实验");
 
       const start = dialog.getByRole("button", { name: "开始设计" });
+      // The submit is greyed for two independent reasons now: no task yet, or
+      // no ready runtime. Write the task first, so what the probe below reads
+      // is the runtime alone — with an empty task the button never enables and
+      // a ready host would still be mistaken for a missing install.
+      await dialog.getByLabel("任务描述").fill(PROBLEM);
       // The submit stays greyed until the runtime reports ready, and that read
       // lands after the dialog opens — the banner is drawn meanwhile, so
       // "banner is up" is not the same as "the runtime is missing". Give the
@@ -300,15 +318,22 @@ test("desktop /evolve-design reaches three PUCT expansions on an LLM-SRBench pro
       if (await unisolated.isVisible().catch(() => false)) await unisolated.click();
       await expect(dialog).toBeHidden({ timeout: 60_000 });
 
-      // The dialog places its flags as a token in the composer and stops
-      // there: the goal is the sentence after the token, and the message
-      // leaves when the user sends it.
+      // The dialog places its flags as a token in the composer and the task as
+      // the sentence after it, and stops there: the message leaves once the
+      // user confirms the settings for that task. The task was written in the
+      // dialog, so the composer already holds it — retyping it here would
+      // prove nothing about the handoff.
       const area = page.locator("#composer-textarea");
       await expect(area).toBeVisible({ timeout: 30_000 });
-      await area.fill(PROBLEM);
+      await expect(area).toHaveValue(PROBLEM);
+      await expect(page.locator(".composer-command")).toContainText("/evolve-design");
       const before = new Set((await api<DesktopRun[]>(page, sessionRuns())).map((run) => run.id));
       await area.press("Enter");
-
+      // The setup dialog replaced the second "确认演进设置" card: the composer's
+      // send is the confirmation now, so nothing stands between Enter and the
+      // Run it creates. Waiting for that card would never return — the click
+      // has no timeout of its own, so the case would sit there until its whole
+      // budget ran out, on a design that had already started.
       runId = (await waitForNewRun(page, fixture!.session.id, before)).id;
       metrics.turns.push({ id: runId, kind: "design", prompt: PROBLEM });
     });
@@ -391,7 +416,7 @@ test("desktop /evolve-design reaches three PUCT expansions on an LLM-SRBench pro
       metrics.search_id = latestSearch(searches).id;
     });
 
-    await journey.step("Watch the search reach three expansions", "The tree expands past the starting program, and each candidate is readable by its hash.", async () => {
+    await journey.step("Watch the search reach three expansions or the target reward", "The tree expands past the starting program, and each candidate is readable by its hash. A successful search may finish early after reaching the target reward.", async () => {
       const target = positiveNumber("E2E_SRBENCH_MIN_EXPANSIONS", 3);
       const search = latestSearch(searches);
       const eventsPath = `/api/evolve/runs/${encodeURIComponent(search.id)}/events`;
@@ -421,10 +446,27 @@ test("desktop /evolve-design reaches three PUCT expansions on an LLM-SRBench pro
       }).toBe(true);
 
       await save("evolve-events.json", events);
-      expect(expanded.length, `The search must record at least ${target} expansions`).toBeGreaterThanOrEqual(target);
 
+      const finished = [...events]
+        .reverse()
+        .find((record) => record.event.type === "search_finished")?.event;
+      // The server stops with target_reward only after applying the run's own
+      // scorecard threshold. Trust that terminal decision instead of
+      // reconstructing a threshold from the client-side goal snapshot.
+      const reachedTargetReward =
+        expanded.length < target
+        && finished?.status === "succeeded"
+        && finished?.stopReason === "target_reward";
+
+      if (!reachedTargetReward) {
+        expect(expanded.length, `The search must record at least ${target} expansions`).toBeGreaterThanOrEqual(target);
+      }
+
+      const recordsToCheck = expanded.length >= target
+        ? expanded.slice(0, target)
+        : expanded;
       const recorded: any[] = [];
-      for (const record of expanded.slice(0, target)) {
+      for (const record of recordsToCheck) {
         const hash = String(record.event.codeHash);
         const candidate = await api<{ hash: string; source: string }>(
           page,
@@ -445,7 +487,7 @@ test("desktop /evolve-design reaches three PUCT expansions on an LLM-SRBench pro
 
       // The acceptance figures from the problem statement are recorded beside
       // the search's own numbers, never turned into a pass gate: three
-      // expansions is the bar, and the digits are what a reader checks later.
+      // expansions or an explicit target-reward stop is the bar, and the digits are what a reader checks later.
       const current = latestSearch(await api<any[]>(page, searchList()));
       expect(current.algorithm, "The desktop command must select PUCT").toBe("puct");
       const scorecard = evolutionScorecard(current, events);

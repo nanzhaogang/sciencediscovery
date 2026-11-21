@@ -15,6 +15,7 @@
 import { useState } from "react";
 
 import type { ApiClient } from "../../api/client.js";
+import { CREDITS_PROVIDER_NAME } from "../../auth/credits-model.js";
 import {
   deleteModel,
   listProviderModels,
@@ -62,7 +63,7 @@ const TONES = ["tone-1", "tone-2", "tone-3", "tone-4", "tone-5", "tone-6"];
  */
 export function ModelSettings({ actions, adding, client, onAddingChange, state }: Props) {
   const [probing, setProbing] = useState<string>();
-  const [probe, setProbe] = useState<Record<string, string>>({});
+  const [probe, setProbe] = useState<Record<string, { ok: boolean; text: string }>>({});
   /** Which row is open, and the name being typed into it. */
   const [openId, setOpenId] = useState<string>();
   const [draft, setDraft] = useState("");
@@ -131,15 +132,18 @@ export function ModelSettings({ actions, adding, client, onAddingChange, state }
       setProbe((current) => ({
         ...current,
         [profile.id]: result.ok
-          ? TEXT.settings.model.testOk(result.latencyMs)
-          : TEXT.settings.model.testFailed(result.message || TEXT.errors.generic),
+          ? { ok: true, text: TEXT.settings.model.testOk(result.latencyMs) }
+          : { ok: false, text: TEXT.settings.model.testFailed(result.message || TEXT.errors.generic) },
       }));
     } catch (reason) {
       setProbe((current) => ({
         ...current,
-        [profile.id]: TEXT.settings.model.testFailed(
-          reason instanceof Error ? reason.message : TEXT.errors.generic,
-        ),
+        [profile.id]: {
+          ok: false,
+          text: TEXT.settings.model.testFailed(
+            reason instanceof Error ? reason.message : TEXT.errors.generic,
+          ),
+        },
       }));
     } finally {
       setProbing(undefined);
@@ -161,6 +165,9 @@ export function ModelSettings({ actions, adding, client, onAddingChange, state }
             const provider = profile.providerId === undefined
               ? undefined
               : state.providers.find((candidate) => candidate.id === profile.providerId);
+            // Extracted so JSX narrowing survives: repeated indexed access
+            // (`probe[profile.id]`) does not narrow under noUncheckedIndexedAccess.
+            const probeResult = probe[profile.id];
             return (
               <article className={`model-row${open ? " is-open" : ""}`} key={profile.id}>
                 <span className={`model-row-mark ${TONES[index % TONES.length]}`} aria-hidden="true">
@@ -179,7 +186,19 @@ export function ModelSettings({ actions, adding, client, onAddingChange, state }
                   </span>
                   <small>
                     {profile.model}
-                    {probe[profile.id] ? <span className="model-row-probe"> · {probe[profile.id]}</span> : null}
+                    {probeResult ? (
+                      <span
+                        className="model-row-probe"
+                        title={probeResult.ok ? TEXT.settings.model.testOkNotice : undefined}
+                      >
+                        {" · "}{probeResult.text}
+                        {/* Visible, not tooltip-only: a reader who never hovers
+                          still sees what the pass does not prove (#824). */}
+                        {probeResult.ok ? (
+                          <em className="model-row-probe-note">{" · "}{TEXT.settings.model.testOkNotice}</em>
+                        ) : null}
+                      </span>
+                    ) : null}
                   </small>
                 </button>
                 <div className="model-row-actions">
@@ -209,17 +228,22 @@ export function ModelSettings({ actions, adding, client, onAddingChange, state }
                       </svg>
                     )}
                   </button>
-                  <button
-                    aria-label={TEXT.settings.model.delete}
-                    className="model-icon-button"
-                    onClick={() => removeProfile(profile, name)}
-                    title={TEXT.settings.model.delete}
-                    type="button"
-                  >
-                    <svg aria-hidden="true" fill="none" height="15" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" viewBox="0 0 24 24" width="15">
-                      <path d="M4.5 6.5h15M9.5 6.5V4.8c0-.7.6-1.3 1.3-1.3h2.4c.7 0 1.3.6 1.3 1.3v1.7M6.5 6.5l.8 12.2c0 .9.8 1.6 1.7 1.6h6c.9 0 1.7-.7 1.7-1.6l.8-12.2" />
-                    </svg>
-                  </button>
+                  {/* The credits model is recreated by the app on every sign-in,
+                      so deleting it only produces a confusing gap until the
+                      next reload: it has no delete action. */}
+                  {provider?.name === CREDITS_PROVIDER_NAME ? null : (
+                    <button
+                      aria-label={TEXT.settings.model.delete}
+                      className="model-icon-button"
+                      onClick={() => removeProfile(profile, name)}
+                      title={TEXT.settings.model.delete}
+                      type="button"
+                    >
+                      <svg aria-hidden="true" fill="none" height="15" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" viewBox="0 0 24 24" width="15">
+                        <path d="M4.5 6.5h15M9.5 6.5V4.8c0-.7.6-1.3 1.3-1.3h2.4c.7 0 1.3.6 1.3 1.3v1.7M6.5 6.5l.8 12.2c0 .9.8 1.6 1.7 1.6h6c.9 0 1.7-.7 1.7-1.6l.8-12.2" />
+                      </svg>
+                    </button>
+                  )}
                 </div>
                 {open ? (
                   <div className="model-row-detail">
@@ -279,7 +303,11 @@ export function ModelSettings({ actions, adding, client, onAddingChange, state }
       )}
 
       {adding ? (
-        <SettingsModal label={TEXT.settings.model.add} onClose={() => onAddingChange(false)}>
+        <SettingsModal
+          hint={TEXT.settings.model.addHint}
+          label={TEXT.settings.model.add}
+          onClose={() => onAddingChange(false)}
+        >
           <ModelForm
             client={client}
             onCancel={() => onAddingChange(false)}

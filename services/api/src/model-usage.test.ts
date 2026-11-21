@@ -18,6 +18,7 @@ import assert from "node:assert/strict";
 
 
 import { normalizeUsage } from "@sciencediscovery/model";
+import { addCapturedModelUsage, unreportedModelUsage } from "./model-usage/index.js";
 import type { ModelInvocationUsage } from "@sciencediscovery/schema";
 
 import {
@@ -446,4 +447,48 @@ test("USG-017 analytics CSV export is stable and escapes spreadsheet formulas", 
   assert.match(csv, /"'\+unsafe"/);
   assert.match(csv, /"'=cmd"/);
   assert.match(csv, /"0.42 \/ 3.1","USD \/ CNY","5.9098","CNY","USD\/CNY 6.69","Frankfurter","2026-09-01T00:00:00.000Z"/);
+});
+
+test("a run row sums its turns and says how many it summed", () => {
+  const first = { cacheReadTokens: 10, cacheWriteTokens: null, inputTokens: 100, outputTokens: 20, reasoningTokens: null, totalTokens: 120, usageStatus: "reported" as const };
+  const second = { cacheReadTokens: 5, cacheWriteTokens: null, inputTokens: 300, outputTokens: 40, reasoningTokens: 7, totalTokens: 340, usageStatus: "reported" as const };
+  const total = addCapturedModelUsage(addCapturedModelUsage(unreportedModelUsage(), first), second);
+  // One row per invocation carries the invocation's total, so its token figures
+  // describe the same window as its startedAt/finishedAt (#1109).
+  assert.equal(total.inputTokens, 400);
+  assert.equal(total.outputTokens, 60);
+  assert.equal(total.totalTokens, 460);
+  assert.equal(total.usageStatus, "reported");
+  // A turn that reported nothing is not a zero-cost turn.
+  const unreported = unreportedModelUsage();
+  assert.deepEqual(addCapturedModelUsage({ ...first }, unreported), first);
+  // A run whose turns never reported stays unknown rather than becoming zeros.
+  assert.equal(addCapturedModelUsage(unreported, unreported).inputTokens, null);
+  assert.equal(addCapturedModelUsage(unreported, unreported).usageStatus, "provider-not-reported");
+});
+
+test("analytics reports missing and partial token fields separately from reported zeros", () => {
+  const summary = summarizeModelUsageAnalytics([
+    usage({ id: "zero", inputTokens: 0, outputTokens: 0, totalTokens: 0 }),
+    usage({ id: "missing", inputTokens: null, outputTokens: null, totalTokens: null, usageStatus: "provider-not-reported" }),
+    usage({ id: "partial", inputTokens: 25, outputTokens: null, totalTokens: null }),
+  ], { projectNameById: new Map(), projectIdBySessionId: new Map(), sessionTitleById: new Map() });
+  const expected = { invocationCount: 3, reportedInputCount: 2, reportedOutputCount: 1, reportedTotalCount: 1 };
+  assert.deepEqual(summary.overview.reporting, expected);
+  assert.deepEqual(summary.dailyByModel[0]?.reporting, expected);
+  assert.equal(summary.overview.inputTokens, 25);
+  assert.equal(summary.overview.totalTokens, 0);
+});
+
+test("analytics reporting metadata respects model/date filters and includes unknown-only models", () => {
+  const summary = summarizeModelUsageAnalytics([
+    usage({ modelProfileId: "unreported", startedAt: "2026-11-18T00:00:00Z", inputTokens: null, outputTokens: null, totalTokens: null, usageStatus: "provider-not-reported" }),
+    usage({ modelProfileId: "other", startedAt: "2026-11-18T00:00:00Z" }),
+    usage({ modelProfileId: "unreported", startedAt: "2026-11-17T00:00:00Z" }),
+  ], { projectNameById: new Map(), projectIdBySessionId: new Map(), sessionTitleById: new Map() },
+  { from: "2026-11-18", to: "2026-11-18", modelProfileId: "unreported" });
+  assert.deepEqual(summary.overview.reporting, { invocationCount: 1, reportedInputCount: 0, reportedOutputCount: 0, reportedTotalCount: 0 });
+  assert.equal(summary.dailyByModel.length, 1);
+  assert.equal(summary.dailyByModel[0]?.modelProfileId, "unreported");
+  assert.deepEqual(summary.dailyByModel[0]?.reporting, summary.overview.reporting);
 });

@@ -24,6 +24,7 @@ import type {
 import type { McpSourceRegistry } from "@sciencediscovery/mcp-sources";
 
 import type { McpTransportClient } from "./transport.js";
+import { SourceOutages, sourceOutages } from "./source-outage.js";
 
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -104,10 +105,15 @@ export class McpSourceCatalog {
   constructor(
     private readonly registry: McpSourceRegistry,
     private readonly gateway: McpTransportClient,
-    /** Current per-server resolved proxies, sent with reloads so the gateway
-     *  rebuilds MCP connections under the right outbound configuration. */
+    /** Current resolved proxies apply to initial discovery and later refreshes. */
     private readonly proxyMapProvider?: () => Record<string, ResolvedProxy>,
     private readonly onCatalog?: (catalog: McpCatalog) => void,
+    /** The broker's outage memory. It only decorates `getStatus`, so the
+     *  readiness view can report a dead provider without changing the gate:
+     *  every caller decides on `status`, which this never touches (#1081). */
+    private readonly outages: SourceOutages = sourceOutages,
+    /** Reject discovery results captured before a configuration/auth mutation. */
+    private readonly configurationRevision?: () => string,
   ) {}
 
   private apply(catalog: McpCatalog): McpCatalog {
@@ -121,11 +127,21 @@ export class McpSourceCatalog {
   }
 
   async refresh(signal?: AbortSignal): Promise<McpCatalog> {
-    return this.apply(await this.gateway.catalog(signal));
+    const revision = this.configurationRevision?.();
+    return this.applyCurrent(await this.gateway.catalog(signal, this.proxyMapProvider?.()), revision);
   }
 
   async reload(signal?: AbortSignal): Promise<McpCatalog> {
-    return this.apply(await this.gateway.reload(this.proxyMapProvider?.(), signal));
+    const revision = this.configurationRevision?.();
+    return this.applyCurrent(await this.gateway.reload(this.proxyMapProvider?.(), signal), revision);
+  }
+
+  /** Leave the current registry untouched when an in-flight snapshot expired. */
+  private applyCurrent(catalog: McpCatalog, revision: string | undefined): McpCatalog {
+    if (revision !== this.configurationRevision?.()) {
+      return { ...catalog, revision: createHash("sha256").update("[]").digest("hex"), servers: [] };
+    }
+    return this.apply(catalog);
   }
 
   getCatalog(): McpCatalog | undefined {
@@ -134,16 +150,18 @@ export class McpSourceCatalog {
 
   getStatus(sourceId: string): McpSourceStatus {
     const status = this.statuses.get(sourceId);
-    if (status) return structuredClone(status);
-    const source = this.registry.get(sourceId);
-    return {
+    const base: McpSourceStatus = status ? structuredClone(status) : {
       availableTools: [],
       error: "MCP catalog has not been refreshed",
       lastCheckedAt: new Date(0).toISOString(),
-      missingTools: Object.keys(source.manifest.tools),
+      missingTools: Object.keys(this.registry.get(sourceId).manifest.tools),
       sourceId,
       status: "unavailable",
     };
+    // Advisory decoration only: `status`, `error` and `missingTools` are exactly
+    // what configuration says they are, so no gate changes behaviour here.
+    const lastOutage = this.outages.read(sourceId);
+    return lastOutage ? { ...base, lastOutage } : base;
   }
 
   listStatuses(): McpSourceStatus[] {
