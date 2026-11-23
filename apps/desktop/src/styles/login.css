@@ -330,6 +330,10 @@
   position: relative;
   height: 100vh;
   overflow: hidden;
+  /* The tagline is sized from this panel's width, not the viewport's: the
+     column is clamped (340–710px), so a vw-based size leaves a lone character
+     on the second line at the narrow end. */
+  container-type: inline-size;
   background:
     radial-gradient(90% 60% at 18% 6%, rgba(255, 255, 255, .5), transparent 62%),
     linear-gradient(168deg, #a9dced 0%, #b8e0ea 40%, #cfe7d8 68%, #efe6c9 100%);
@@ -360,7 +364,9 @@
 .login-art-copy h2 {
   margin: 0;
   font-family: "HarmonyOS Sans", "Segoe UI", system-ui, sans-serif;
-  font-size: clamp(28px, 2.5vw, 48px);
+  /* 14 CJK glyphs must fit the panel minus its 24px side padding; 5.4cqw
+     keeps them on one line from the 340px floor to the 710px cap. */
+  font-size: clamp(18px, 5.4cqw, 44px);
   font-weight: 400;
   line-height: 1.12;
   letter-spacing: .2px;
