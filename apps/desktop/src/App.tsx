@@ -26,7 +26,7 @@ import { appendEvolveDirection, isEvidenceSessionReadOnly, isEvolveRunActive, ty
 import { ApiClient } from "./api/client.js";
 import { TOKEN_STORAGE_KEY } from "./state/storage.js";
 import { AccountApiError, revokeAccountSession } from "./auth/account.js";
-import { ensureCreditsModel } from "./auth/credits-model.js";
+import { CREDITS_PROVIDER_NAME, ensureCreditsModel } from "./auth/credits-model.js";
 import { requiresLocalToken } from "./auth/gate.js";
 import { clearSession, readSession, saveSession, sessionRefreshDelayMs, type UserSession } from "./auth/session.js";
 import { ensureFreshAccountSession } from "./auth/session-refresh.js";
@@ -217,16 +217,6 @@ export function App({ initialToken }: Props) {
   // the account page updates the record (a new callback would restart its load).
   const accountSessionRef = useRef(accountSession);
   accountSessionRef.current = accountSession;
-  // Signing out drops the account, not the machine's credential: a workspace
-  // running on a custom model keeps working, and the user surface turns into a
-  // signed-out page with the one way back in.
-  const signOut = useCallback(() => {
-    const current = accountSessionRef.current;
-    if (current) void revokeAccountSession(current.accessToken).catch(() => undefined);
-    clearSession();
-    setAccountSession(undefined);
-    setAccountOpen(true);
-  }, []);
   // The page reads the account back after every change, so the record it hands
   // over is written through to storage as well: a rename must survive a reload.
   const updateAccountSession = useCallback((next: UserSession) => {
@@ -239,6 +229,27 @@ export function App({ initialToken }: Props) {
   // a mutable header through every call site.
   const client = useMemo(() => new ApiClient(token, onAuthRejected), [onAuthRejected, token]);
   const { actions, boot, state } = useWorkspace(client, onAuthRejected);
+  // Signing out drops the account, not the machine's credential: a workspace
+  // running on a custom model keeps working, and the user surface turns into a
+  // signed-out page with the one way back in. It is a decision with a visible
+  // cost — the credit model stops answering until the next sign-in — so the
+  // button asks before it acts.
+  const signOut = useCallback(() => {
+    actions.confirmAction({
+      accept: TEXT.account.signOut,
+      body: TEXT.account.signOutBody,
+      eyebrow: "",
+      onAccept: () => {
+        const current = accountSessionRef.current;
+        if (current) void revokeAccountSession(current.accessToken).catch(() => undefined);
+        clearSession();
+        setAccountSession(undefined);
+        setAccountOpen(true);
+      },
+      title: TEXT.account.signOutTitle,
+      warning: true,
+    });
+  }, [actions]);
   const creditsModelToken = useRef<string | undefined>(undefined);
 
   useEffect(() => {
@@ -877,10 +888,12 @@ export function App({ initialToken }: Props) {
     // needs refreshing, which keeps the account details on screen.
     if (localToken !== token) {
       acceptToken(localToken);
-    } else if (creditsModelReady && boot === "setup") {
-      // The sign-in registered the credits model after boot had already decided
-      // the catalog was empty. Re-run the bootstrap so the non-empty catalog
-      // opens the workspace instead of leaving the setup wizard on screen.
+    } else if (creditsModelReady) {
+      // Re-run the bootstrap so a freshly registered credits model opens the
+      // workspace. This is deliberately not gated on the `boot` value captured
+      // in this callback: a callback return can settle while boot is still
+      // reading an empty catalog, and that older closure would then leave the
+      // setup wizard on screen even though the model now exists.
       actions.finishSetup();
     } else {
       void actions.refreshCatalog();
@@ -888,7 +901,7 @@ export function App({ initialToken }: Props) {
     setAccountSession(session);
     setSettlingAuth(false);
     setAccountOpen(returnToAccount.current);
-  }, [actions, boot, onAuthRejected, token]);
+  }, [actions, onAuthRejected, token]);
 
   // A restored account settles the callback latch as well: the ticket is no
   // longer the reason this render is a sign-in page.
@@ -1340,6 +1353,20 @@ export function App({ initialToken }: Props) {
 
   /** The composer is one component in two places — under the transcript, and
    *  in the middle of the welcome page — so its props are assembled once. */
+  // Signing out revokes the credits provider's token, so leaving it in the
+  // picker would offer a model whose every run fails with 401. The provider
+  // stays in the catalog — signing back in needs no setup — it just is not
+  // offered until there is an account again.
+  const creditsProviderIds = new Set(
+    state.providers
+      .filter((provider) => provider.name === CREDITS_PROVIDER_NAME)
+      .map((provider) => provider.id)
+      .filter((id): id is string => Boolean(id)),
+  );
+  const isCreditsModel = (model: { providerId?: string }) => model.providerId !== undefined && creditsProviderIds.has(model.providerId);
+  const offeredModels = accountSession ? state.models : state.models.filter((model) => !isCreditsModel(model));
+  const creditsModelSignedOut = !accountSession
+    && state.models.some((model) => model.id === state.selectedModelId && isCreditsModel(model));
   const composerProps: Omit<ComponentProps<typeof Composer>, "landing" | "seed" | "tag"> = {
     activeProjectId: state.activeProjectId,
     // The session's own mode, else the reader's last choice, else the project/global
@@ -1368,7 +1395,7 @@ export function App({ initialToken }: Props) {
     attachments: state.attachments,
     client,
     jwBlocked: jwReady ? undefined : TEXT.composer.jwBlocked,
-    models: state.models,
+    models: offeredModels,
     onApprovalMode: (mode) => {
     // The choice is remembered before it is applied: a new conversation started
     // from this instance inherits it, and the selector on the landing page has
@@ -1413,7 +1440,9 @@ export function App({ initialToken }: Props) {
     seededCommand,
     selectedModelId: state.selectedModelId,
     skillsEpoch,
-    unavailableModel: Boolean(state.detail?.settingsOverrides?.modelId && !state.models.some(model => model.id === state.detail?.settingsOverrides.modelId)),
+    unavailableModel: creditsModelSignedOut
+      || Boolean(state.detail?.settingsOverrides?.modelId && !state.models.some(model => model.id === state.detail?.settingsOverrides.modelId)),
+    unavailableModelText: creditsModelSignedOut ? TEXT.errors.modelSignInRequired : undefined,
     selectedSpecialistId: state.detail?.specialistId,
     uploading: state.uploading,
   };
@@ -1603,7 +1632,7 @@ export function App({ initialToken }: Props) {
         // After signing out the account surface shows a grey avatar and the
         // single way back in; the workspace behind it stays usable with a
         // custom model.
-        <SignedOutAccount pending={settlingAuth} />
+        <SignedOutAccount onClose={() => setAccountOpen(false)} pending={settlingAuth} />
       ) : null}
 
       {settingsOpen ? (
@@ -1623,6 +1652,7 @@ export function App({ initialToken }: Props) {
             setSettingsOpen(false);
             openGuide();
           }}
+          signedIn={accountSession !== undefined}
           state={state}
         />
       ) : null}

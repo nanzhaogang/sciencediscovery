@@ -78,6 +78,8 @@ interface Props {
   /** Plays the first-run guide again. 通用 owns the row that asks for it, and
    *  the surface closes before the cards appear over the page. */
   onShowGuide: () => void;
+  /** See `ModelSettings.signedIn`: the credits model is unavailable without it. */
+  signedIn: boolean;
   state: WorkspaceState;
 }
 
@@ -97,6 +99,7 @@ export function SystemSettingsDialog({
   onClose,
   onGroupChange,
   onShowGuide,
+  signedIn,
   state,
 }: Props) {
   const [collapsed, setCollapsed] = useState<Partial<Record<CategoryId, boolean>>>({});
@@ -145,6 +148,7 @@ export function SystemSettingsDialog({
             adding={addingModel}
             client={client}
             onAddingChange={setAddingModel}
+            signedIn={signedIn}
             state={state}
           />
         );

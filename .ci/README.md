@@ -196,11 +196,11 @@ A separate credential-free `policy` job selects the profile/backend before L1,
 so a failed L1 check cannot hide the requested real suite. It also enforces one
 content rule, because it is the only job that checks out the pull request's
 history: a change to `application/package.json`'s `version` must be a release
-change — the title starts with `chore(release):` and every place the release is
-spelled carries the new number (the dot form in `electron-builder.yml` and the
-NSIS stub, plus the badge and the tag link in both READMEs; at GA the
-`${version}` macro is accepted in the artifact name, per
-`scripts/package-sd-windows.sh`). A violation fails `policy`, which every other
+change — the title starts with `chore(release):` and the new value is a SemVer
+shape. The version field is the single source of truth: the installer name
+expands `${version}` from it, the README badge is a dynamic latest-release
+badge, and the NSIS syntax-check stub mirrors no number. A violation fails
+`policy`, which every other
 job depends on, so the run stops before L1 with the reason in the log. Pull
 requests only: a push and the merge queue re-verify a commit whose pull request
 already answered. The rule is `.ci/release-version.mjs`; its cases carry
@@ -495,6 +495,8 @@ supplies the final case result. A retry that passes is counted as
 retry report keeps the case and the layer failed. The PR `pr` and merge-queue
 `merge` profiles do not retry a failed case, so their first failure remains the
 final result.
+
+The retry worktree is created from the committed `HEAD`. CI checkouts are clean by contract, while a local daily or release run refuses to retry when the parent checkout has uncommitted changes, so the retry cannot silently test a different tree.
 
 The retry policy intentionally includes product `FAIL` results in `daily` and
 `release` because those profiles validate paid live-model journeys against
