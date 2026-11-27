@@ -173,6 +173,48 @@ test("one SKILL.md goes up as the multipart field the route reads", async () => 
   } finally { await act(async () => { view.unmount(); }); }
 });
 
+/** Pick a file in the dialog and press 确定, then hand back the markup the
+ *  refusal left on the pane. */
+async function refusalMarkup(reason: unknown): Promise<string> {
+  const stub = new StubClient().fail(reason);
+  const view = await mount(
+    <SkillUploadView client={stub.asClient()} onCancel={() => {}} onImported={() => {}} />,
+  );
+  try {
+    const file = new File(["PK"], "skills-main.zip", { type: "application/zip" });
+    const input = view.root.findAllByType("input").find((node) => node.props.type === "file");
+    assert.ok(input);
+    await act(async () => { input.props.onChange({ target: { files: [file] } }); });
+    await act(async () => { buttonWithText(view, TEXT.settings.skills.uploadDialog.confirm).props.onClick(); });
+    return JSON.stringify(view.toJSON());
+  } finally { await act(async () => { view.unmount(); }); }
+}
+
+test("an archive over the entry cap shows the count beside the cap, in the pane's language", async () => {
+  const markup = await refusalMarkup(new ApiRequestError(
+    "Skill archive exceeds 500 entries",
+    413,
+    "SKILL_PACKAGE_REFUSED",
+    { refusal: { actual: 1200, cap: 500, limit: "entries", reason: "too-large" } },
+  ));
+  const text = TEXT.settings.skills.uploadDialog.refusals;
+  assert.ok(markup.includes(text.entries(1200, 500)), "the count and the cap are not beside each other");
+  assert.ok(markup.includes(text.onePackage), "the Git import route is not offered");
+  assert.ok(!markup.includes("Skill archive exceeds 500 entries"), "the server's English sentence was shown verbatim");
+});
+
+test("a repository ZIP with no root SKILL.md says one package and points at Git import", async () => {
+  const markup = await refusalMarkup(new ApiRequestError(
+    "Skill ZIP package root must contain SKILL.md",
+    400,
+    "SKILL_PACKAGE_REFUSED",
+    { refusal: { reason: "missing-root" } },
+  ));
+  const text = TEXT.settings.skills.uploadDialog.refusals;
+  assert.ok(markup.includes(text.missingRoot), "the missing root is not named");
+  assert.ok(markup.includes(text.onePackage), "the reader is not told that one ZIP is one package, or how to import a repository");
+});
+
 test("the drop zone is the label of the file input, so a click opens the picker", async () => {
   const view = await mount(
     <SkillUploadView client={new StubClient().asClient()} onCancel={() => {}} onImported={() => {}} />,
@@ -433,6 +475,60 @@ test("an upload that lands leaves a success notice over the list", async () => {
     const markup = JSON.stringify(view.toJSON());
     assert.ok(markup.includes(TEXT.settings.skills.toastUploadDone(skill.name)), "no success notice");
     assert.ok(view.root.findAllByProps({ className: "skill-toasts" }).length === 1);
+  } finally { await act(async () => { view.unmount(); }); }
+});
+
+test("an upload whose enable step fails says so instead of claiming success", async () => {
+  const stub = new StubClient()
+    .reply([skill])
+    .reply({ backend: "jiuwenswarm", skills: [] })
+    // afterInstall tries the switch, and the runtime refuses
+    .fail(new ApiRequestError("JiuwenSwarm is unreachable", 503))
+    .reply([skill, { ...skill, id: "fresh", name: "fresh" }])
+    .reply({ backend: "jiuwenswarm", skills: [] });
+  const view = await mount(<SkillsSettings client={stub.asClient()} />);
+  try {
+    await openAddView(view, TEXT.settings.skills.addMenu.upload);
+    await act(async () => {
+      await view.root.findByType(SkillUploadView).props.onImported({ ...detail, id: "fresh", name: "fresh" });
+    });
+    const markup = JSON.stringify(view.toJSON());
+    assert.ok(markup.includes(TEXT.settings.skills.toastUploadNotEnabled("fresh")), "no enable failure notice");
+    assert.ok(!markup.includes(TEXT.settings.skills.toastUploadDone("fresh")),
+      "the success notice still says the package is ready");
+    assert.ok(markup.includes("JiuwenSwarm is unreachable"), "the reason is missing");
+  } finally { await act(async () => { view.unmount(); }); }
+});
+
+test("a page that arrives after the repository changed does not land", async () => {
+  const commit = "0123456789abcdef0123456789abcdef01234567";
+  const urlA = "https://example.invalid/org/a.git";
+  const urlB = "https://example.invalid/org/b.git";
+  const stub = new StubClient()
+    .reply({ candidates: gitRows(0, 2), commit, nextCursor: "skills/skill-1", repositoryUrl: urlA, total: 3 })
+    .reply({ candidates: gitRows(2, 3), commit, repositoryUrl: urlA, total: 3 });
+  const view = await mount(<SkillGitImportView client={stub.asClient()} onCancel={() => {}} onStart={async () => {}} />);
+  try {
+    const input = () => view.root.findAllByType("input")
+      .find((node) => node.props["aria-label"] === TEXT.settings.skills.git.url);
+    const checkboxes = () => view.root.findAllByType("input").filter((node) => node.props.type === "checkbox");
+    assert.ok(input());
+    await act(async () => { input().props.onChange({ target: { value: urlA } }); });
+    await act(async () => { buttonWithText(view, TEXT.settings.skills.git.inspect).props.onClick(); });
+    assert.equal(checkboxes().length, 3);
+
+    // Read the next page, then correct the address before that page answers.
+    await act(async () => {
+      buttonWithText(view, TEXT.settings.skills.git.loadMore).props.onClick();
+      input().props.onChange({ target: { value: urlB } });
+    });
+
+    // The answer belongs to the repository the reader left: it must not
+    // repaint rows, or an import would target an address no longer on screen.
+    assert.equal(input().props.value, urlB);
+    assert.equal(checkboxes().length, 0, "the old repository's page repainted the list");
+    assert.ok(!JSON.stringify(view.toJSON()).includes(TEXT.settings.skills.git.found(3)),
+      "the old inspection's header is back");
   } finally { await act(async () => { view.unmount(); }); }
 });
 

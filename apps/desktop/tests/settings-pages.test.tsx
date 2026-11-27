@@ -32,6 +32,7 @@ import type {
 import type { WorkspaceActions, WorkspaceState } from "../src/app/use-workspace.js";
 import { getLanguage, setLanguage, TEXT } from "../src/text.js";
 import { writeSettingsCache } from "../src/app/settings-cache.js";
+import type { ReactTestRenderer } from "./support/dom-renderer.js";
 import { StubClient } from "./api-stub.js";
 import { GeneralSettings } from "../src/views/settings/GeneralSettings.js";
 import { SandboxDirectSettings } from "../src/views/settings/SandboxDirectSettings.js";
@@ -47,7 +48,7 @@ import { RuntimeSettings } from "../src/views/settings/RuntimeSettings.js";
 import { SkillForm } from "../src/views/settings/SkillForm.js";
 import { SkillsSettings } from "../src/views/settings/SkillsSettings.js";
 import { skillMeta } from "../src/views/settings/skill-meta.js";
-import { AbilityPicker } from "../src/views/settings/system/AbilityPicker.js";
+import { AbilityPicker, selectableSkills } from "../src/views/settings/system/AbilityPicker.js";
 import { McpServers } from "../src/views/settings/system/McpServers.js";
 import { MemorySettings } from "../src/views/settings/system/MemorySettings.js";
 import { SpecialistForm } from "../src/views/settings/system/SpecialistForm.js";
@@ -86,7 +87,7 @@ describe("the settings tree", () => {
     assert.deepEqual(Object.values(TEXT.settings.system.categories), ["系统", "智能", "连接", "工作区"]);
     assert.deepEqual(
       Object.values(TEXT.settings.system.groups).map((group) => group.label),
-      ["通用", "科学记忆", "模型", "模型用量", "技能", "MCP 服务器", "专家", "沙箱网络", "运行环境", "运行配额", "联网搜索", "网络代理", "超时", "会话管理", "导出记录", "Idea Tree"],
+      ["通用", "科学记忆", "模型", "模型用量", "技能", "MCP 服务器", "专家", "沙箱网络", "运行环境", "运行配额", "联网搜索", "网络代理", "超时", "会话管理", "导出记录", "研究思路树"],
     );
   });
 });
@@ -797,6 +798,43 @@ describe("the specialist form", () => {
     const connectors = pick("connectors");
     assert.ok(connectors.includes("arXiv"), "the picker does not list the connector");
   });
+
+  it("offers no bundled package that failed to load in the specialist picker", () => {
+    const valid = skill("draft-review", "初稿审阅");
+    const failed = {
+      description: "Failed to load: SKILL.md frontmatter is invalid YAML",
+      hash: "",
+      id: "idea-tree-team",
+      loadFailure: { code: "SKILL_VALIDATION", message: "SKILL.md frontmatter is invalid YAML" },
+      name: "idea-tree-team",
+      readOnly: true,
+      source: "built-in",
+    } as unknown as SkillDescriptor;
+
+    assert.deepEqual(
+      selectableSkills([failed, valid]).map((entry) => entry.id),
+      ["draft-review"],
+      "the picker's input still offers a package the catalog reports as failed",
+    );
+
+    const markup = renderToStaticMarkup(
+      <AbilityPicker
+        connectors={[]}
+        initialTab="skills"
+        onApply={noConfirm}
+        onClose={noConfirm}
+        selectedConnectorIds={[]}
+        // A saved specialist may already name the now-broken package; it must
+        // not stay selected through the picker either.
+        selectedSkillIds={["idea-tree-team", "draft-review"]}
+        skills={[failed, valid]}
+      />,
+    );
+    assert.ok(markup.includes("初稿审阅"), "the valid skill is missing from the picker");
+    assert.ok(!markup.includes("idea-tree-team"), "the failed package is still listed in the picker");
+    assert.ok(!markup.includes("Failed to load"), "the server's English failure text reached the picker");
+    assert.equal(markup.match(/checked=""/gu)?.length, 1, "the failed package is still selected");
+  });
 });
 
 describe("the add-skill form", () => {
@@ -900,6 +938,29 @@ describe("the skill card", () => {
     } finally { setLanguage(previous); }
   });
 
+  it("shows a bundled package that failed to load without any switch, detail or row action", () => {
+    const failedClient = new StubClient().asClient();
+    writeSettingsCache(failedClient, "skills:jiuwenswarm", {
+      enabled: ["idea-tree-team"], native: false, switchesAvailable: true, jiuwenSwarmSkills: [],
+      skills: [skill({
+        description: "Failed to load: SKILL.md frontmatter is invalid YAML",
+        hash: "",
+        id: "idea-tree-team",
+        loadFailure: { code: "SKILL_VALIDATION", message: "SKILL.md frontmatter is invalid YAML" },
+        name: "idea-tree-team",
+        source: "built-in",
+      })],
+    });
+    const markup = renderToStaticMarkup(<SkillsSettings client={failedClient} />);
+    assert.ok(markup.includes(TEXT.settings.skills.loadFailure), "the failed row has no localized reason");
+    assert.ok(markup.includes("SKILL.md frontmatter is invalid YAML"), "the validator message is missing");
+    assert.ok(!markup.includes('role="switch"'), "a failed package still has a switch");
+    assert.ok(!markup.includes('<button class="settings-card-main"'), "a failed package still opens a detail view");
+    assert.ok(markup.includes("settings-card-main is-failed"), "the failed row is not marked as a failure");
+    assert.ok(!markup.includes(TEXT.settings.skills.rowMenu.actions("idea-tree-team")), "a failed package still has row actions");
+    assert.ok(!markup.includes(TEXT.settings.skills.toggle("idea-tree-team")), "a failed package still has a toggle");
+  });
+
   it("names the revision a skill was installed at instead of the server's label", () => {
     // The server's own label for an undeclared version is `revision:1`; put
     // after a `v` it read as `vrevision:1`.
@@ -940,12 +1001,12 @@ describe("the data sources page", () => {
       <McpServers client={client} onConfirm={noConfirm} onToast={noConfirm} />,
     );
 
-  it("reads one card list, not the custom/built-in tabs", () => {
+  it("shows catalog identity while the first read is pending", () => {
     const markup = page();
     assert.ok(markup.includes("settings-section"), "数据源 rendered no section");
     assert.ok(markup.includes(loading), "数据源 did not start a read");
     assert.ok(!markup.includes('role="tablist"'), "the custom/built-in tabs are back");
-    assert.ok(markup.includes(TEXT.settings.system.mcp.help), "the page does not explain default selection");
+    assert.ok(markup.includes(TEXT.settings.system.groups.mcp.description), "the page does not explain default selection");
   });
 
   it("keeps the create form closed until the user opens it", () => {
@@ -1104,5 +1165,60 @@ describe("each settings page", () => {
     assert.ok(sandbox.directExecution.heading && sandbox.directExecution.heading !== sandbox.heading,
       "the opt-in heading must be its own, not the page-level 沙箱网络 heading");
     assert.equal(sandbox.directExecution.heading, "沙箱");
+  });
+});
+
+/**
+ * #1383: 沙箱网络 is the starting policy for each execution, not a boundary.
+ * The page has to say that an approval widens one execution, that a denial and
+ * 完全访问 change nothing here, that host execution ignores the policy, and
+ * that 无网络 is not absolute either. Asserted on the rendered page, because a
+ * sentence that exists only in the dictionary is not on screen.
+ */
+describe("the sandbox network disclosure", () => {
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+  async function paint(): Promise<string> {
+    const page = new StubClient().reply({
+      allowPrivateNetwork: false,
+      allowedDomains: ["api.example.org"],
+      egressProxyPolicy: "inherit",
+      mode: "domain-allowlist",
+    });
+    let renderer!: ReactTestRenderer;
+    try {
+      await act(async () => {
+        renderer = create(
+          <NetworkSettings client={page.asClient()} onConfirm={noConfirm} toast={() => undefined} />,
+        );
+      });
+      return JSON.stringify(renderer.toJSON());
+    } finally {
+      if (renderer) await act(async () => renderer.unmount());
+    }
+  }
+
+  it("states the starting policy, the per-execution widening and what a denial does", async () => {
+    const previous = getLanguage();
+    try {
+      setLanguage("zh-CN");
+      const chinese = await paint();
+      assert.ok(chinese.includes("起始策略"), `the starting-policy wording is missing: ${chinese.slice(0, 400)}`);
+      assert.ok(chinese.includes("临时加入使用该授权的那一次执行的允许域名"), "the per-execution widening is not stated");
+      assert.ok(chinese.includes("拒绝不会改动这里的设置"), "a denial still reads as editing the setting");
+      assert.ok(chinese.includes("主机直执行不受沙箱网络策略约束"), "host execution is not scoped out of the policy");
+      assert.ok(chinese.includes("「完全访问」批准方式下，这类请求不会弹卡片"), "完全访问 auto-approval is not disclosed");
+      assert.ok(chinese.includes("仅含这些主机的允许域名"), "无网络 is still described as absolute");
+      assert.ok(!chinese.includes("只放行列出的域名"), "the old absolute-boundary sentence survived");
+
+      setLanguage("en");
+      const english = await paint();
+      assert.ok(english.includes("starting policy for each execution"), "the starting-policy wording is missing in English");
+      assert.ok(english.includes("adds those exact hosts to the single execution that uses that authorization"));
+      assert.ok(english.includes("Denying leaves this setting unchanged"));
+      assert.ok(english.includes("host execution is not subject to the sandbox network policy"));
+      assert.ok(english.includes("Under Full access approval mode these requests are approved without a card"));
+      assert.ok(english.includes("temporary allowlist of exactly those hosts"));
+    } finally { setLanguage(previous); }
   });
 });

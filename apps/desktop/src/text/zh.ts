@@ -40,12 +40,15 @@ const PERMISSION_DESCRIPTIONS: PermissionDescriptionRenderers = {
   "direct-host": ({ account, command, cwd, runnerId, subagentId, target, workspaceRoot }) =>
     `直接在主机上执行：Runner ${runnerId}，目标 ${target}，账号 ${account}，工作区 ${workspaceRoot}，目录 ${cwd || "."}`
     + `${subagentId ? `，子代理 ${subagentId}` : ""}。不会隔离文件系统、进程或网络，主机凭据可能可被访问；`
+    + `沙箱网络模式与域名白名单对它不生效，沙箱里刚被拒绝的主机仍可能经此通道访问；`
     + `主机上的影响无法全部追踪或回滚。同类授权只覆盖本次 Agent 运行中的这条命令和这个范围，没有固定有效期。`
     + `批准不会执行命令。命令：\n${command}`,
   "specialist-runtime": ({ runtime, workspaceRoot }) =>
     `在 API 主机上直接运行 ${runtime}（${workspaceRoot}）。这会移除本任务的外层沙箱；平台工具仍各自需要授权。`,
   network: ({ hosts, purpose, runnerId }) =>
-    `本次 Agent 运行允许 ${runnerId} 上的沙箱网络访问：${hosts.join("、")}。用途：${purpose}。`,
+    `本次 Agent 运行请求 ${runnerId} 上的沙箱网络访问：${hosts.join("、")}。用途：${purpose}。`
+    + `批准只会把这些主机临时加入使用该授权的那一次执行的允许域名，不改动设置里的白名单；在本次 Agent 运行内继续允许相同主机时，相同请求不再询问。`
+    + `拒绝只拒绝沙箱内的这条通道：设置里的白名单不变，主机直执行也不受沙箱网络策略约束。`,
   environment: ({ environmentId, language, manager, name, operation, runnerId }) => {
     const runner = runnerId ? `（Runner ${runnerId}）` : "";
     switch (operation) {
@@ -123,6 +126,8 @@ export const ZH = {
     projectDestination: "项目归属", noProject: "无项目", projectDestinationHint: "默认放入「会话」，也可以选择一个已有项目。",
     projectImport: (name: string) => `在「${name}」中导入会话`, messageMenu: "回复菜单", packageContents: "包含会话、工作区文件、产物及相关研究证据。",
     title: "科研证据包", import: "导入会话", export: "导出会话", continue: "继续聊天", branch: "创建新分支聊天", source: "返回来源会话",
+    /** The fallback "save as" name for a session the server left untitled. */
+    untitledSession: "科研会话", downloadFailed: "证据包下载失败，请重试。",
     readOnly: "导入证据快照 · 只读。创建独立副本后，可使用已有材料继续研究。", copying: "正在复制研究记录，可切换会话…", failed: "操作失败",
     recalculating: "正在重算…",
     omissionsSummary: (count: number) => `未包含 ${count} 个工作区文件`, download: "下载", preparing: "正在后台准备证据包…", close: "关闭", copyMissing: "复制任务对应的会话或操作记录已不存在，已停止等待。请重新创建续聊。", copyPollingFailed: "暂时无法读取复制进度，已停止重试。请稍后刷新或重新操作。", legacyUnavailable: "本地服务暂时不可用，正在重试…", exportPollingFailed: "暂时无法读取导出进度，已停止重试。请稍后重新导出。", exportMissing: "导出任务已不存在，请重新导出。",
@@ -213,6 +218,8 @@ export const ZH = {
 
   account: {
     eyebrow: "华为账号",
+    /** The name shown when HUAWEI shares no display name for the profile. */
+    defaultName: "华为账号用户",
     back: "返回会话",
     joined: (days: number) => `加入 ${days} 天`,
     emailReadonly: (email: string) => `邮箱 ${email}`,
@@ -325,6 +332,18 @@ export const ZH = {
     showMore: (count: number) => `显示更早的 ${count} 个会话`,
     /** The rule a folded Project states above its page: the newest N are shown. */
     pageRule: (count: number) => `最近 ${count} 个`,
+    searchRetry: "重试",
+    searchPlaceholder: "搜索",
+    searchLabel: "搜索",
+    searchAll: "全部",
+    searchClose: "关闭",
+    searchKinds: "搜索范围",
+    searchHint: "输入以搜索会话、项目和产物。",
+    searchProjects: "项目",
+    searchSessions: "会话",
+    searchArtifacts: "产物",
+    searchEmpty: (query: string) => `没有匹配「${query}」的会话、项目或产物。搜索只匹配名称与标题，不包含消息正文。`,
+    searchFailed: "搜索失败，请重试。",
     collapseSidebar: "收起侧栏",
     expandSidebar: "显示侧栏",
     /** Shown as the tooltip on a session name, for the gesture nothing else
@@ -370,7 +389,7 @@ export const ZH = {
     sessionSettings: "会话设置",
     /** 会话设置最上面的一项：进入程序演进。 */
     evolveExperiment: "程序演进实验",
-    ideaTree: "idea-tree",
+    ideaTree: "研究思路树",
     experts: "专家",
     expertsNone: "无",
     expertsHint: "为此对话绑定一位个人专家。",
@@ -386,7 +405,17 @@ export const ZH = {
     permissionAskDesc: "编辑外部文件和使用互联网时始终询问",
     permissionFull: "完全访问",
     permissionFullDesc: "可不受限制地访问互联网和您电脑上的任何文件",
-    permissionLocked: "这一轮跑完才能切换权限",
+    /** The pill stays usable during a run (#1330): the switch applies to the
+     *  tool calls that have not run yet. It settles a waiting approval only
+     *  when the new policy covers it: `direct_code` keeps asking, even under
+     *  完全访问. */
+    permissionModeRunning: "权限模式（本轮进行中，更改会影响后续工具调用）",
+    /** Says what the server actually does: the switch waits for an executing
+     *  tool to finish, then stops the session's kernels and shell sessions and
+     *  loses their in-memory state; it settles a waiting approval only when the
+     *  new policy covers it. 仅允许一次 is the safe path for a run that only
+     *  needs the current request released. */
+    permissionRunningHint: "本轮仍在运行：切换影响后续工具调用，并会停掉本会话的科研内核与 Shell 会话（其中的内存状态会丢失；正在执行的工具会先跑完，切换随后生效）；仅结算新策略覆盖的批准，本机直接执行仍需单独确认；只放行当前请求请用「仅允许一次」。",
     attachHint: (limit?: string) => limit === undefined
       ? "放进本次会话的工作区，智能体就能读到。也可以直接把文件拖进界面。"
       : `放进本次会话的工作区，智能体就能读到。单个文件最大 ${limit}。也可以直接把文件拖进界面。`,
@@ -396,8 +425,8 @@ export const ZH = {
   },
 
   ideaTreeOverride: {
-    title: "idea-tree 参数",
-    hint: "确认后把这套参数用于当前会话，并在输入框放好 Idea Tree 命令；补全研究任务后发送即可。单次修改只用于当前会话，不影响全局默认；只有点「覆盖全局设置」才会改全局默认。",
+    title: "研究思路树参数",
+    hint: "确认后把这套参数用于当前会话，并在输入框放好研究思路树命令；补全研究任务后发送即可。单次修改只用于当前会话，不影响全局默认；只有点「覆盖全局设置」才会改全局默认。",
     template: "研究模板",
     templateGeneral: "通用科学假设",
     templateWater: "水处理材料",
@@ -447,6 +476,10 @@ export const ZH = {
     } as Record<string, string>,
     summaryPass: "未发现问题",
     summaryFindings: (count: number) => `${count} 个问题`,
+    /** A warning is not a revision request; its row and badge say 提醒. */
+    summaryWarnings: (count: number) => `${count} 个提醒`,
+    summaryFindingsAndWarnings: (critical: number, warnings: number) =>
+      `${critical} 个问题 · ${warnings} 个提醒`,
     summaryContradicted: "矛盾",
     summaryPartlySupported: "部分支持",
     summaryIncomplete: "交付不完整",
@@ -473,7 +506,7 @@ export const ZH = {
       citation: "引用：核对引文标识符能否识别、格式是否完整；不核实文献是否支持结论。",
       computation: "计算：把报告里的数值与证据、数据逐项比对，检查数字与统计口径是否一致。",
       completeness: "完整性：按本次任务声明的交付清单，检查应交付的文件是否都在、是否为空白。",
-      semantics: "语义：由来源服务读原文，判断结论是否有出处支撑；只有深度审查会做。",
+      semantics: "语义：深度审查读取引用的文献原文，判断结论是否有出处支撑；只有深度审查会做。",
       other: "通用发现：不属于某一类具体检查，是审查过程中记录的问题。",
       gaps: "未检查：这次审查没有做这一项，原因见下方；未检查不等于通过。",
       source: "来源核验：把一条结论与来源原文对照，给出支持、部分支持、矛盾或无结论。",
@@ -502,10 +535,13 @@ export const ZH = {
       citation_identity: "这次审查没有核对文献身份（作者、期刊、年份）。",
       computation: "这次审查没有核对数字与计算依据。",
     } as Record<string, string>,
+    /** The claim-support gap as a Deep review leaves it. Asking the reader to
+     *  run a Deep review again would contradict the level they just chose. */
+    deepGapBodies: {
+      inconclusive: "深度审查已经尝试核对结论与来源，但没能作出判断（可能缺少足够的原文，或读到的内容无法明确支持或否定结论），所以这一项仍算未检查。这不代表报告有问题。",
+      noComparison: "深度审查没有找到可与原文比对的结论，所以这一项仍算未检查。",
+    },
     gapBodyUnknown: "这次审查没有执行这一项。",
-    /** A source check that could not conclude is not a report defect. */
-    inconclusive: "来源核验没有得出结论",
-    inconclusiveBody: "来源服务未返回结论，这不代表报告有问题。",
     /** A citation-format-only Quick pass did not look at claim support. */
     citationOnlyNote: "本次只核对引用格式，未检查结论支撑。",
     /** Why a checkpoint produced nothing, by the server's reason code. */
@@ -546,9 +582,9 @@ export const ZH = {
     queued: (count: number) => `排队 ${count}`,
     /** A bounded passage in a locked source; "定位" and evidence levels are
      *  internal vocabulary, so the card says what was found instead. */
-    locators: (count: number) => `${count} 处原文`,
-    sourceInconclusiveWith: (count: number) => `找到 ${count} 处原文，但还不足以支撑这条结论。`,
-    sourceInconclusiveNone: "没有找到可用于支撑这条结论的原文。",
+    locators: (count: number) => `${count} 处来源材料`,
+    sourceInconclusiveWith: (count: number) => `找到 ${count} 处来源材料，但还不足以判断这条结论是否成立。`,
+    sourceInconclusiveNone: "没有找到可用于判断这条结论的来源材料。",
     failedDetail: "审查过程报告了错误。",
     empty: "这个检查点没有产生审查记录。",
     noReviews: "还没有审查记录。",
@@ -556,10 +592,10 @@ export const ZH = {
     levelName: (level: string): string => (level === "quick" ? "快速" : "深度"),
     levelPill: (level: string): string => (level === "quick" ? "快速" : "深度"),
     /** The pill only names the level; the tip carries what the name claims.
-     *  The two levels differ in whether a source service is consulted. */
+     *  The two levels differ in whether the cited source text is read. */
     levelTip: (level: string): string => (level !== "quick"
-      ? "深度审查：在快速检查之外，调用来源服务逐条核对结论与原文是否一致。"
-      : "快速审查：只在本机做确定性的结构、引用格式和交付完整性检查，不调用外部来源服务。"),
+      ? "深度审查：在快速检查之外，读取引用的文献原文和证据，逐条核对结论与来源是否一致。"
+      : "快速审查：只在本机做确定性的结构、引用格式和交付完整性检查，不读取文献原文。"),
   },
 
   /** The bottom-right banner while the JiuwenSwarm cluster is still starting
@@ -806,6 +842,8 @@ export const ZH = {
     disabledBody: "在「设置 → 科学记忆」里开启后，报告的引用就能展开成证据与产物。",
     unreachableTitle: "暂时读不到科学记忆",
     unreachableBody: "记忆服务没有响应。稍后再试一次。",
+    authTitle: "记忆服务拒绝了访问凭据",
+    authBody: "记忆服务有响应，但拒绝了本机 API 使用的内部令牌。请确认 API 与记忆服务的内部令牌配置一致，再重新检查。",
     errorTitle: "读取失败",
     retry: "重试",
     previewTab: "预览",
@@ -822,6 +860,7 @@ export const ZH = {
     },
     status: {
       healthy: "运行正常",
+      unauthorized: "凭据被拒绝",
       degraded: "连接失败",
       checking: "检查中",
       unknown: "状态未知",
@@ -1123,6 +1162,7 @@ export const ZH = {
       /** The × inside the search field that puts the whole list back. */
       clearSearch: "清空搜索",
       noMatches: "没有匹配的技能。",
+      loadFailure: "内置技能加载失败",
 
       heading: "技能",
       jiuwenSwarmOnly: "当前执行器不是 JiuwenSwarm，技能开关不可用。",
@@ -1247,13 +1287,25 @@ export const ZH = {
       closeDialog: "关闭",
       /** 技能 › 上传技能, as the handoff's dialog. */
       uploadDialog: {
-        hint: "文件夹或者.zip需要包含Skill.md文件，.md 文件需包含 YAML 格式的技能名称和描述。",
+        hint: "文件夹或 .zip 需要包含 SKILL.md，单个 .md 文件需要有 YAML 格式的名称和描述；一个压缩包只能装一个技能包，整个仓库请用「从 GitHub 导入」。",
         chooseFile: "选择文件",
         dropTitle: "选择Skill.md文件",
         dropHint: "点击或拖动压缩包或文件到此处",
         reselect: "重新选择",
         cancel: "取消",
         confirm: "确定",
+        /** 上传被服务端拒绝时，按拒绝的事实写出的句子。 */
+        refusals: {
+          entries: (actual: number, cap: number) => `压缩包里有 ${actual} 个条目，上限是 ${cap} 个。`,
+          files: (actual: number, cap: number) => `技能包里有 ${actual} 个文件，上限是 ${cap} 个。`,
+          archiveBytes: (actual: string, cap: string) => `压缩包大小是 ${actual}，超过了 ${cap} 的上限。`,
+          extractedBytes: (actual: string, cap: string) => `解压后的内容有 ${actual}，超过了 ${cap} 的上限。`,
+          fileBytes: (path: string, cap: string) => `「${path}」超过了单个文件 ${cap} 的上限。`,
+          missingRoot: "压缩包的根目录里没有 SKILL.md。",
+          severalRoots: "压缩包的顶层不是单个技能包目录。",
+          outsideRoot: "压缩包里有技能包根目录之外的文件。",
+          onePackage: "一个压缩包只能导入一个技能包。如果这是装着多个技能的仓库，请改用「从 GitHub 导入」，先选择要导入的技能。",
+        },
       },
       /** 技能 › 从 GitHub 导入, as the handoff's dialog. */
       gitDialog: {
@@ -1266,6 +1318,8 @@ export const ZH = {
       importBusy: "正在导入…",
       backgroundImportDone: (count: number) => `已导入 ${count} 个技能。`,
       backgroundImportPartial: (imported: number, failed: number) => `已导入 ${imported} 个，${failed} 个失败。`,
+      backgroundImportEnableFailed: (imported: number, failed: number) =>
+        `已导入 ${imported} 个技能，但 ${failed} 个未能启用。`,
       backgroundImportFailed: "后台导入失败。",
       backgroundImportFailures: (names: string, count: number) =>
         count > 3 ? `失败：${names} 等 ${count} 个` : `失败：${names}`,
@@ -1273,6 +1327,7 @@ export const ZH = {
       importSucceeded: (name: string) => `已导入「${name}」。`,
       /** The 技能 page's own notices (design 1-4). */
       toastUploadDone: (name: string) => `「${name}」上传成功！`,
+      toastUploadNotEnabled: (name: string) => `「${name}」已导入，但未能启用。`,
       toastGitDone: "GitHub 技能导入成功！",
       toastGitFailed: "GitHub 技能导入失败",
       toastProgress: (done: number, total: number) => `正在导入(${done}/${total})`,
@@ -1388,6 +1443,8 @@ export const ZH = {
         modeAllowlist: "域名白名单",
         modeOpen: "开放网络",
         modeOpenWarning: "开放网络意味着沙箱里的任何代码都能访问任意地址，只保留私网过滤。确定要这样吗？",
+        switching: "正在保存网络设置，保存完成前不能切换模式。",
+        staleMode: "无法读取当前的沙箱网络设置；重新加载后才能切换模式。",
         saved: "沙箱网络已保存",
         /** The allowlist editor. The accepted format is shown by the
          *  placeholder rather than explained in a sentence. */
@@ -1395,7 +1452,16 @@ export const ZH = {
         domainsPlaceholder: "example.org\n*.example.org:443",
         emptyDomains: "至少填写一个允许的域名。",
         saveDomains: "保存",
-        scope: "只作用于 run_shell 与沙箱内的代码。",
+        scope: "只作用于 run_shell 与沙箱内的代码；这是每次执行的起始策略，批准的网络访问只会临时扩充当次执行。",
+        /** Said next to the list, because the list alone reads as a boundary
+         *  (#1383): an approval widens one execution, a denial and 完全访问
+         *  change nothing here, and host execution ignores the policy. */
+        approvalNote:
+          "对话中批准网络访问只会把这些主机临时加入使用该授权的那一次执行的允许域名，不会写回这里的设置；"
+          + "在本次 Agent 运行内持续允许同类请求，才让相同主机不再弹卡片。"
+          + "拒绝不会改动这里的设置，而且只阻止沙箱内的通道——主机直执行不受沙箱网络策略约束。"
+          + "「完全访问」批准方式下，这类请求不会弹卡片、会被自动批准；"
+          + "「无网络」模式下一次批准也会让那次执行临时获得仅含这些主机的允许域名。",
         /** [mac-direct] 安装级 opt-in。开启后本地代码执行不再经过沙箱：
          *  影响范围是整个本地执行栈——Agent 的临时 Shell/Python 与程序
          *  演进的候选程序都以你本人的文件、网络与环境权限运行；持久
@@ -1680,7 +1746,7 @@ export const ZH = {
         timeouts: { label: "超时", description: "墙钟限制与不限模式" },
         "session-management": { label: "会话管理", description: "已归档的会话，可恢复或彻底删除" },
         "export-history": { label: "导出记录", description: "本机保存过的研究包" },
-        "idea-tree": { label: "Idea Tree", description: "假设树的研究范围与阶段提示词" },
+        "idea-tree": { label: "研究思路树", description: "假设树的研究范围与阶段提示词" },
       },
       global: {
         modelHeading: "主模型",
@@ -1693,6 +1759,52 @@ export const ZH = {
         connectorsEmpty: "这台机器上还没有可用的连接器。",
       },
       mcp: {
+        allMcp: "全部MCP",
+        myMcp: "我的MCP",
+        officialMcp: "官方MCP",
+        searchMcp: "搜索MCP",
+        enableAll: "一键启用",
+        disableAll: "一键关闭",
+        bulkHint: "批量操作仅影响当前显示的自定义服务；内置服务开关控制会话默认使用。",
+        bulkFailed: (names: string) => `以下服务更新失败：${names}。可重试更新剩余服务。`,
+        tryIt: "去试试",
+        tryUnavailable: "未启用服务不支持；内置来源需处于可用状态。",
+        noMatches: "没有匹配的 MCP 服务",
+        manualEntry: "手动填写",
+        importJsonEntry: "导入 JSON",
+        jsonSource: "JSON 来源",
+        importFillHint: "粘贴包含 mcpServers 的 JSON 或上传文件，检查并修改下方配置后，确认添加。",
+        importEmptyHint: "粘贴或上传 JSON 后，配置会自动填入下方表单。",
+        chooseConfiguration: "服务器配置",
+        duplicateName: "服务器名称不能重复。",
+        timeoutInvalid: "超时必须是 1 到 600 之间的整数。",
+        commandRequired: "STDIO 需要填写命令。",
+        urlInvalid: "请填写不含用户名、密码或片段的 HTTP(S) 地址。",
+        confirmAdd: (count: number) => count > 1 ? `确认添加 ${count} 台服务器` : "确认添加",
+        importFilled: (count: number) => `已填入 ${count} 份配置，请检查并修改后确认添加。`,
+        importProgress: (added: number, total: number) => `已添加 ${added}/${total} 台，仅重试尚未添加的配置。`,
+        addedCount: (count: number) => `已添加 ${count} 台 MCP 服务器`,
+        savedCheckFailed: (reason: string) => `配置已保存。连接检查：${reason}`,
+        importFieldInvalid: (name: string, field: string) => `「${name}」的 ${field} 无效，请修改 JSON 后重试。`,
+        configured: "已配置的服务器",
+        details: "服务器详情",
+        custom: "外部",
+        noDescription: "暂无描述",
+        builtinReadOnly: "内置来源由应用管理，仅支持查看。",
+        checkedAt: "最近检查时间",
+        neverChecked: "暂无检查记录",
+        checkHint: "连接状态为最近一次发现或测试的结果，并非持续心跳。服务启用与会话默认选用分别设置。",
+        storedValue: "已安全保存",
+        publisher: "发布者 / 版本",
+        serviceEnabled: "已启用",
+        selected: "已选用",
+        notSelected: "未选用",
+        authorized: "已授权",
+        authorizing: "正在等待授权",
+        deleted: "MCP 服务器已删除",
+        retry: "重试",
+        more: (name: string) => `${name}的更多操作`,
+        openDetails: (name: string) => `查看${name}详情`,
         heading: "MCP 服务器",
         help: "“默认使用”选择继承全局设置的会话所用的来源；项目或会话的显式选择优先。专家可能补充其他来源，实际工具调用仍受服务就绪状态和权限限制。自定义服务器编辑表单中的“启用服务”单独控制连接。更改不会重新配置正在运行的任务。",
         builtin: "内置",
@@ -1744,8 +1856,8 @@ export const ZH = {
         saved: "MCP 服务器已保存",
         deleteTitle: (name: string) => `删除服务器「${name}」？`,
         deleteBody: (name: string) => `删除「${name}」后依赖它的工具不再可用，已经跑完的结果不受影响。`,
-        addServer: "添加服务器",
-        createTitle: "新建服务器",
+        addServer: "新增 MCP 服务器",
+        createTitle: "新增 MCP 服务器",
         importServers: "导入",
         importPaste: "粘贴 JSON",
         importFile: "上传 JSON 文件",
@@ -1775,6 +1887,8 @@ export const ZH = {
         clearAuthorization: "清除授权",
         nameRequired: "名称不能为空。",
         openAuthorization: "打开授权页面",
+        actions: (name: string) => `${name}的操作`,
+        importChoice: "导入 JSON",
       },
       web: {
         searchHeading: "搜索",
@@ -1833,7 +1947,7 @@ export const ZH = {
         saving: "保存中…",
         saved: "已保存，对后续研究生效。",
         failed: "保存失败。",
-        unavailable: "Idea Tree 服务尚未就绪：请先启动 Evolve 服务，再回到这里重试。",
+        unavailable: "研究思路树服务尚未就绪：请先启动 Evolve 服务，再回到这里重试。",
       },
       specialists: {
         heading: "专家",
@@ -2263,6 +2377,19 @@ export const ZH = {
       busy: "这条回复还没结束，等它完成后再操作。",
     },
 
+    /* 一个没有卡片可写「已停止自动续跑」的停滞：检查点以普通散文到达、
+       fence 没解析成卡片，或者这一轮调用过 create_evolve_run 却没创建出
+       搜索。整段会话就停在那里，画面上没有任何可以点的东西，所以要由
+       会话自己把「搜索还没开始」和接下来该发的那句话写出来。句子与客户端
+       自动续跑时发送的完全一致，按钮只是替用户把它发出去。 */
+    stall: {
+      title: "搜索还没开始",
+      stopped: "自动续跑停在这一步：同一步已经自动推过一次，客户端不会再次自动继续。",
+      unstarted: "这一轮调用过 create_evolve_run，但还没有创建出搜索。",
+      send: "发送下面这句话继续：",
+      action: "发送这句话",
+    },
+
     create: {
       title: "新建程序演进实验",
       algorithmLabel: "选择搜索算法",
@@ -2463,9 +2590,9 @@ export const ZH = {
   },
 
   ideaTree: {
-    heading: "Idea Tree 研究",
-    empty: "这个会话还没有 Idea Tree 研究。",
-    unavailable: "Idea Tree 服务尚未就绪：请先启动 Evolve 服务，再回来查看。",
+    heading: "研究思路树",
+    empty: "这个会话还没有研究思路树。",
+    unavailable: "研究思路树服务尚未就绪：请先启动 Evolve 服务，再回来查看。",
     objective: "研究目标",
     legacyCard: "旧版假设树",
     legacyHint: "这条会话的树来自旧版本，只提供查看，不能在桌面端继续推进。",
@@ -2503,7 +2630,7 @@ export const ZH = {
     end: "结束",
     open: "打开任务面板",
     create: {
-      title: "启动 Idea Tree 研究",
+      title: "启动研究思路树",
       hint: "研究在后台自行推进；卡出现后点开即可看树、节点与控制。",
       taskLabel: "研究任务",
       taskPlaceholder: "一句话说明课题与验收边界",
@@ -2513,7 +2640,7 @@ export const ZH = {
       starting: "正在启动…",
       cancel: "取消",
       failed: "启动失败。",
-      unavailable: "Idea Tree 服务尚未就绪：请先启动 Evolve 服务，再回来重试。",
+      unavailable: "研究思路树服务尚未就绪：请先启动 Evolve 服务，再回来重试。",
     },
     detail: {
       title: "节点详情",

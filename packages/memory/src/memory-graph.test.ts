@@ -27,7 +27,7 @@ import type { ObserveToolCallPayload } from "./memory-graph.js";
  * to assert the API-side client/sink posts the right shape to /observe/tool-call
  * and that the sink's fire-and-forget contract never throws into the caller.
  */
-function startFakeMemoryGraph(handler: (path: string, body: unknown) => { status: number; json: unknown }): Promise<http.Server> {
+function startFakeMemoryGraph(handler: (path: string, body: unknown, request: http.IncomingMessage) => { status: number; json: unknown }): Promise<http.Server> {
   const server = http.createServer((request, response) => {
     let data = "";
     request.on("data", (chunk) => { data += chunk; });
@@ -36,7 +36,7 @@ function startFakeMemoryGraph(handler: (path: string, body: unknown) => { status
       if (data) {
         try { body = JSON.parse(data); } catch { /* leave null */ }
       }
-      const { status, json } = handler(request.url ?? "/", body);
+      const { status, json } = handler(request.url ?? "/", body, request);
       response.writeHead(status, { "content-type": "application/json" });
       response.end(JSON.stringify(json));
     });
@@ -57,18 +57,129 @@ function close(server: http.Server): Promise<void> {
 test("health requests carry a timeout signal", async () => {
   const originalFetch = globalThis.fetch;
   const signals: AbortSignal[] = [];
-  globalThis.fetch = async (_input, init) => {
+  const calls: Array<{ input: unknown; init: RequestInit | undefined }> = [];
+  globalThis.fetch = async (input, init) => {
     assert.ok(init?.signal instanceof AbortSignal);
     signals.push(init.signal);
+    calls.push({ input, init });
     return Response.json({ status: "healthy", backend: "neo4j" });
   };
   try {
     const client = new MemoryGraphClient({ url: "http://memory-graph.test", token: "t" });
     assert.deepEqual(await client.healthInfo(), { status: "healthy", backend: "neo4j" });
     assert.equal(await client.health(), "healthy");
-    assert.equal(signals.length, 2);
+    // /health plus the authenticated O(1) ping the status now depends on.
+    assert.equal(signals.length, 3);
+    assert.equal(String(calls[1]!.input), "http://memory-graph.test/health");
+    assert.equal(String(calls[2]!.input), "http://memory-graph.test/internal/ping");
+    assert.equal(new Headers(calls[2]!.init?.headers).get("authorization"), "Bearer t");
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("health reports unauthorized, not healthy, when /health answers but the authenticated probe is refused", async () => {
+  // The exact misconfiguration from Issue #1352: the sidecar's `/health` does
+  // not need the internal token, so it keeps saying healthy while every
+  // authenticated route refuses the wrong Bearer token. Reading only
+  // `/health` therefore called a broken installation healthy.
+  const probes: Array<{ authorization: string | undefined; body: unknown; path: string }> = [];
+  const server = await startFakeMemoryGraph((path, body, request) => {
+    if (path === "/health") return { status: 200, json: { status: "healthy", backend: "local" } };
+    probes.push({ authorization: request.headers.authorization, body, path });
+    return { status: 401, json: { detail: "invalid internal token" } };
+  });
+  try {
+    const client = new MemoryGraphClient({ url: `http://127.0.0.1:${portOf(server)}`, token: "wrong-token" });
+    assert.equal(await client.health(), "unauthorized");
+    // The probe is the O(1) authenticated ping: it must not issue a graph
+    // query whose cost depends on graph size.
+    assert.equal(probes.length, 1);
+    assert.equal(probes[0]!.path, "/internal/ping");
+    assert.equal(probes[0]!.authorization, "Bearer wrong-token");
+  } finally {
+    await close(server);
+  }
+});
+
+test("health stays degraded for a store the sidecar itself calls degraded", async () => {
+  const server = await startFakeMemoryGraph((path) => path === "/health"
+    ? { status: 200, json: { status: "degraded" } }
+    : { status: 200, json: { hits: [], total: 0, truncated: false } });
+  try {
+    const client = new MemoryGraphClient({ url: `http://127.0.0.1:${portOf(server)}`, token: "t" });
+    assert.equal(await client.health(), "degraded");
+  } finally {
+    await close(server);
+  }
+});
+
+test("a budget refusal from the authenticated probe does not read as down", async () => {
+  // The by-node-type probe this replaces answered HTTP 503 with
+  // `{"detail":{"code":"memory_graph_query_limit"}}` on a large local graph:
+  // the token was accepted, the store was healthy, the query work budget was
+  // not. The credential verdict must stay independent of graph availability,
+  // so that shape keeps the `/health` reading instead of "Cannot connect".
+  const server = await startFakeMemoryGraph((path) => path === "/health"
+    ? { status: 200, json: { status: "healthy", backend: "local" } }
+    : { status: 503, json: { detail: { code: "memory_graph_query_limit", message: "query budget exceeded" } } });
+  try {
+    const client = new MemoryGraphClient({ url: `http://127.0.0.1:${portOf(server)}`, token: "t" });
+    assert.equal(await client.health(), "healthy");
+  } finally {
+    await close(server);
+  }
+});
+
+test("an older sidecar without the O(1) ping still reports a refused credential", async () => {
+  // Mixed-version deployment: the API has the new probe, the sidecar predates
+  // it and answers 404. A 404 proves nothing about the credential, so the
+  // client must fall back to the authenticated read instead of calling the
+  // installation healthy — the original #1352 symptom.
+  const calls: string[] = [];
+  const server = await startFakeMemoryGraph((path) => {
+    calls.push(path);
+    if (path === "/health") return { status: 200, json: { status: "healthy", backend: "local" } };
+    if (path === "/internal/ping") return { status: 404, json: { detail: "Not Found" } };
+    return { status: 401, json: { detail: "invalid internal token" } };
+  });
+  try {
+    const client = new MemoryGraphClient({ url: `http://127.0.0.1:${portOf(server)}`, token: "wrong-token" });
+    assert.equal(await client.health(), "unauthorized");
+    assert.ok(calls.includes("/query/by-node-type"), "the fallback must test the credential again");
+  } finally {
+    await close(server);
+  }
+});
+
+test("an older sidecar's budget refusal in the fallback is not down", async () => {
+  // The fallback read is the old whole-graph probe, so its known budget
+  // refusal must still keep the `/health` reading rather than regress to
+  // "Cannot connect" on a large graph.
+  const server = await startFakeMemoryGraph((path) => {
+    if (path === "/health") return { status: 200, json: { status: "healthy", backend: "local" } };
+    if (path === "/internal/ping") return { status: 404, json: { detail: "Not Found" } };
+    return { status: 503, json: { detail: { code: "memory_graph_query_limit", message: "query budget exceeded" } } };
+  });
+  try {
+    const client = new MemoryGraphClient({ url: `http://127.0.0.1:${portOf(server)}`, token: "t" });
+    assert.equal(await client.health(), "healthy");
+  } finally {
+    await close(server);
+  }
+});
+
+test("an unexpected probe error is degraded, not evidence the token is accepted", async () => {
+  // A 500 from the probe is a failure of the check itself. Calling it healthy
+  // would give the same false assurance the probe exists to remove.
+  const server = await startFakeMemoryGraph((path) => path === "/health"
+    ? { status: 200, json: { status: "healthy", backend: "local" } }
+    : { status: 500, json: { detail: "probe exploded" } });
+  try {
+    const client = new MemoryGraphClient({ url: `http://127.0.0.1:${portOf(server)}`, token: "t" });
+    assert.equal(await client.health(), "degraded");
+  } finally {
+    await close(server);
   }
 });
 
@@ -103,6 +214,45 @@ test("queryMatch degrades to an empty result with a reason when the sidecar erro
     assert.equal(result.truncated, false);
     assert.equal(result.reason, "memory_graph_unreachable");
     assert.deepEqual(result.hits, []);
+  } finally {
+    await close(server);
+  }
+});
+
+test("a refused credential keeps its own reason instead of reading as an unreachable service", async () => {
+  // 401 and 403 mean the service answered; a timeout or a dead socket does
+  // not. The citation card needs the difference to decide between "try again"
+  // and "this installation's token is wrong".
+  let status = 401;
+  const server = await startFakeMemoryGraph(() => ({ status, json: { detail: "invalid internal token" } }));
+  try {
+    const client = new MemoryGraphClient({ url: `http://127.0.0.1:${portOf(server)}`, token: "wrong-token" });
+    assert.equal((await client.byNodeType(["Evidence"])).reason, "memory_graph_unauthorized");
+    assert.equal((await client.getChain("evidence-1", "s1", undefined, "viewSourcePaper")).reason, "memory_graph_unauthorized");
+    status = 403;
+    assert.equal((await client.queryMatch("x")).reason, "memory_graph_unauthorized");
+    status = 503;
+    assert.equal((await client.byNodeType(["Evidence"])).reason, "memory_graph_unreachable");
+  } finally {
+    await close(server);
+  }
+});
+
+test("GET and search reads keep a refused credential distinct from an outage", async () => {
+  // The subgraph, web-page hash and search-graph reads share the same defensive
+  // "never throw" contract, so they must share the reason split too; otherwise
+  // a token mismatch still reaches the web UI as an unreachable graph.
+  let status = 401;
+  const server = await startFakeMemoryGraph(() => ({ status, json: { detail: "invalid internal token" } }));
+  try {
+    const client = new MemoryGraphClient({ url: `http://127.0.0.1:${portOf(server)}`, token: "wrong-token" });
+    assert.equal((await client.getSubgraph("s1")).reason, "memory_graph_unauthorized");
+    assert.equal((await client.getWebPageContentHash("s1", "wp-1")).reason, "memory_graph_unauthorized");
+    // getSearchGraph's payload is opaque by design; only the reason is asserted.
+    assert.equal((await client.getSearchGraph("search-1") as { reason?: string }).reason, "memory_graph_unauthorized");
+    status = 500;
+    assert.equal((await client.getSubgraph("s1")).reason, "memory_graph_unreachable");
+    assert.equal((await client.getWebPageContentHash("s1", "wp-1")).reason, "memory_graph_unreachable");
   } finally {
     await close(server);
   }

@@ -655,8 +655,24 @@ async function readSpecialistBody<T>(request: IncomingMessage): Promise<T> {
   return body as T;
 }
 
+/** A startup component that never became available. Routes must report this as
+ *  a service fault (503), not as the code of the validation that stopped the
+ *  component: the caller did not send the file that failed to parse. */
+class StartupUnavailableError extends Error {
+  readonly code = "STARTUP_UNAVAILABLE";
+
+  constructor(readonly reason: unknown) {
+    super(reason instanceof Error ? reason.message : "Service initialization failed", { cause: reason });
+    this.name = "StartupUnavailableError";
+  }
+}
+
 export function createApiServer(config = loadServerConfig(), dependencies: ApiServerDependencies = {}): Server {
-  const platform = createPlatformServices(config, repositoryRoot, dependencies);
+  // The bundled Skill packages are read once from this root. Tests point it at
+  // a temporary tree so a malformed built-in can be reproduced without editing
+  // the checkout; production keeps the checkout it is running from.
+  const bundledSkillsRoot = dependencies.repositoryRoot ?? repositoryRoot;
+  const platform = createPlatformServices(config, bundledSkillsRoot, dependencies);
   const measurePackageCapacity = dependencies.measureResearchPackageCapacity ?? measureResearchPackageCapacity;
   const {
     artifactManager,
@@ -1139,7 +1155,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
   const ready = modelCatalog.load()
     .then(() => skillLibraryCatalog.load())
     .then(() => store.setConfigurationSkillLibrarySource(() => skillLibraryCatalog.list()))
-    .then(() => skillLibraryCatalog.seedBuiltInSkillLibrary(repositoryRoot))
+    .then(() => skillLibraryCatalog.seedBuiltInSkillLibrary(bundledSkillsRoot))
     .then(() => initializePlatformServices(platform, config, skillLibraryCatalog))
     .then(() => conversationalConfiguration().service.recoverPendingVerifications())
     .then(() => store.plugins.bindAssets(async (settings) => {
@@ -1151,7 +1167,14 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
     }))
     .then(() => recoverContinuations())
     .then(() => reviewerAuditCoordinator.resume())
-    .then(() => undefined);
+    .then(() => undefined)
+    // Initialization is the process's own work, not something the caller sent.
+    // Tag a failed component so a request that waits here answers "service
+    // unavailable" instead of the client-error code of whatever stopped it
+    // (a SKILL_VALIDATION used to make every route answer 400).
+    .catch((error: unknown) => {
+      throw new StartupUnavailableError(error);
+    });
 
   // With the JiuwenSwarm backend its web search is configured from the web settings: pushed once the store has
   // loaded (a few tries, the adapter may still be starting) and again on every change.
@@ -1364,8 +1387,19 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       // Answer fast instead: 503 "starting" until ready, bounded component
       // checks after that — never a hung response.
       if (request.method === "GET" && (url.pathname === "/health" || url.pathname === "/api/health")) {
-        if (!(await settleWithin(ready.then(() => true), 3_000, false))) {
-          sendJson(response, 503, { service: "sciencediscovery-api", liveness: "starting" });
+        // A rejected startup promise is a service state, not a request error:
+        // `settleWithin` races, and an unhandled rejection would reject the race
+        // and send the raw initialization error to every probe.
+        const startup = await settleWithin(
+          ready.then(() => "ready" as const, () => "failed" as const),
+          3_000,
+          "starting" as const,
+        );
+        if (startup !== "ready") {
+          sendJson(response, 503, {
+            liveness: startup === "failed" ? "unavailable" : "starting",
+            service: "sciencediscovery-api",
+          });
           return;
         }
         // Liveness for everyone, detail for a caller that proves it may read it:
@@ -2244,7 +2278,14 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
         const skillId = decodeURIComponent(jiuwenSwarmSkillByIdMatch[1]!);
         let snapshot: RuntimeSkillSnapshot;
         try {
-          snapshot = skillCatalog.resolve([skillId])[0]!;
+          const resolved = skillCatalog.resolve([skillId])[0];
+          // `resolve` drops a saved selection naming a bundled package that
+          // failed to load, so it answers an empty list instead of throwing.
+          // That package has no snapshot to import: answer 404 as for an id
+          // that was never installed, not a TypeError the catch below would
+          // report as HTTP 502.
+          if (!resolved) throw new SkillCatalogError("SKILL_NOT_FOUND", `Skill not found: ${skillId}`);
+          snapshot = resolved;
         } catch (error) {
           throw new ApiStatusError(404, error instanceof Error ? error.message : String(error));
         }
@@ -4079,8 +4120,15 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
           // without serialising the whole subgraph.
           const { contentHash, reason } =
             await memoryGraphClient.getWebPageContentHash(sessionId, webPageId);
-          if (reason === "memory_graph_unreachable") {
-            return sendError(response, 502, "memory graph unreachable");
+          // A reason means the graph could not answer: unreachable, busy, or
+          // refusing this installation's credential. None of those mean the
+          // WebPage is gone, so every reason must stay a 502 — folding an auth
+          // rejection into the 404 would tell the reader their page no longer
+          // exists. The client maps 401/403 to `memory_graph_unauthorized`.
+          if (reason) {
+            return sendError(response, 502, reason === "memory_graph_unauthorized"
+              ? "memory graph rejected the internal token"
+              : "memory graph unreachable");
           }
           if (typeof contentHash !== "string" || !/^[a-f0-9]{64}$/.test(contentHash)) {
             return sendError(response, 404, "WebPage not found or has no content_hash");
@@ -4611,7 +4659,7 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
           const result = await ideaResearch.command(sid, operation, input);
           if (operation === "create" && typeof input.content === "string") {
             await store.appendMessage(sid, "user", input.content);
-            await store.appendMessage(sid, "assistant", `已启动 Idea Tree 研究（${result.research.id}）。Python 引擎正在后台执行构思、设计、独立评估和迭代。请在 Idea Tree 卡片查看实时进度，也可以稍后询问研究结果。`);
+            await store.appendMessage(sid, "assistant", `已启动研究思路树（${result.research.id}）。Python 引擎正在后台执行构思、设计、独立评估和迭代。请在研究思路树卡片查看实时进度，也可以稍后询问研究结果。`);
           }
           sendJson(response, 200, result);
         }
@@ -5108,12 +5156,35 @@ export function createApiServer(config = loadServerConfig(), dependencies: ApiSe
       const code = (error as NodeJS.ErrnoException).code;
       const message = error instanceof Error ? error.message : "Request failed";
       if (error instanceof ApiStatusError) sendError(response, error.statusCode, message, error.code, error.details);
+      else if (error instanceof StartupUnavailableError) {
+        // The reason is logged for an operator; the caller gets the state, not
+        // an initialization error (a validation message here used to answer 400).
+        apiLog.error("request_service_unavailable", {
+          errorMessage: shortErrorMessage(error.reason),
+          method: request.method ?? "UNKNOWN",
+          path: requestPath,
+        });
+        sendError(response, 503, "Service is starting or unavailable");
+      }
       else if (error instanceof SessionStoreHttpError) sendError(response, error.statusCode, message, error.code);
       else if (error instanceof IdeaTreePersistenceError || error instanceof IdeaTreeRuntimeError) {
         sendError(
           response,
           error.code === "PERSISTENCE_UNAVAILABLE" ? 503 : error.code === "REVISION_CONFLICT" ? 409 : 500,
           message,
+        );
+      }
+      // A refused Skill import answers with the facts behind the sentence, so
+      // a localized surface can say what was over the cap, by how much, and
+      // what to do next instead of echoing the validator's English. The prose
+      // stays in `error` for callers that show the server's own text.
+      else if ((error as { skillRefusal?: unknown }).skillRefusal !== undefined) {
+        sendError(
+          response,
+          code === "PAYLOAD_TOO_LARGE" ? 413 : 400,
+          message,
+          "SKILL_PACKAGE_REFUSED",
+          { refusal: (error as { skillRefusal: unknown }).skillRefusal },
         );
       }
       else if (code === "EVOLVE_UNAVAILABLE") sendError(response, 503, message);

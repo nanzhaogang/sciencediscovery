@@ -87,6 +87,14 @@ export interface SkillDescriptor {
   };
   /** Normalized metadata from SKILL.md frontmatter; values may be nested objects, arrays, or strings (relaxed in https://gitcode.com/openJiuwen/sciencediscovery/pull/127 to admit SAS skill openclaw declarations). */
   metadata?: Record<string, unknown>;
+  /** Set only on a bundled package the loader skipped because it failed
+   *  validation: the entry reports the failure instead of disappearing. Such a
+   *  descriptor carries no package (`hash` is empty, no resources) and cannot
+   *  be selected, edited or exported. */
+  loadFailure?: {
+    code: string;
+    message: string;
+  };
   name: string;
   readOnly: boolean;
   resourceSummary: SkillResourceSummary;
@@ -638,3 +646,39 @@ export interface JiuwenSwarmSkillsStateResponse {
   enabled: boolean;
   results: JiuwenSwarmSkillSwitchResult[];
 }
+
+/** The cap a Skill import refused to cross. */
+export type SkillPackageLimit =
+  | "entries"
+  | "files"
+  | "archive-bytes"
+  | "entry-bytes"
+  | "extracted-bytes"
+  | "markdown-bytes"
+  | "resource-bytes"
+  | "runtime-text-bytes";
+
+/**
+ * Why `POST /api/skills/import` refused an archive, as facts rather than
+ * prose (`code: "SKILL_PACKAGE_REFUSED"`, `details.refusal`).
+ *
+ * The server's `error` sentence stays English and names the cap without the
+ * count that was over it; a localized surface writes its own sentence from
+ * this record. `missing-root` is the case the importer's one-package rule was
+ * built for: a repository-wide ZIP has no SKILL.md at the archive root, and
+ * the Git import is the route that accepts a whole repository.
+ */
+export type SkillPackageRefusal =
+  | {
+      reason: "too-large";
+      limit: SkillPackageLimit;
+      /** What the caller's package carried. */
+      actual: number;
+      /** The cap it exceeded. */
+      cap: number;
+      /** The offending entry, when the refusal knows it. */
+      path?: string;
+    }
+  | { reason: "missing-root" }
+  | { reason: "several-roots" }
+  | { reason: "outside-root" };

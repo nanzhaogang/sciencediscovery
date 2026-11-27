@@ -42,9 +42,11 @@ import type {
   SubagentStep,
 } from "./api/types.js";
 import { CATALOG_FAILURES_BEFORE_STALE, createCatalogPoll } from "./app/catalog-poll.js";
+import { resumeGitSkillImport } from "./app/git-skill-import-job.js";
 import type { GuideStep } from "./app/guide.js";
 import { isEmptyTranscript, landingKey } from "./app/landing.js";
 import { canExportSession } from "./app/session-export.js";
+import { sessionReadOnly } from "./app/session-read-only.js";
 import { useIdeaResearches } from "./app/use-idea-researches.js";
 import { useJiuwenReadiness, jwReadyFromBridge, wizardIntroHandled } from "./app/shell-bridge.js";
 import type { ToolDetail } from "./app/tool-io.js";
@@ -94,6 +96,7 @@ import { EvolveCreateDialog } from "./views/evolve/EvolveCreateDialog.js";
 import { IdeaTreeOverrideDialog } from "./views/idea/IdeaTreeOverrideDialog.js";
 import { defersIdeaSend } from "./idea/send-gate.js";
 import { EvolveDetail } from "./views/evolve/EvolveDetail.js";
+import { EvolveStallNotice } from "./views/EvolveStallNotice.js";
 import { EvolveRuns } from "./views/evolve/EvolveRuns.js";
 import { Guide } from "./views/Guide.js";
 import { Landing } from "./views/Landing.js";
@@ -229,6 +232,14 @@ export function App({ initialToken }: Props) {
   // a mutable header through every call site.
   const client = useMemo(() => new ApiClient(token, onAuthRejected), [onAuthRejected, token]);
   const { actions, boot, state } = useWorkspace(client, onAuthRejected);
+  // A Git Skill import keeps running in the API across a reload, but switching
+  // its new packages on is the client's work. Pick the job back up once the
+  // backend has answered, before the reader opens 设置 again; an extra request
+  // during the auth checks could turn a stale id into a 401 for the whole app.
+  useEffect(() => {
+    if (boot !== "ready" && boot !== "setup") return;
+    void resumeGitSkillImport(client);
+  }, [boot, client]);
   // Signing out drops the account, not the machine's credential: a workspace
   // running on a custom model keeps working, and the user surface turns into a
   // signed-out page with the one way back in. It is a decision with a visible
@@ -851,7 +862,7 @@ export function App({ initialToken }: Props) {
   // to write into. The listeners are installed regardless of that: a file
   // dropped on a page that ignores it would otherwise navigate away from the
   // app entirely.
-  const canUpload = boot === "ready" && state.detail?.archivedAt === undefined && !isEvidenceSessionReadOnly(state.detail);
+  const canUpload = boot === "ready" && sessionReadOnly(state.detail) === undefined;
   const dragging = useFileDrop((files) => void upload(files), canUpload);
 
   /** A session with nothing to read yet shows the welcome page instead of an
@@ -1599,6 +1610,11 @@ export function App({ initialToken }: Props) {
             projects={state.projects}
             recent={state.recent}
             running={state.running}
+            searchError={state.searchError}
+            searchQuery={state.searchQuery}
+            searchResults={state.searchResults}
+            onSearch={(query) => actions.search(query)}
+            onSearchOpen={(result) => actions.openSearchResult(result)}
             sessionsByProject={state.sessionsByProject}
           />
         ) : null}
@@ -1635,7 +1651,7 @@ export function App({ initialToken }: Props) {
                   detail={state.detail}
                   configuration={configuration}
                   onConfigurationChange={actions.refreshConfiguration}
-                  configurationReadOnly={isEvidenceSessionReadOnly(state.detail) || state.detail?.archivedAt !== undefined}
+                  configurationReadOnly={sessionReadOnly(state.detail) !== undefined}
                   // One card per research; the panel is where the tree and the
                   // controls live, so the card itself only opens it. These are
                   // the transcript's foot, not its header: `Conversation` draws
@@ -1656,14 +1672,25 @@ export function App({ initialToken }: Props) {
                       {idea.unavailable ? TEXT.ideaTree.unavailable : idea.error ?? legacy.error}
                     </p>
                   ) : null}
-                  // A search keeps running after the turn that started it, so its
-                  // card is the last thing the conversation produced. It draws
-                  // nothing at all for a session that has no searches.
-                  evolve={<EvolveRuns
-                    onOpen={showEvolveRun}
-                    onRetry={evolveRetryAllowed ? retryEvolve : undefined}
-                    runs={evolve.runs}
-                  />}
+                  // A design the client will not carry any further says why
+                  // above the searches: a stall with no card to carry the badge
+                  // has nothing else on screen to say the search never started.
+                  // Hidden while a turn runs, like the card's own stop badge.
+                  evolve={<>
+                    <EvolveStallNotice
+                      busy={state.running}
+                      notice={state.running ? undefined : autoContinue.notice}
+                      onSend={(text) => latestSend.current(text)}
+                    />
+                    {/* A search keeps running after the turn that started it, so
+                        its card is the last thing the conversation produced. It
+                        draws nothing for a session that has no searches. */}
+                    <EvolveRuns
+                      onOpen={showEvolveRun}
+                      onRetry={evolveRetryAllowed ? retryEvolve : undefined}
+                      runs={evolve.runs}
+                    />
+                  </>}
                   loading={state.loadingSession}
                   onDecidePermission={decidePermission}
                   onOpenArtifactPanel={openArtifactPanel}
@@ -1682,7 +1709,7 @@ export function App({ initialToken }: Props) {
                   workspaceFiles={state.panelFiles}
                 />
               </CheckpointRefusedProvider>
-              {state.detail?.archivedAt !== undefined ? (
+              {sessionReadOnly(state.detail) === "archived" ? (
             <p className="session-archived-banner" role="status">{TEXT.errors.archivedBanner}</p>
           ) : null}
           {isEvidenceSessionReadOnly(state.detail) ? null : (
@@ -1815,7 +1842,7 @@ export function App({ initialToken }: Props) {
       {evolveCreate === undefined ? null : (
         <EvolveCreateDialog
           activeRun={evolve.runs.some((run) => isEvolveRunActive(run.status))}
-          archived={state.detail?.archivedAt !== undefined}
+          archived={sessionReadOnly(state.detail) === "archived"}
           error={evolve.error}
           initialAlgorithm={evolveCreate.algorithm}
           initialCheckpointMode={evolveCreate.checkpointMode}

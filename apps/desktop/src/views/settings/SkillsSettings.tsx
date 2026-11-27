@@ -38,8 +38,12 @@ import type { ConfirmRequest } from "../../app/use-workspace.js";
 import {
   dismissGitSkillImportJob,
   enableCreatedSkills,
+  resumeGitSkillImport,
+  retryEnableCreatedSkills,
   startGitSkillImportInBackground,
+  subscribeGitSkillImportEnableFailure,
   subscribeGitSkillImportJob,
+  type GitSkillImportEnableFailure,
 } from "../../app/git-skill-import-job.js";
 import { saveSkillPackage } from "../../app/skill-export.js";
 import { skillMark } from "../../app/slash.js";
@@ -131,9 +135,11 @@ function serverValue(page: SkillPage, key: string): boolean | undefined {
  * A catalog skill brings the JiuwenSwarm name it is installed as when the page
  * knows it, which is what keeps the bulk write free of a lookup per skill. A
  * skill JiuwenSwarm does not have yet goes by id, and the server imports it
- * only if the action needs it there.
+ * only if the action needs it there. A bundled package that failed to load has
+ * no package to switch, so it is not a bulk target.
  */
-function skillRow(skill: SkillDescriptor | JiuwenSwarmSkill, installedNames: Record<string, string>): SkillRow {
+function skillRow(skill: SkillDescriptor | JiuwenSwarmSkill, installedNames: Record<string, string>): SkillRow | undefined {
+  if ("id" in skill && skill.loadFailure !== undefined) return undefined;
   return "id" in skill
     ? {
       key: catalogKey(skill.id),
@@ -145,6 +151,16 @@ function skillRow(skill: SkillDescriptor | JiuwenSwarmSkill, installedNames: Rec
       },
     }
     : { key: jiuwenKey(skill.name), name: skill.name, target: { name: skill.name } };
+}
+
+/** The rows a bulk action may write: the visible ones, minus any bundled
+ *  package the loader skipped. Its card says it failed; it has no package to
+ *  import into JiuwenSwarm, so it is never part of "enable everything". */
+function bulkTargets(page: SkillPage, scope: SkillScope, term: string): SkillRow[] {
+  return visibleRows(page, scope, term).flatMap((row) => {
+    const target = skillRow(row.skill, page.installedNames ?? {});
+    return target === undefined ? [] : [target];
+  });
 }
 
 /** The result that belongs to a row: by id when its target had one, else by name. */
@@ -248,7 +264,13 @@ export function SkillsSettings({ client, onConfirm }: Props) {
     message: string;
   }>();
   const [backgroundImport, setBackgroundImport] = useState<GitSkillImportJob>();
-  const [uploadToast, setUploadToast] = useState<{ id: number; message: string }>();
+  const [enableFailure, setEnableFailure] = useState<GitSkillImportEnableFailure>();
+  const [uploadToast, setUploadToast] = useState<{
+    detail?: string;
+    id: number;
+    kind: "error" | "success";
+    message: string;
+  }>();
   /** A running job's progress toast can be hidden without cancelling the job;
    *  its result still arrives when the job ends. */
   const [dismissedProgress, setDismissedProgress] = useState<string>();
@@ -270,6 +292,14 @@ export function SkillsSettings({ client, onConfirm }: Props) {
   // this pane only watches it. Once it ends, new packages are switched on in
   // JiuwenSwarm (as a foreground import did) and the catalog is re-read once.
   useEffect(() => subscribeGitSkillImportJob(setBackgroundImport), []);
+  // The switch-on step belongs to the import, not to this pane: when it could
+  // not finish, the notice says so here even if the pane was closed then.
+  useEffect(() => subscribeGitSkillImportEnableFailure(setEnableFailure), []);
+  // The app tries to pick a reloaded import back up at startup; if the API was
+  // not reachable yet, opening 设置 is the next chance to finish that work.
+  useEffect(() => {
+    void resumeGitSkillImport(client);
+  }, [client]);
   const [view, setView] = useState<SkillView>({ kind: "list" });
   // A message belongs to the page that produced it. Moving on starts clean,
   // so a refusal from one page does not follow the reader into the next; the
@@ -376,10 +406,9 @@ export function SkillsSettings({ client, onConfirm }: Props) {
    * A page of 31 skills used to be 31 awaited requests plus its own reload,
    * which is what froze it for seconds.
    */
-  const setAll = async (next: boolean, visible: Array<SkillDescriptor | JiuwenSwarmSkill>) => {
+  const setAll = async (next: boolean, rows: SkillRow[]) => {
     const page = loaded.value;
     if (!page?.switchesAvailable) return;
-    const rows = visible.map((skill) => skillRow(skill, page.installedNames ?? {}));
     if (!rows.length) return;
     setFailure(undefined);
     setBulkPending(true);
@@ -493,24 +522,31 @@ export function SkillsSettings({ client, onConfirm }: Props) {
    * An *update* of a skill that was already installed is left alone: the user
    * may have switched it off on purpose, and re-enabling it would undo that
    * while replacing its files, which is not what they asked for.
+   *
+   * Returns why the package could not be enabled, so the caller that reports a
+   * passing install can say this instead of claiming it is ready to use.
    */
-  const afterInstall = async (skill: SkillDetail) => {
+  const afterInstall = async (skill: SkillDetail): Promise<string | undefined> => {
     setBusy(true);
     setFailure(undefined);
+    let problem: string | undefined;
     try {
       const page = loaded.value;
       const wasInstalled = page?.skills.some((entry) => entry.id === skill.id) ?? false;
       if (page?.switchesAvailable) {
         if (!wasInstalled) await setJiuwenSwarmSkillEnabledById(client, skill.id, true);
       } else if (!page?.native && !wasInstalled) {
-        setFailure(page?.switchError ?? TEXT.settings.saveFailed);
+        problem = page?.switchError ?? TEXT.settings.saveFailed;
+        setFailure(problem);
       }
     } catch (reason) {
-      setFailure(reason instanceof Error ? reason.message : TEXT.settings.saveFailed);
+      problem = reason instanceof Error ? reason.message : TEXT.settings.saveFailed;
+      setFailure(problem);
     } finally {
       setBusy(false);
       loaded.reload();
     }
+    return problem;
   };
 
   /** Enable a new skill when JiuwenSwarm is available; native creation needs no import. */
@@ -522,9 +558,10 @@ export function SkillsSettings({ client, onConfirm }: Props) {
   };
 
   // A passing upload is news about a dialog that just closed, so it leaves by
-  // itself; a failed Git import stays until it is dismissed or retried.
+  // itself; a failed Git import stays until it is dismissed or retried. An
+  // upload that arrived but stayed switched off is a failure, too.
   useEffect(() => {
-    if (!uploadToast) return;
+    if (!uploadToast || uploadToast.kind === "error") return;
     const timer = setTimeout(() => setUploadToast(undefined), 4_000);
     return () => clearTimeout(timer);
   }, [uploadToast]);
@@ -533,8 +570,9 @@ export function SkillsSettings({ client, onConfirm }: Props) {
   if (uploadToast) {
     toasts.push({
       id: `upload-${uploadToast.id}`,
-      kind: "success",
+      kind: uploadToast.kind,
       message: uploadToast.message,
+      ...(uploadToast.detail ? { detail: uploadToast.detail } : {}),
       onClose: () => setUploadToast(undefined),
     });
   }
@@ -542,6 +580,23 @@ export function SkillsSettings({ client, onConfirm }: Props) {
   // closed, which is how a background import stays visible on the list.
   if (backgroundImport && dialog !== "git") {
     const job = backgroundImport;
+    const enableProblem = enableFailure?.jobId === job.id ? enableFailure : undefined;
+    // A failed switch-on is its own problem with its own remedy: the import
+    // retry re-runs subdirectories, and only the enable retry switches on the
+    // packages that arrived. When a job has both, both are offered — the
+    // import retry cannot do the enable run's work.
+    const pushEnableRetry = (target: typeof job, problem: GitSkillImportEnableFailure) => {
+      toasts.push({
+        id: `git-enable-${target.id}`,
+        kind: "error",
+        message: TEXT.settings.skills.backgroundImportEnableFailed(target.imported.length, problem.count),
+        detail: problem.message,
+        onClose: () => dismissGitSkillImportJob(),
+        onRetry: () => {
+          void retryEnableCreatedSkills(client, target).then(() => loaded.reload());
+        },
+      });
+    };
     if (job.status === "queued" || job.status === "running") {
       if (dismissedProgress !== job.id) {
         toasts.push({
@@ -558,14 +613,12 @@ export function SkillsSettings({ client, onConfirm }: Props) {
         message: job.status === "failed"
           ? TEXT.settings.skills.toastGitFailed
           : TEXT.settings.skills.backgroundImportPartial(job.imported.length, job.failures.length),
-        ...(job.failures.length
-          ? {
-            detail: TEXT.settings.skills.backgroundImportFailures(
-              job.failures.slice(0, 3).map((failure) => failure.subdirectory).join("、"),
-              job.failures.length,
-            ),
-          }
-          : {}),
+        detail: job.failures.length
+          ? TEXT.settings.skills.backgroundImportFailures(
+            job.failures.slice(0, 3).map((failure) => failure.subdirectory).join("、"),
+            job.failures.length,
+          )
+          : undefined,
         onClose: () => dismissGitSkillImportJob(),
         ...(lastGitRequest
           ? {
@@ -577,6 +630,12 @@ export function SkillsSettings({ client, onConfirm }: Props) {
           }
           : {}),
       });
+      if (enableProblem !== undefined) pushEnableRetry(job, enableProblem);
+    } else if (enableProblem !== undefined) {
+      // The packages are installed, but a new one that stays switched off is
+      // not the success the reader asked for; say what is still off and let
+      // the switch-on step run again.
+      pushEnableRetry(job, enableProblem);
     } else {
       toasts.push({
         id: `git-result-${job.id}`,
@@ -671,7 +730,7 @@ export function SkillsSettings({ client, onConfirm }: Props) {
           mine: allRows.length - officialCount,
           official: officialCount,
         };
-        const bulkRows = page ? visibleRows(page, scope, query.trim().toLowerCase()) : [];
+        const bulkRows = page ? bulkTargets(page, scope, query.trim().toLowerCase()) : [];
         return (
           <div className="skill-toolbar">
             {page ? (
@@ -700,7 +759,7 @@ export function SkillsSettings({ client, onConfirm }: Props) {
               {page?.switchesAvailable && bulkRows.length > 0
                 ? <BulkToggles
                   busy={busy || bulkPending}
-                  onAll={(next) => void setAll(next, bulkRows.map((row) => row.skill))}
+                  onAll={(next) => void setAll(next, bulkRows)}
                   variant="toolbar"
                 />
                 : null}
@@ -781,6 +840,24 @@ export function SkillsSettings({ client, onConfirm }: Props) {
             const renderCatalog = (skill: SkillDescriptor) => {
               const key = catalogKey(skill.id);
               const on = intent[key] ?? page.enabled.includes(skill.id);
+              // A bundled package the loader skipped has no package behind it:
+              // switching, opening or exporting it would only reach a route that
+              // answers 404. Show why the row is there instead.
+              if (skill.loadFailure) {
+                return (
+                  <article className="settings-card skill-card" key={skill.id}>
+                    <div className="skill-card-head">
+                      {markFor(skill)}
+                      <div className="settings-card-main is-failed">
+                        <strong>{markedName(skill.name, term)}</strong>
+                        <span className="skill-card-tag">{tagFor(skill)}</span>
+                      </div>
+                    </div>
+                    <p className="row-note is-error">{TEXT.settings.skills.loadFailure}</p>
+                    <p className="skill-card-desc">{skill.loadFailure.message}</p>
+                  </article>
+                );
+              }
               return (
                 <article className="settings-card skill-card" key={skill.id}>
                   <div className="skill-card-head">
@@ -896,11 +973,22 @@ export function SkillsSettings({ client, onConfirm }: Props) {
             onCancel={() => setDialog(undefined)}
             onImported={async (skill) => {
               setDialog(undefined);
-              setUploadToast({
-                id: Date.now(),
-                message: TEXT.settings.skills.toastUploadDone(skill.name),
-              });
-              await afterInstall(skill);
+              // Say what actually happened: a package that arrived but could
+              // not be switched on is not "uploaded" in the sense the reader
+              // needs, and the success notice would talk them out of looking.
+              const problem = await afterInstall(skill);
+              setUploadToast(problem === undefined
+                ? {
+                  id: Date.now(),
+                  kind: "success",
+                  message: TEXT.settings.skills.toastUploadDone(skill.name),
+                }
+                : {
+                  id: Date.now(),
+                  kind: "error",
+                  message: TEXT.settings.skills.toastUploadNotEnabled(skill.name),
+                  detail: problem,
+                });
             }}
           />
         </SkillDialog>

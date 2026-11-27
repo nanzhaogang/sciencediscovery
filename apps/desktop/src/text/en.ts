@@ -50,12 +50,15 @@ const PERMISSION_DESCRIPTIONS: PermissionDescriptionRenderers = {
   "direct-host": ({ account, command, cwd, runnerId, subagentId, target, workspaceRoot }) =>
     `DIRECT HOST EXECUTION: Runner ${runnerId}, ${target}, account ${account}, workspace ${workspaceRoot}, cwd ${cwd || "."}`
     + `${subagentId ? `, subagent ${subagentId}` : ""}. No sandbox filesystem, process or network isolation; host credentials may be accessible.`
+    + ` The sandbox network mode and domain allowlist do not apply here, so a host just denied in the sandbox may still be reached through this channel.`
     + ` Host effects cannot all be tracked or rolled back. Matching consent covers only this exact command and scope during this Agent run, with no fixed TTL.`
     + ` Approval does not execute. Command:\n${command}`,
   "specialist-runtime": ({ runtime, workspaceRoot }) =>
     `Run ${runtime} directly on the API host in ${workspaceRoot}. This removes the outer sandbox for this task; platform tools retain their own permissions.`,
   network: ({ hosts, purpose, runnerId }) =>
-    `Sandbox network on ${runnerId} for this Agent run: ${hosts.join(", ")}. Purpose: ${purpose}.`,
+    `Sandbox network on ${runnerId} for this Agent run: ${hosts.join(", ")}. Purpose: ${purpose}.`
+    + ` Approval adds these hosts to the allowed domains of the single execution that uses that authorization, without editing the configured allowlist; allowing the same hosts again later in this Agent run stops the card from reappearing.`
+    + ` Deny blocks only this sandbox channel: the configured allowlist is unchanged, and direct host execution is not subject to the sandbox network policy.`,
   environment: ({ environmentId, language, manager, name, operation, runnerId }) => {
     const runner = runnerId ? ` on Runner ${runnerId}` : "";
     switch (operation) {
@@ -134,6 +137,8 @@ export const EN: Text = {
     projectDestination: "Project", noProject: "No project", projectDestinationHint: "Added to Sessions by default. You may choose an existing project.",
     projectImport: (name: string) => `Import conversation into ${name}`, messageMenu: "Reply menu", packageContents: "Conversation, workspace files, artifacts and related research evidence.",
     title: "Research package", import: "Import conversation", export: "Export conversation", continue: "Continue chatting", branch: "Create branch chat", source: "Return to source",
+    /** The fallback "save as" name for a session the server left untitled. */
+    untitledSession: "Research session", downloadFailed: "The evidence package could not be downloaded. Try again.",
     readOnly: "Imported evidence · Read-only. Create an independent copy to continue with the retained materials.", copying: "Copying research in the background…", failed: "Operation failed",
     recalculating: "Recalculating…",
     omissionsSummary: (count: number) => `Not included: ${count} workspace file${count === 1 ? "" : "s"}`, download: "Download", preparing: "Preparing the package in the background…", close: "Close", copyMissing: "The conversation or operation record for this copy no longer exists; waiting has stopped. Create a new continuation.", copyPollingFailed: "Unable to read copy progress; retries have stopped. Refresh or try again later.", legacyUnavailable: "The local service is temporarily unavailable, retrying…", exportPollingFailed: "Unable to read export progress; retries have stopped. Export again later.", exportMissing: "The export task no longer exists. Export again.",
@@ -227,6 +232,8 @@ export const EN: Text = {
 
   account: {
     eyebrow: "HUAWEI ID",
+    /** The name shown when HUAWEI shares no display name for the profile. */
+    defaultName: "HUAWEI ID user",
     back: "Back to sessions",
     joined: (days: number) => `Joined ${days} days ago`,
     emailReadonly: (email: string) => `Email ${email}`,
@@ -334,6 +341,18 @@ export const EN: Text = {
     showMore: (count: number) => `Show ${count} older ${count === 1 ? "Session" : "Sessions"}`,
     /** The rule a folded Project states above its page: the newest N are shown. */
     pageRule: (count: number) => `Latest ${count}`,
+    searchRetry: "Retry",
+    searchPlaceholder: "Search",
+    searchLabel: "Search",
+    searchAll: "All",
+    searchClose: "Close",
+    searchKinds: "What to search",
+    searchHint: "Type to search sessions, projects and artifacts.",
+    searchProjects: "Projects",
+    searchSessions: "Sessions",
+    searchArtifacts: "Artifacts",
+    searchEmpty: (query: string) => `Nothing matches "${query}". Search matches names and titles, not message text.`,
+    searchFailed: "Search failed. Try again.",
     collapseSidebar: "Collapse sidebar",
     expandSidebar: "Show sidebar",
     renameHint: "Double-click to rename",
@@ -392,7 +411,17 @@ export const EN: Text = {
     permissionAskDesc: "Always ask before editing external files or using the internet",
     permissionFull: "Full access",
     permissionFullDesc: "Access the internet and any file on your computer without restriction",
-    permissionLocked: "You can change permissions when this run finishes",
+    /** The pill stays usable during a run (#1330): the switch applies to the
+     *  tool calls that have not run yet. It settles a waiting approval only
+     *  when the new policy covers it: `direct_code` keeps asking, even under
+     *  full access. */
+    permissionModeRunning: "Permission mode (this run is going; changes affect later tool calls)",
+    /** Says what the server actually does: the switch waits for an executing
+     *  tool to finish, then stops the session's kernels and shell sessions and
+     *  loses their in-memory state; it settles a waiting approval only when the
+     *  new policy covers it. Allow once is the safe path for a run that only
+     *  needs the current request released. */
+    permissionRunningHint: "Still running: the change affects later tool calls and stops this session's kernels and shell sessions (their in-memory state is lost; an executing tool finishes first, then the switch takes effect); only approvals the new policy covers are settled, direct-on-machine requests still ask separately; to release only this request, use Allow once.",
     attachHint: (limit?: string) => limit === undefined
       ? "Files go into this session's workspace, where the agent can read them. You can also drag files onto the window."
       : `Files go into this session's workspace, where the agent can read them. A single file may be up to ${limit}. You can also drag files onto the window.`,
@@ -455,6 +484,10 @@ export const EN: Text = {
     } as Record<string, string>,
     summaryPass: "No issues found",
     summaryFindings: (count: number) => `${count} ${count === 1 ? "issue" : "issues"}`,
+    /** A warning is not a revision request; its row and badge say Warning. */
+    summaryWarnings: (count: number) => `${count} ${count === 1 ? "warning" : "warnings"}`,
+    summaryFindingsAndWarnings: (critical: number, warnings: number) =>
+      `${critical} ${critical === 1 ? "issue" : "issues"} · ${warnings} ${warnings === 1 ? "warning" : "warnings"}`,
     summaryContradicted: "Contradicted",
     summaryPartlySupported: "Partly supported",
     summaryIncomplete: "Delivery incomplete",
@@ -482,7 +515,7 @@ export const EN: Text = {
       citation: "Citation: checks the citation identifiers can be recognised and are well formed. It does not check whether the cited work supports the claim.",
       computation: "Computation: compares the numbers in the report with the evidence, checking the figures and the statistics agree.",
       completeness: "Completeness: checks every declared deliverable is present and not empty.",
-      semantics: "Semantics: the source service reads the cited text and decides whether the claim is supported. Deep reviews only.",
+      semantics: "Semantics: Deep review reads the cited source text and decides whether the claim is supported. Deep reviews only.",
       other: "General finding: not tied to one check, recorded during the review.",
       gaps: "Not checked: this review did not run this check, and the reason is below. Not checked is not a pass.",
       source: "Source verification: compares one claim with the source text and answers supported, partly supported, contradicted or inconclusive.",
@@ -511,10 +544,13 @@ export const EN: Text = {
       citation_identity: "This review did not check the papers' identity (authors, journal, year).",
       computation: "This review did not check the numbers against the computation evidence.",
     } as Record<string, string>,
+    /** The claim-support gap as a Deep review leaves it. Asking the reader to
+     *  run a Deep review again would contradict the level they just chose. */
+    deepGapBodies: {
+      inconclusive: "Deep review did try to check the claims against their sources but could not reach a verdict (enough source text may have been unavailable, or the excerpt may not clearly support or contradict the claim), so this check still counts as not performed. That does not mean the report is wrong.",
+      noComparison: "Deep review found no claim it could compare with a source, so this check still counts as not performed.",
+    },
     gapBodyUnknown: "This review did not run this check.",
-    /** A source check that could not conclude is not a report defect. */
-    inconclusive: "Source verification reached no conclusion",
-    inconclusiveBody: "The source service returned no verdict; this is not a problem with the report.",
     /** A citation-format-only Quick pass did not look at claim support. */
     citationOnlyNote: "This review checked citation format only; claim support was not checked.",
     /** Why a checkpoint produced nothing, by the server's reason code. */
@@ -555,11 +591,11 @@ export const EN: Text = {
     queued: (count: number) => `${count} queued`,
     /** A bounded passage in a locked source; "locator" and evidence levels
      *  are internal vocabulary, so the card says what was found instead. */
-    locators: (count: number) => `${count} source passage${count === 1 ? "" : "s"}`,
+    locators: (count: number) => `${count} source excerpt${count === 1 ? "" : "s"}`,
     sourceInconclusiveWith: (count: number) => count === 1
-      ? "Found 1 source passage, but it is not enough to support this claim."
-      : `Found ${count} source passages, but they are not enough to support this claim.`,
-    sourceInconclusiveNone: "No source passage was found to support this claim.",
+      ? "Found 1 source excerpt, but it is not enough to decide whether this claim holds."
+      : `Found ${count} source excerpts, but not enough to decide whether this claim holds.`,
+    sourceInconclusiveNone: "No source excerpt was found to judge this claim.",
     failedDetail: "The review reported an error.",
     empty: "This checkpoint produced no review record.",
     noReviews: "No reviews yet.",
@@ -567,10 +603,10 @@ export const EN: Text = {
     levelName: (level: string): string => (level === "quick" ? "Quick" : "Deep"),
     levelPill: (level: string): string => (level === "quick" ? "Quick" : "Deep"),
     /** The pill only names the level; the tip carries what the name claims.
-     *  The two levels differ in whether a source service is consulted. */
+     *  The two levels differ in whether the cited source text is read. */
     levelTip: (level: string): string => (level !== "quick"
-      ? "Deep review: on top of the Quick checks, calls the source service to verify each claim against its source."
-      : "Quick review: deterministic structure, citation-format and delivery checks on this machine; no source service is called."),
+      ? "Deep review: on top of the Quick checks, reads the cited source text and evidence to verify each claim against its source."
+      : "Quick review: deterministic structure, citation-format and delivery checks on this machine; no source text is read."),
   },
 
   /** The bottom-right banner while the JiuwenSwarm cluster is still starting
@@ -784,6 +820,8 @@ export const EN: Text = {
     disabledBody: "Turn it on in Settings → Scientific memory and a report's citations expand into their evidence and artifacts.",
     unreachableTitle: "Scientific memory is unavailable",
     unreachableBody: "The memory service did not answer. Try again in a moment.",
+    authTitle: "Scientific memory rejected the access token",
+    authBody: "The memory service answered but rejected the internal token this API uses. Make sure the API and the memory service share the same internal token, then check again.",
     errorTitle: "Could not read memory",
     retry: "Retry",
     previewTab: "Preview",
@@ -800,6 +838,7 @@ export const EN: Text = {
     },
     status: {
       healthy: "Running",
+      unauthorized: "Credentials rejected",
       degraded: "Cannot connect",
       checking: "Checking",
       unknown: "Status unknown",
@@ -1096,6 +1135,7 @@ export const EN: Text = {
       /** The × inside the search field that puts the whole list back. */
       clearSearch: "Clear search",
       noMatches: "No skills match your search.",
+      loadFailure: "This bundled skill failed to load",
 
       heading: "Skills",
       jiuwenSwarmOnly: "The current agent backend is not JiuwenSwarm, so skill switches are unavailable.",
@@ -1222,13 +1262,25 @@ export const EN: Text = {
       closeDialog: "Close",
       /** 技能 › 上传技能, as the handoff's dialog. */
       uploadDialog: {
-        hint: "A folder or .zip must contain SKILL.md; a .md file must carry the skill name and description in YAML.",
+        hint: "A folder or .zip must contain SKILL.md; a lone .md needs the name and description in YAML. One archive holds one skill package — import a whole repository with \"Import from GitHub\".",
         chooseFile: "Choose file",
         dropTitle: "Choose a SKILL.md file",
         dropHint: "Click, or drag a package or file here",
         reselect: "Choose again",
         cancel: "Cancel",
         confirm: "OK",
+        /** What the server refused, written from the facts in its refusal. */
+        refusals: {
+          entries: (actual: number, cap: number) => `The archive has ${actual} entries; the import accepts at most ${cap}.`,
+          files: (actual: number, cap: number) => `The package has ${actual} files; the import accepts at most ${cap}.`,
+          archiveBytes: (actual: string, cap: string) => `The archive is ${actual}; the limit is ${cap}.`,
+          extractedBytes: (actual: string, cap: string) => `The unpacked package is ${actual}; the limit is ${cap}.`,
+          fileBytes: (path: string, cap: string) => `"${path}" is over the ${cap} per-file limit.`,
+          missingRoot: "The archive has no SKILL.md at its root.",
+          severalRoots: "The archive's top level is not one package directory.",
+          outsideRoot: "The archive contains files outside the package root.",
+          onePackage: "One archive imports one skill package. To import a whole repository, use \"Import from GitHub\" and pick the skills you want.",
+        },
       },
       /** 技能 › 从 GitHub 导入, as the handoff's dialog. */
       gitDialog: {
@@ -1241,6 +1293,8 @@ export const EN: Text = {
       importBusy: "Importing…",
       backgroundImportDone: (count: number) => `Imported ${count} skills.`,
       backgroundImportPartial: (imported: number, failed: number) => `Imported ${imported}; ${failed} failed.`,
+      backgroundImportEnableFailed: (imported: number, failed: number) =>
+        `Imported ${imported}; ${failed} could not be enabled.`,
       backgroundImportFailed: "The background import failed.",
       backgroundImportFailures: (names: string, count: number) =>
         count > 3 ? `Failed: ${names} and ${count - 3} more` : `Failed: ${names}`,
@@ -1248,6 +1302,7 @@ export const EN: Text = {
       importSucceeded: (name: string) => `Imported "${name}".`,
       /** The 技能 page's own notices (design 1-4). */
       toastUploadDone: (name: string) => `"${name}" uploaded.`,
+      toastUploadNotEnabled: (name: string) => `"${name}" was imported but could not be enabled.`,
       toastGitDone: "GitHub import done.",
       toastGitFailed: "GitHub import failed.",
       toastProgress: (done: number, total: number) => `Importing (${done}/${total})`,
@@ -1366,6 +1421,10 @@ export const EN: Text = {
         modeOpen: "Open network",
         modeOpenWarning:
           "Open network lets any code in the sandbox reach any address, keeping only private-network filtering. Continue?",
+        /** Why the mode pills cannot be pressed right now. Shown under them
+         *  whenever they are disabled, so a press never looks ignored. */
+        switching: "Saving the sandbox network settings. The mode cannot change until the save finishes.",
+        staleMode: "The current sandbox network settings could not be read. Reload them before changing the mode.",
         saved: "Sandbox network saved",
         /** The allowlist editor. The accepted format is shown by the
          *  placeholder rather than explained in a sentence. */
@@ -1373,7 +1432,12 @@ export const EN: Text = {
         domainsPlaceholder: "example.org\n*.example.org:443",
         emptyDomains: "Add at least one allowed domain.",
         saveDomains: "Save",
-        scope: "Applies only to run_shell and code inside the sandbox.",
+        scope: "Applies only to run_shell and code inside the sandbox; this is the starting policy for each execution, and an approval only widens that one execution.",
+        approvalNote:
+          "Approving a network request in a conversation adds those exact hosts to the single execution that uses that authorization and never writes them into this setting;"
+          + " allowing the same hosts for the rest of this Agent run is what stops the card from reappearing."
+          + " Denying leaves this setting unchanged and blocks only the sandbox channel, because host execution is not subject to the sandbox network policy."
+          + " Under Full access approval mode these requests are approved without a card, and under No network one approval still gives that execution a temporary allowlist of exactly those hosts.",
         /** [mac-direct] Installation-level opt-in. With it on, local code
          *  execution leaves the sandbox: the full local execution stack is
          *  affected — the Agent's own ephemeral Shell/Python and evolution
@@ -1672,6 +1736,52 @@ export const EN: Text = {
         connectorsEmpty: "No connectors are available on this machine yet.",
       },
       mcp: {
+        allMcp: "All MCP",
+        myMcp: "My MCP",
+        officialMcp: "Official MCP",
+        searchMcp: "Search MCP",
+        enableAll: "Enable all",
+        disableAll: "Disable all",
+        bulkHint: "Bulk actions affect only the custom servers shown. Built-in switches select sources by default.",
+        bulkFailed: (names: string) => `Could not update: ${names}. Retry to update the remaining servers.`,
+        tryIt: "Try it",
+        tryUnavailable: "Enable the service before trying it. Built-in sources must be available.",
+        noMatches: "No matching MCP servers",
+        manualEntry: "Manual entry",
+        importJsonEntry: "Import JSON",
+        jsonSource: "JSON source",
+        importFillHint: "Paste an mcpServers JSON object or upload a file. Review and edit the configuration below, then confirm to add it.",
+        importEmptyHint: "Paste or upload JSON to fill the configuration fields.",
+        chooseConfiguration: "Server configuration",
+        duplicateName: "Server names must be unique.",
+        timeoutInvalid: "Timeout must be an integer between 1 and 600 seconds.",
+        commandRequired: "A command is required for STDIO.",
+        urlInvalid: "Use an HTTP(S) URL without credentials or a fragment.",
+        confirmAdd: (count: number) => count > 1 ? `Add ${count} servers` : "Confirm add",
+        importFilled: (count: number) => `${count} configuration(s) filled. Review and edit before confirming.`,
+        importProgress: (added: number, total: number) => `${added} of ${total} added. Only remaining configurations will be retried.`,
+        addedCount: (count: number) => `${count} MCP servers added`,
+        savedCheckFailed: (reason: string) => `Configuration saved. Connection check: ${reason}`,
+        importFieldInvalid: (name: string, field: string) => `Invalid ${field} in “${name}”. Correct the JSON and try again.`,
+        configured: "Configured servers",
+        details: "Server details",
+        custom: "External",
+        noDescription: "No description",
+        builtinReadOnly: "Built-in sources are managed by the application and are read-only.",
+        checkedAt: "Last checked",
+        neverChecked: "No check recorded",
+        checkHint: "Connection status is the last discovery or test result, not a continuous heartbeat. Service enablement and session default selection are independent.",
+        storedValue: "Stored securely",
+        publisher: "Publisher / version",
+        serviceEnabled: "Enabled",
+        selected: "Selected",
+        notSelected: "Not selected",
+        authorized: "Authorized",
+        authorizing: "Waiting for authorization",
+        deleted: "MCP server deleted",
+        retry: "Retry",
+        more: (name: string) => `More actions for ${name}`,
+        openDetails: (name: string) => `View ${name} details`,
         heading: "MCP servers",
         help: "Use by default selects sources for sessions that inherit global settings; explicit project or session selections take precedence. Specialists may add other sources. Actual tool calls still depend on service readiness and permissions. Enable service in a custom server’s edit form controls its connection separately. Changes do not reconfigure a running task.",
         builtin: "Built-in",
@@ -1724,8 +1834,8 @@ export const EN: Text = {
         deleteTitle: (name: string) => `Delete the server “${name}”?`,
         deleteBody: (name: string) =>
           `Tools that depend on “${name}” stop working. Results already produced are unaffected.`,
-        addServer: "Add server",
-        createTitle: "New server",
+        addServer: "Add MCP server",
+        createTitle: "New MCP server",
         importServers: "Import",
         importPaste: "Paste JSON",
         importFile: "Upload JSON file",
@@ -1755,6 +1865,8 @@ export const EN: Text = {
         clearAuthorization: "Clear authorization",
         nameRequired: "A server name is required.",
         openAuthorization: "Open the authorization page",
+        actions: (name: string) => `Actions for ${name}`,
+        importChoice: "Import JSON",
       },
       web: {
         searchHeading: "Search",
@@ -2218,6 +2330,20 @@ export const EN: Text = {
       autoStoppedHint: "This step was already carried forward once, so the client will not push it again. Reply to carry the design on.",
       adjustDraft: "I'd like to change this step: ",
       busy: "This reply is still running; wait for it to finish.",
+    },
+
+    /* A stall with no card to carry "Auto-continue stopped": the checkpoint
+       arrived as prose, its fence did not parse, or the turn called
+       create_evolve_run and no search was created. The conversation stops
+       there with nothing to press, so it says the search has not started and
+       writes out the sentence that continues it. The button sends exactly the
+       sentence the client sends when it can carry the design itself. */
+    stall: {
+      title: "The search has not started",
+      stopped: "Auto-continue stopped on this step: it was already carried once, so the client will not push it again.",
+      unstarted: "This turn called create_evolve_run, but no search was created.",
+      send: "Send this sentence to continue:",
+      action: "Send this sentence",
     },
 
     create: {

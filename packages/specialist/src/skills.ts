@@ -49,6 +49,7 @@ import type {
   SkillDescriptor,
   SkillDetail,
   SkillPackageFileBytes,
+  SkillPackageRefusal,
   SkillResource,
   SkillResourceContent,
   SkillResourceKind,
@@ -170,6 +171,14 @@ interface LoadedPackage {
 interface ManagedPackage extends LoadedPackage {
   createdAt: string;
   provenance: SkillVersionProvenance;
+}
+
+/** A bundled package the loader could not install, kept so the failure is
+ *  reported instead of the skill silently disappearing. */
+export interface SkillLoadFailure {
+  code: string;
+  id: string;
+  message: string;
 }
 
 interface StoredSkillReviewFile {
@@ -637,9 +646,18 @@ export async function checkoutGitSkillRepository(
   }
 }
 
-function payloadTooLarge(message: string): NodeJS.ErrnoException {
+/** Attach the structured reason to an error that already carries the prose.
+ *  The property is deliberately not part of the public error contract: only
+ *  the HTTP layer reads it, to pass the reason on to the client. */
+function refused<T extends Error>(error: T, refusal: SkillPackageRefusal): T {
+  (error as T & { skillRefusal?: SkillPackageRefusal }).skillRefusal = refusal;
+  return error;
+}
+
+function payloadTooLarge(message: string, refusal?: SkillPackageRefusal): NodeJS.ErrnoException {
   const error = new Error(message) as NodeJS.ErrnoException;
   error.code = "PAYLOAD_TOO_LARGE";
+  if (refusal) (error as NodeJS.ErrnoException & { skillRefusal?: SkillPackageRefusal }).skillRefusal = refusal;
   return error;
 }
 
@@ -751,7 +769,12 @@ export function validateSkillPackage(
   } = {},
 ): LoadedPackage {
   if (!sourceFiles.size) throw validationError("Skill package is empty");
-  if (sourceFiles.size > SKILL_LIMITS.files) throw payloadTooLarge(`Skill package exceeds ${SKILL_LIMITS.files} files`);
+  if (sourceFiles.size > SKILL_LIMITS.files) {
+    throw payloadTooLarge(
+      `Skill package exceeds ${SKILL_LIMITS.files} files`,
+      { reason: "too-large", limit: "files", actual: sourceFiles.size, cap: SKILL_LIMITS.files },
+    );
+  }
   const files = new Map<string, Buffer>();
   let extractedBytes = 0;
   for (const [rawPath, sourceBytes] of sourceFiles) {
@@ -759,10 +782,18 @@ export function validateSkillPackage(
     if (files.has(path)) throw validationError(`Duplicate normalized skill package path: ${path}`);
     const bytes = Buffer.from(sourceBytes);
     const limit = path === "SKILL.md" ? SKILL_LIMITS.skillMarkdownBytes : SKILL_LIMITS.resourceBytes;
-    if (bytes.length > limit) throw payloadTooLarge(`${path} exceeds ${limit} bytes`);
+    if (bytes.length > limit) {
+      throw payloadTooLarge(
+        `${path} exceeds ${limit} bytes`,
+        { reason: "too-large", limit: path === "SKILL.md" ? "markdown-bytes" : "resource-bytes", actual: bytes.length, cap: limit, path },
+      );
+    }
     extractedBytes += bytes.length;
     if (extractedBytes > SKILL_LIMITS.extractedBytes) {
-      throw payloadTooLarge(`Skill package exceeds ${SKILL_LIMITS.extractedBytes} extracted bytes`);
+      throw payloadTooLarge(
+        `Skill package exceeds ${SKILL_LIMITS.extractedBytes} extracted bytes`,
+        { reason: "too-large", limit: "extracted-bytes", actual: extractedBytes, cap: SKILL_LIMITS.extractedBytes },
+      );
     }
     files.set(path, bytes);
   }
@@ -910,7 +941,10 @@ async function writePackageDirectory(root: string, files: ReadonlyMap<string, Bu
 
 function inspectZip(bytes: Buffer): void {
   if (bytes.length > SKILL_LIMITS.archiveBytes) {
-    throw payloadTooLarge(`Skill archive exceeds ${SKILL_LIMITS.archiveBytes} bytes`);
+    throw payloadTooLarge(
+      `Skill archive exceeds ${SKILL_LIMITS.archiveBytes} bytes`,
+      { reason: "too-large", limit: "archive-bytes", actual: bytes.length, cap: SKILL_LIMITS.archiveBytes },
+    );
   }
   let eocd = -1;
   for (let offset = Math.max(0, bytes.length - 65_557); offset <= bytes.length - 22; offset += 1) {
@@ -920,7 +954,12 @@ function inspectZip(bytes: Buffer): void {
   const entries = bytes.readUInt16LE(eocd + 10);
   const centralOffset = bytes.readUInt32LE(eocd + 16);
   if (entries === 0xffff || centralOffset === 0xffffffff) throw validationError("ZIP64 skill archives are not supported");
-  if (entries > SKILL_LIMITS.files) throw payloadTooLarge(`Skill archive exceeds ${SKILL_LIMITS.files} entries`);
+  if (entries > SKILL_LIMITS.files) {
+    throw payloadTooLarge(
+      `Skill archive exceeds ${SKILL_LIMITS.files} entries`,
+      { reason: "too-large", limit: "entries", actual: entries, cap: SKILL_LIMITS.files },
+    );
+  }
   let offset = centralOffset;
   let extractedBytes = 0;
   for (let index = 0; index < entries; index += 1) {
@@ -941,11 +980,18 @@ function inspectZip(bytes: Buffer): void {
       throw validationError("Skill ZIP cannot contain symlinks");
     }
     if (originalSize > SKILL_LIMITS.resourceBytes) {
-      throw payloadTooLarge(`Skill ZIP entry exceeds ${SKILL_LIMITS.resourceBytes} bytes`);
+      const entryPath = bytes.subarray(offset + 46, offset + 46 + nameLength).toString("utf8");
+      throw payloadTooLarge(
+        `Skill ZIP entry exceeds ${SKILL_LIMITS.resourceBytes} bytes`,
+        { reason: "too-large", limit: "entry-bytes", actual: originalSize, cap: SKILL_LIMITS.resourceBytes, path: entryPath },
+      );
     }
     extractedBytes += originalSize;
     if (extractedBytes > SKILL_LIMITS.extractedBytes) {
-      throw payloadTooLarge(`Skill archive exceeds ${SKILL_LIMITS.extractedBytes} extracted bytes`);
+      throw payloadTooLarge(
+        `Skill archive exceeds ${SKILL_LIMITS.extractedBytes} extracted bytes`,
+        { reason: "too-large", limit: "extracted-bytes", actual: extractedBytes, cap: SKILL_LIMITS.extractedBytes },
+      );
     }
     offset += 46 + nameLength + extraLength + commentLength;
   }
@@ -966,7 +1012,15 @@ function extractZip(bytes: Buffer): Map<string, Buffer> {
         extractedBytes += chunk.length;
         if (fileBytes > SKILL_LIMITS.resourceBytes || extractedBytes > SKILL_LIMITS.extractedBytes) {
           file.terminate();
-          throw payloadTooLarge(`Skill archive exceeds extracted byte limits`);
+          throw fileBytes > SKILL_LIMITS.resourceBytes
+            ? payloadTooLarge(
+              `Skill archive exceeds extracted byte limits`,
+              { reason: "too-large", limit: "resource-bytes", actual: fileBytes, cap: SKILL_LIMITS.resourceBytes, path },
+            )
+            : payloadTooLarge(
+              `Skill archive exceeds extracted byte limits`,
+              { reason: "too-large", limit: "extracted-bytes", actual: extractedBytes, cap: SKILL_LIMITS.extractedBytes },
+            );
         }
         chunks.push(Buffer.from(chunk));
       }
@@ -986,15 +1040,26 @@ function extractZip(bytes: Buffer): Map<string, Buffer> {
 function stripArchiveRoot(files: ReadonlyMap<string, Buffer>): { directoryName?: string; files: Map<string, Buffer> } {
   if (files.has("SKILL.md")) return { files: cloneFiles(files) };
   const firstSegments = new Set([...files.keys()].map((path) => path.split("/")[0]!));
-  if (firstSegments.size !== 1) throw validationError("Skill ZIP must contain one package root");
+  if (firstSegments.size !== 1) {
+    throw refused(validationError("Skill ZIP must contain one package root"), { reason: "several-roots" });
+  }
   const directoryName = [...firstSegments][0]!;
   const prefix = `${directoryName}/`;
+  if (![...files.keys()].some((path) => path.startsWith(prefix))) {
+    // The one top-level entry is a file, not a directory: an archive of loose
+    // files has no package root at all, rather than files outside one.
+    throw refused(validationError("Skill ZIP package root must contain SKILL.md"), { reason: "missing-root" });
+  }
   const stripped = new Map<string, Buffer>();
   for (const [path, bytes] of files) {
-    if (!path.startsWith(prefix)) throw validationError("Skill ZIP contains entries outside its package root");
+    if (!path.startsWith(prefix)) {
+      throw refused(validationError("Skill ZIP contains entries outside its package root"), { reason: "outside-root" });
+    }
     stripped.set(path.slice(prefix.length), Buffer.from(bytes));
   }
-  if (!stripped.has("SKILL.md")) throw validationError("Skill ZIP package root must contain SKILL.md");
+  if (!stripped.has("SKILL.md")) {
+    throw refused(validationError("Skill ZIP package root must contain SKILL.md"), { reason: "missing-root" });
+  }
   return { directoryName, files: stripped };
 }
 
@@ -1060,6 +1125,10 @@ function packageFileBytes(files: ReadonlyMap<string, Buffer>): SkillPackageFileB
 
 export class SkillCatalog {
   private builtIns = new Map<string, LoadedPackage>();
+  /** Built-ins whose package could not be validated. One malformed file is a
+   *  fact about that one skill, not a reason to leave the rest of the catalog
+   *  unloaded or to fail startup. */
+  private builtInFailures = new Map<string, SkillLoadFailure>();
   private index: CatalogIndex = { managed: {}, schemaVersion: 1 };
   private loaded = false;
   private managed = new Map<string, ManagedPackage>();
@@ -1178,15 +1247,25 @@ export class SkillCatalog {
     await rm(resolve(this.root, ".imports"), { force: true, recursive: true });
     await mkdir(resolve(this.root, ".staging"), { recursive: true });
     await mkdir(this.reviewDraftRoot, { recursive: true });
+    this.builtInFailures.clear();
     for (const id of BUNDLED_SKILL_IDS) {
-      const files = await readPackageDirectory(resolve(this.repositoryRoot, "skills", id));
-      this.builtIns.set(id, validateSkillPackage(files, {
-        directoryName: id,
-        readOnly: true,
-        revision: 1,
-        source: "built-in",
-        version: BUILT_IN_VERSIONS[id],
-      }));
+      try {
+        const files = await readPackageDirectory(resolve(this.repositoryRoot, "skills", id));
+        this.builtIns.set(id, validateSkillPackage(files, {
+          directoryName: id,
+          readOnly: true,
+          revision: 1,
+          source: "built-in",
+          version: BUILT_IN_VERSIONS[id],
+        }));
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        this.builtInFailures.set(id, {
+          code: error instanceof SkillCatalogError ? error.code : typeof code === "string" ? code : "SKILL_LOAD_FAILED",
+          id,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
     try {
       const saved = JSON.parse(await readFile(this.indexPath, "utf8")) as Partial<CatalogIndex>;
@@ -1290,14 +1369,37 @@ export class SkillCatalog {
     return [...this.builtIns.keys(), ...this.managed.keys()].toSorted();
   }
 
+  /** Bundled packages that were skipped during the one-shot startup load. The
+   *  `/api/skills` list renders each as a failed entry so an operator can see
+   *  the file is broken instead of wondering why a skill is missing. */
+  loadFailures(): SkillLoadFailure[] {
+    this.assertLoaded();
+    return [...this.builtInFailures.values()]
+      .map((failure) => ({ ...failure }))
+      .toSorted((left, right) => left.id.localeCompare(right.id));
+  }
+
   list(): SkillDescriptor[] {
     this.assertLoaded();
-    return [...this.builtIns.values(), ...this.managed.values()]
+    const loaded = [...this.builtIns.values(), ...this.managed.values()]
       .map(({ detail }) => {
         const { frontmatter: _frontmatter, instructions: _instructions, resources: _resources, ...descriptor } = detail;
         return structuredClone(descriptor);
-      })
-      .toSorted((left, right) => left.name.localeCompare(right.name));
+      });
+    const failed = [...this.builtInFailures.values()].map((failure): SkillDescriptor => ({
+      currentRevision: 1,
+      description: `Failed to load: ${failure.message}`,
+      diagnostics: [],
+      hash: "",
+      id: failure.id,
+      loadFailure: { code: failure.code, message: failure.message },
+      name: failure.id,
+      readOnly: true,
+      resourceSummary: { bytes: 0, files: 0, kinds: { asset: 0, other: 0, reference: 0, script: 0 } },
+      source: "built-in",
+      version: BUILT_IN_VERSIONS[failure.id as (typeof BUNDLED_SKILL_IDS)[number]] ?? "unknown",
+    }));
+    return [...loaded, ...failed].toSorted((left, right) => left.name.localeCompare(right.name));
   }
 
   get(id: string): SkillDetail | undefined {
@@ -2575,12 +2677,19 @@ export class SkillCatalog {
 
   resolve(ids: string[]): RuntimeSkillSnapshot[] {
     this.assertLoaded();
-    return ids.map((id) => {
+    // A selection saved before a bundled package broke still names that id.
+    // Dropping it here keeps one malformed file from failing plugin binding
+    // (and therefore every later request) for everyone who had it enabled; an
+    // id that was never installed still raises, so callers keep their signal.
+    return ids.flatMap((id) => {
       const value = this.builtIns.get(id) ?? this.managed.get(id);
-      if (!value) throw new SkillCatalogError("SKILL_NOT_FOUND", `Skill not found: ${id}`);
+      if (!value) {
+        if (this.builtInFailures.has(id)) return [];
+        throw new SkillCatalogError("SKILL_NOT_FOUND", `Skill not found: ${id}`);
+      }
       const detail = structuredClone(value.detail);
       const files = cloneFiles(value.files);
-      return {
+      return [{
         content: detail.instructions,
         description: detail.description,
         hash: detail.hash,
@@ -2591,7 +2700,7 @@ export class SkillCatalog {
         resources: structuredClone(detail.resources),
         revision: detail.currentRevision,
         version: detail.version,
-      };
+      }];
     });
   }
 }

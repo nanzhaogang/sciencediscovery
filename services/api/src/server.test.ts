@@ -4561,6 +4561,52 @@ test("skill lifecycle APIs author, import, edit, select, audit impact, and delet
   assert.ok(diff.body.lines.some((line) => line.kind === "added" && line.text === "Corrected value with units."));
 });
 
+test("a refused upload answers with the count and the package shape, not just the cap", async (context) => {
+  const tempRoot = resolve(process.cwd(), ".tmp", `skill-refusal-${Date.now()}-${process.pid}`);
+  await mkdir(tempRoot, { recursive: true });
+  context.after(() => removeTestRoot(tempRoot));
+  const { origin } = await startTestApi(context, tempRoot);
+
+  const upload = (files: Record<string, Uint8Array>): FormData => {
+    const form = new FormData();
+    form.set("file", new Blob([Buffer.from(zipSync(files))], { type: "application/zip" }), "skills-main.zip");
+    return form;
+  };
+  const refusalOf = async (form: FormData): Promise<{
+    code?: string;
+    details?: { refusal?: unknown };
+    error?: string;
+    status: number;
+  }> => {
+    const response = await fetch(`${origin}/api/skills/import`, { body: form, headers: authorization, method: "POST" });
+    return { ...(await response.json() as { code?: string; details?: { refusal?: unknown }; error?: string }), status: response.status };
+  };
+
+  // A repository-wide ZIP reaches the entry cap first. The client cannot write
+  // "N 个条目，上限 500" from a sentence that only names the cap.
+  const repositoryZip: Record<string, Uint8Array> = {
+    "skills-main/SKILL.md": strToU8("---\nname: many\ndescription: Many entries.\n---\n\nBody.\n"),
+    "skills-main/alpha/SKILL.md": strToU8("---\nname: alpha\ndescription: One.\n---\n"),
+    "skills-main/beta/SKILL.md": strToU8("---\nname: beta\ndescription: Two.\n---\n"),
+  };
+  for (let index = 0; index < 498; index += 1) repositoryZip[`skills-main/references/${index}.md`] = strToU8("#");
+  const entries = await refusalOf(upload(repositoryZip));
+  assert.equal(entries.status, 413);
+  assert.equal(entries.code, "SKILL_PACKAGE_REFUSED");
+  assert.equal(entries.error, "Skill archive exceeds 500 entries");
+  assert.deepEqual(entries.details?.refusal, { actual: 501, cap: 500, limit: "entries", reason: "too-large" });
+
+  // Under the cap, the same repository ZIP fails the one-package shape: the
+  // skills sit in subdirectories and there is no SKILL.md at the root.
+  const shape = await refusalOf(upload({
+    "skills-main/alpha/SKILL.md": strToU8("---\nname: alpha\ndescription: One.\n---\n"),
+    "skills-main/beta/SKILL.md": strToU8("---\nname: beta\ndescription: Two.\n---\n"),
+  }));
+  assert.equal(shape.status, 400);
+  assert.equal(shape.code, "SKILL_PACKAGE_REFUSED");
+  assert.deepEqual(shape.details?.refusal, { reason: "missing-root" });
+});
+
 test("ART-001 a missing artifact version answers 404 on provenance and diff like content", async (context) => {
   const tempRoot = resolve(process.cwd(), ".tmp", `artifact-version-missing-${Date.now()}-${process.pid}`);
   await mkdir(tempRoot, { recursive: true });
@@ -9676,6 +9722,69 @@ test("memory query and provenance routes forward complete success contracts", { 
   assert.equal(calls.some((call) => call.path === "/query/artifact-provenance"), true);
 });
 
+test("a memory sidecar that answers health but refuses authenticated queries reports unauthorized, not healthy", { id: "memory-graph-auth-rejection" }, async (context) => {
+  // Issue #1352. The sidecar's `/health` does not need the internal token, so
+  // a token mismatch leaves it saying healthy while every `/query/*` answers
+  // 401. The status the settings page reads must say unauthorized, and the
+  // citation read must carry a reason that is not a transport failure.
+  const tempRoot = resolve(process.cwd(), ".tmp", `memory-auth-${randomUUID()}`);
+  await mkdir(tempRoot, { recursive: true });
+  context.after(() => removeTestRoot(tempRoot));
+  const calls: Array<{ authorization: string | undefined; path: string }> = [];
+  const sidecar = createHttpServer((request, response) => {
+    const path = (request.url ?? "/").split("?")[0] ?? "/";
+    calls.push({ authorization: request.headers.authorization, path });
+    response.writeHead(path === "/health" ? 200 : 401, { "content-type": "application/json" });
+    response.end(path === "/health"
+      ? JSON.stringify({ status: "healthy", backend: "local" })
+      : JSON.stringify({ detail: "invalid internal token" }));
+  });
+  let sidecarClosed = false;
+  await new Promise<void>((done) => sidecar.listen(0, "127.0.0.1", done));
+  context.after(() => new Promise<void>((done) => {
+    if (sidecarClosed) { done(); return; }
+    sidecar.close(() => done());
+  }));
+  const api = createProductionApiServer({
+    ...testConfig(tempRoot),
+    memoryGraph: { url: `http://127.0.0.1:${(sidecar.address() as AddressInfo).port}`, internalToken: "wrong-internal-token" },
+  });
+  await new Promise<void>((done) => api.listen(0, "127.0.0.1", done));
+  context.after(() => closeApiServer(api));
+  const origin = `http://127.0.0.1:${(api.address() as AddressInfo).port}`;
+  const headers = { ...authorization, "content-type": "application/json" };
+  const enabled = await fetch(`${origin}/api/memory/settings`, {
+    method: "PUT", headers, body: JSON.stringify({ enabled: true }),
+  });
+  assert.equal(enabled.status, 200);
+
+  const health = await jsonRequest<{ memoryGraph: string }>(`${origin}/api/health`, { headers: authorization });
+  assert.equal(health.body.memoryGraph, "unauthorized");
+
+  const read = async () => jsonRequest<Record<string, unknown>>(`${origin}/api/memory/query/by-node-type`, {
+    method: "POST", headers, body: JSON.stringify({ node_types: ["Evidence"] }),
+  });
+  const refused = await read();
+  assert.equal(refused.response.status, 200);
+  assert.equal(refused.body.reason, "memory_graph_unauthorized");
+  assert.deepEqual(refused.body.hits, []);
+  // The status probe and the card read both used the configured token. The
+  // probe is the O(1) ping, never a graph query: a by-node-type probe would
+  // depend on graph size and the query work budget. (The settings write above
+  // also probes, hence the lower bound rather than a count.)
+  const probes = calls.filter((call) => call.path === "/internal/ping");
+  assert.ok(probes.length >= 2);
+  assert.ok(probes.every((call) => call.authorization === "Bearer wrong-internal-token"));
+  assert.equal(calls.filter((call) => call.path === "/query/by-node-type").length, 1,
+    "health must not probe with a graph query");
+
+  // A service that is not there is still a different reading.
+  sidecarClosed = true;
+  await new Promise<void>((done) => sidecar.close(() => done()));
+  const offline = await read();
+  assert.equal(offline.body.reason, "memory_graph_unreachable");
+});
+
 test("WPC-005 a reachable sidecar whose graph is down returns 502, not 404", async (context) => {
   // The sidecar is reachable (HTTP 200) but its Neo4j is unreachable, so it
   // answers { content_hash: null, reason: "memory_graph_unreachable" }. The API
@@ -9718,6 +9827,50 @@ test("WPC-005 a reachable sidecar whose graph is down returns 502, not 404", asy
   const response = await fetch(`${origin}/api/sessions/${sessionId}/web-pages/wp-anything/content`, { headers: authorization });
   assert.equal(response.status, 502);
   assert.match((await response.json() as { error?: string }).error ?? "", /memory graph unreachable/);
+});
+
+test("WPC-006 a sidecar that rejects the credential returns 502, not 404", async (context) => {
+  // The WebPage lookup now distinguishes a rejected internal token from an
+  // absent node. The content endpoint must keep that distinction: a 401 is a
+  // reason the graph could not answer, so it is a 502, never the 404 the UI
+  // reads as "this page is gone".
+  const tempRoot = resolve(process.cwd(), ".tmp", `wpc-unauthorized-${Date.now()}-${process.pid}`);
+  await mkdir(tempRoot, { recursive: true });
+  context.after(() => removeTestRoot(tempRoot));
+  const sidecar = createHttpServer((request, response) => {
+    const url = new URL(request.url ?? "/", "http://sidecar.test");
+    if (url.pathname === "/health") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(`${JSON.stringify({ status: "healthy", backend: "local" })}\n`);
+      return;
+    }
+    // Any authenticated read, including the content-hash lookup, is refused.
+    response.writeHead(401, { "content-type": "application/json" });
+    response.end(`${JSON.stringify({ detail: "invalid internal token" })}\n`);
+  });
+  await new Promise<void>((resolveListen) => sidecar.listen(0, "127.0.0.1", resolveListen));
+  context.after(() => new Promise<void>((resolveClose) => sidecar.close(() => resolveClose())));
+  const sidecarUrl = `http://127.0.0.1:${(sidecar.address() as AddressInfo).port}`;
+
+  const api = createProductionApiServer({ ...testConfig(tempRoot), memoryGraph: { url: sidecarUrl, internalToken: "wrong-token" } });
+  await new Promise<void>((resolveListen) => api.listen(0, "127.0.0.1", resolveListen));
+  context.after(() => new Promise<void>((resolveClose) => { api.close(() => resolveClose()); api.closeAllConnections(); }));
+  const origin = `http://127.0.0.1:${(api.address() as AddressInfo).port}`;
+  const project = await jsonRequest<{ project: { id: string }; firstSession: { id: string } }>(`${origin}/api/projects`, {
+    body: JSON.stringify({ name: "WebPage content rejected" }),
+    headers: { ...authorization, "content-type": "application/json" },
+    method: "POST",
+  });
+  const sessionId = project.body.firstSession.id;
+  await fetch(`${origin}/api/memory/settings`, {
+    body: JSON.stringify({ enabled: true }),
+    headers: { ...authorization, "content-type": "application/json" },
+    method: "PUT",
+  });
+
+  const response = await fetch(`${origin}/api/sessions/${sessionId}/web-pages/wp-anything/content`, { headers: authorization });
+  assert.equal(response.status, 502);
+  assert.match((await response.json() as { error?: string }).error ?? "", /rejected the internal token/);
 });
 
 test("deep checkpoint forwards selected MCP readiness without duplicating main notices", async (context) => {
