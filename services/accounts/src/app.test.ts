@@ -556,6 +556,55 @@ test("a ticket is single use and yields a session with the signup grant", async 
   assert.equal(payload(second).error.code, "ticket_invalid");
 });
 
+test("a ticket without a device profile derives it from the User-Agent", async () => {
+  const store = new MemoryStore();
+  const app = createApp({ config: config(), store, now: () => NOW, fetchImpl: fakeHuawei("openid-1") });
+  const started = await call(app, "GET", "/v1/auth/huawei/start?returnUrl=https%3A%2F%2Fapp.example.com%2Flogin");
+  const state = new URL(String(started.headers.location)).searchParams.get("state")!;
+  const callback = await call(app, "GET", `/v1/auth/huawei/callback?code=abc&state=${encodeURIComponent(state)}`);
+  const ticket = new URLSearchParams(String(callback.headers.location).split("#")[1]).get("auth-ticket");
+
+  const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Electron/33.0.0 Safari/537.36";
+  const exchanged = await call(app, "POST", "/v1/auth/ticket", { body: { ticket }, headers: { "user-agent": userAgent } });
+  assert.equal(exchanged.status, 200);
+  const accessToken = payload(exchanged).accessToken as string;
+
+  const sessions = await call(app, "GET", "/v1/me/sessions", { headers: { authorization: `Bearer ${accessToken}` } });
+  const row = payload(sessions).items[0];
+  assert.equal(row.platform, 1);
+  assert.equal(row.deviceLabel, `Windows 桌面 · ${userAgent.slice(0, 64)}`);
+  assert.equal(row.deviceId, null);
+});
+
+test("all=1 returns the whole ledger for local paging", async () => {
+  const store = new MemoryStore();
+  const app = createApp({ config: config(), store, now: () => NOW, fetchImpl: fakeHuawei("openid-1") });
+  const { accessToken } = await signInUser(app);
+  const me = payload(await call(app, "GET", "/v1/me", { headers: { authorization: `Bearer ${accessToken}` } }));
+  const userId = me.user.id as number;
+  for (let index = 0; index < 120; index += 1) {
+    store.ledger.push({
+      id: 10_000 + index,
+      userId,
+      delta: 10,
+      balanceAfter: 500_000 + index,
+      bizType: "CHECKIN",
+      bizId: `seed-${index}`,
+      remark: null,
+      createdAt: NOW.toISOString(),
+    });
+  }
+
+  const all = await call(app, "GET", "/v1/credits/ledger?all=1", { headers: { authorization: `Bearer ${accessToken}` } });
+  assert.equal(all.status, 200);
+  assert.equal(payload(all).items.length, 121);
+  assert.equal(payload(all).nextBeforeId, null);
+
+  // The cursor path still caps at 100, so `all=1` is the one that can exceed it.
+  const paged = await call(app, "GET", "/v1/credits/ledger?limit=100", { headers: { authorization: `Bearer ${accessToken}` } });
+  assert.equal(payload(paged).items.length, 100);
+});
+
 test("the signed-in user can inspect and revoke sessions, and rename within bounds", async () => {
   const store = new MemoryStore();
   const app = createApp({ config: config(), store, now: () => NOW, fetchImpl: fakeHuawei("openid-1") });

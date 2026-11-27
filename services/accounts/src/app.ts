@@ -54,6 +54,8 @@ const REFRESH_REPLAY_GRACE_MS = 30_000;
 /** Output budget the proxy freezes when the client sends no `max_tokens`. */
 const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
 const MAX_OUTPUT_TOKENS = 131_072;
+/** Upper bound when the client asks for the whole ledger for local paging. */
+const LEDGER_ALL_LIMIT = 1000;
 
 export interface AppDeps {
   config: AccountsConfig;
@@ -75,6 +77,18 @@ function parseBigId(raw: string): number {
   const id = Number(raw);
   if (!Number.isSafeInteger(id) || id <= 0) throw new HttpError(400, "invalid_id", "id must be a positive integer");
   return id;
+}
+
+/** The first-run entry page runs inside Electron; everything else is the web build. */
+function inferPlatformFromUserAgent(userAgent: string | undefined): number {
+  return /Electron/i.test(userAgent ?? "") ? 1 : 2;
+}
+
+/** A human label for the device list, derived from the request's own UA. */
+function inferDeviceLabel(userAgent: string | undefined, platform: number): string | undefined {
+  const ua = (userAgent ?? "").trim();
+  if (!ua) return undefined;
+  return `${platform === 1 ? "Windows 桌面" : "Linux Web"} · ${ua.slice(0, 64)}`;
 }
 
 function readInteger(source: Record<string, unknown>, key: string, range: { min?: number; max?: number }): number | undefined {
@@ -434,15 +448,19 @@ export function createApp(deps: AppDeps): (request: HttpRequest) => Promise<Http
     if (!user) throw new HttpError(401, "ticket_invalid", "ticket refers to no account");
     if (user.status === 2 || user.status === 3) throw new HttpError(403, "account_frozen", "account is frozen");
 
+    const userAgent = request.headers["user-agent"];
+    // The client no longer uploads its device profile: the platform and label
+    // are derived from the request's own User-Agent.
+    const platform = readNumber(body, "platform", { min: 1, max: 2 }) ?? inferPlatformFromUserAgent(userAgent);
     const refreshToken = randomToken();
     const session = await store.createSession({
       userId: user.id,
       refreshHash: sha256(refreshToken),
-      platform: readNumber(body, "platform", { min: 1, max: 2 }) ?? 1,
-      deviceLabel: readString(body, "deviceLabel", { maxLength: 128 }),
+      platform,
+      deviceLabel: readString(body, "deviceLabel", { maxLength: 128 }) ?? inferDeviceLabel(userAgent, platform),
       deviceId: readString(body, "deviceId", { maxLength: 64 }),
       ip: request.ip ?? undefined,
-      userAgent: request.headers["user-agent"],
+      userAgent,
       expiresAt: new Date(now().getTime() + config.refreshTtlSeconds * 1000),
     });
     await store.recordLoginEvent({ userId: user.id, sessionId: session.id, event: "SIGN_IN", ip: request.ip ?? undefined, userAgent: request.headers["user-agent"] });
@@ -588,6 +606,12 @@ export function createApp(deps: AppDeps): (request: HttpRequest) => Promise<Http
 
   router.add("GET", "/v1/credits/ledger", async (request) => {
     const context = await requireUser(request);
+    // `all=1` is the local-paging path: the client asks once and keeps the
+    // paging state on its own side, so no limit/cursor leaves the browser.
+    if (request.query.get("all") === "1") {
+      const rows = await store.listLedger(context.user.id, undefined, LEDGER_ALL_LIMIT);
+      return json(200, { items: rows.map(ledgerView), nextBeforeId: null });
+    }
     const before = request.query.get("beforeId");
     const limit = Math.min(Math.max(Number(request.query.get("limit") ?? 20), 1), 100);
     const rows = await store.listLedger(context.user.id, before ? parseBigId(before) : undefined, limit);
