@@ -176,6 +176,13 @@ export async function listAccountLedger(
   return getAccountJson(`/v1/credits/ledger?${query.toString()}`, accessToken);
 }
 
+/** The whole ledger in one read, so paging can happen on this device. */
+export async function listAccountLedgerAll(
+  accessToken: string,
+): Promise<{ items: AccountLedgerRow[]; nextBeforeId: number | null }> {
+  return getAccountJson("/v1/credits/ledger?all=1", accessToken);
+}
+
 export async function fetchAccountUsage(accessToken: string): Promise<{ days: AccountUsageDay[]; records: AccountUsageRecord[] }> {
   return getAccountJson("/v1/me/usage", accessToken);
 }

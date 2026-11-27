@@ -279,15 +279,17 @@ export function huaweiSignInUrl(returnUrl: string, options: AccountClientOptions
   return `${normalizedBase(options.baseUrl ?? "")}/v1/auth/huawei/start?${new URLSearchParams({ returnUrl }).toString()}`;
 }
 
-/** Exchanges the single-use ticket from the HUAWEI callback for a real session. */
+/** Exchanges the single-use ticket from the HUAWEI callback for a real session.
+ *  The device profile stays on this machine: the service derives the platform
+ *  and label from the request's own User-Agent. */
 export async function exchangeTicket(
   ticket: string,
-  device: AccountDevice,
+  _device?: AccountDevice,
   options: AccountClientOptions = {},
 ): Promise<AccountSession> {
   const session = await request<Omit<AccountSession, "isNewUser"> & { isNewUser?: boolean }>(
     "/v1/auth/ticket",
-    jsonRequest({ ticket, platform: device.platform, deviceLabel: device.deviceLabel, deviceId: device.deviceId }),
+    jsonRequest({ ticket }),
     options,
   );
   return { ...session, isNewUser: session.isNewUser === true };
