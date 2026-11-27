@@ -41,14 +41,7 @@ import {
 } from "./wizard-api.ts";
 import { runSeatbeltProbe, type SeatbeltVerdict } from "./sandbox-probe.ts";
 import { readDirectExecution, writeDirectExecution } from "./direct-execution.ts";
-import { setupAutoUpdate, updateEnabled } from "./updater.ts";
 import { type AgentInfo } from "./agent-ready.ts";
-// electron-updater exports a PLATFORM SINGLETON (NsisUpdater on win /
-// MacUpdater on darwin) — use it as-is, never `new`. esbuild bundles this
-// CJS package into the main.cjs just fine (pure JS deps: semver/js-yaml/
-// fs-extra). The update feed URL comes from the app-embedded publish
-// config (electron-builder.yml, B4-2) — nothing here names a URL.
-import { autoUpdater } from "electron-updater";
 
 // Bundled as CJS by esbuild: the app path is the shell root in dev (`electron .`).
 const shellDir = app.getAppPath();
@@ -196,13 +189,6 @@ let externalStackAlive = false;
 // payload then carries modeKnown:false so the row can hedge instead of
 // asserting (review round 14).
 let stackAdoptedThisSession = false;
-/** F8: the updater's drain-retry hook (re-enter stopStack → visible
- *  install for a gate-blocked update), captured so the drain-blocked
- *  dialog's "stop and install" button can call it. */
-let drainRetryInstall: (() => void) | null = null;
-/** F15: the updater's drain-dismiss hook — drops the pending install so
- * the periodic checks resume after the user picks 「暂不安装」. */
-let drainDropPending: (() => void) | null = null;
 /** Endpoints of the current run; the save-token IPC handler reloads the UI. */
 let currentEndpoints: Endpoints | null = null;
 // --- wizard state ---
@@ -2255,93 +2241,8 @@ void app.whenReady().then(async () => {
   createWindow();
   SD_PERF("window-created");
 
-  // Auto-update (B4-3, F11 conservative policy — D4 §5): armed only in
-  // packaged builds; the update-source URL comes from the publish section
-  // embedded by electron-builder (B4-2's yml block is the frozen truth).
-  // Dev builds never hit the feed.
-  if (updateEnabled(app.isPackaged)) {
-    setupAutoUpdate({
-      app,
-      autoUpdater,
-      log,
-      prompt: async version => {
-        const answer = await dialog.showMessageBox({
-          type: "info",
-          title: "ScienceDiscovery 更新",
-          message: `新版本 ${version} 可用`,
-          detail: "下载并安装更新？你可以稍后再装——检查会定期重新提醒。",
-          buttons: ["下载并安装", "暂不更新"],
-          defaultId: 0,
-          cancelId: 1,
-          noLink: true,
-        });
-        return answer.response === 0;
-      },
-      notify: (kind, detail) => {
-        log(`update: ${kind} ${detail}`);
-        if (Notification.isSupported() && mainWindow) {
-          const body = kind === "downloading" ? `正在下载新版本 ${detail}…`
-            : kind === "ready" ? "更新已就绪，即将重启安装"
-            : kind === "drain-blocked" ? detail
-            : `更新失败：${detail}`;
-          new Notification({ title: "ScienceDiscovery 更新", body }).show();
-        }
-      },
-      stackFacts: () => ({
-        // F9: a reused (not spawned) backend is just as live — the drain
-        // gate must block on it too, or the update swaps the .app under a
-        // python tree this shell merely adopted.
-        hasHandle: stack !== null || externalStackAlive,
-        stopInFlight: stackStopInFlight,
-      }),
-      stopStack: async () => {
-        const s = stack;
-        if (s && stackOwnedByShell) {
-          stack = null;
-          stackStopInFlight = true;
-          try { await s.stop(); } finally { stackStopInFlight = false; }
-          return;
-        }
-        if (externalStackAlive) {
-          // F9: the stack survived a previous shell (crash / force-quit) and
-          // this session reused it. Stop it by pid so the install cannot
-          // race a live python tree. The flag clears optimistically; a
-          // still-healthy backend on the next start just re-marks it.
-          const healthPort = parseInt(new URL(currentEndpoints?.health ?? "http://127.0.0.1:4410/api/health").port || "4410", 10);
-          stackStopInFlight = true;
-          try { await stopExternalStack(healthPort, log); }
-          finally { stackStopInFlight = false; externalStackAlive = false; }
-        }
-      },
-      // F8: "drain gate blocked" must not be a dead end — offer the stop-
-      // and-install path. Confirmed → stopStack resolves after the tree is
-      // gone → the updater's pending install fires (visible restart).
-      // F15: 「暂不安装」 → dropPending so the 6h checks resume (the
-      // update re-offers next check) instead of freezing the session.
-      onDrainBlocked: (message) => {
-        void dialog.showMessageBox(mainWindow!, {
-          type: "warning",
-          title: "ScienceDiscovery 更新",
-          message: message,
-          detail: "选择「停止并安装」将停止后端进程并立即重启安装更新；选「暂不安装」将在下次检查时再次提醒。",
-          buttons: ["暂不安装", "停止并安装"],
-          defaultId: 1,
-          cancelId: 0,
-          noLink: true,
-        }).then(({ response }) => {
-          if (response === 1) {
-            log("update: user chose stop-and-install from the drain-blocked dialog");
-            drainRetryInstall?.();
-          } else {
-            log("update: user deferred the install from the drain-blocked dialog");
-            drainDropPending?.();
-          }
-        });
-      },
-      registerDrainRetry: (retry) => { drainRetryInstall = retry; },
-      registerDrainDismiss: (dismiss) => { drainDropPending = dismiss; },
-    });
-  }
+  // Automatic update checks are disabled: this build must not contact the
+  // update feed on its own, so no timer ever calls checkForUpdates().
 
   // [U5c] Probe Seatbelt ONCE per session, before the wizard/startup fork —
   // both flows consume the result through darwinDirectEnv (the spawn env
