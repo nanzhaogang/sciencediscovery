@@ -18,7 +18,7 @@ const { test } = createTest(import.meta.url, {
 });
 import assert from "node:assert/strict";
 
-import { browserSignInAvailable, startBrowserSignIn } from "../src/auth/browser-signin.js";
+import { browserSignInAvailable, SIGN_IN_DEADLINE_MS, startBrowserSignIn } from "../src/auth/browser-signin.js";
 
 type Callback = (result: { ticket?: string; error?: string }) => void;
 
@@ -104,4 +104,39 @@ test("cancelling resolves the flow and closes the shell callback", async () => {
     assert.equal(await flow.result, null);
     assert.equal(cancelled, true);
   });
+});
+
+test("a flow the browser never calls back times out instead of spinning", async () => {
+  // The real deadline is minutes away, so the timer is captured and fired by
+  // hand: what matters is that a flow without a callback settles at all, and
+  // that the shell's loopback server is released with it.
+  let cancelled = false;
+  let armed: { run: () => void; delay: number } | undefined;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const bridge = {
+    begin: async () => ({ callbackUrl: "http://127.0.0.1:43213/callback" }),
+    open: async () => {},
+    cancel: async () => { cancelled = true; },
+    onResult: () => () => {},
+  };
+  (globalThis as { setTimeout: unknown }).setTimeout = (run: () => void, delay: number) => {
+    armed = { run, delay };
+    return { unref: () => {} };
+  };
+  (globalThis as { clearTimeout: unknown }).clearTimeout = () => undefined;
+  try {
+    await withWindow({ sdShell: { accountSignIn: bridge } }, async () => {
+      const flow = startBrowserSignIn((callbackUrl) => callbackUrl);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.ok(armed, "the flow arms a deadline");
+      assert.equal(armed.delay, SIGN_IN_DEADLINE_MS);
+      armed.run();
+      assert.deepEqual(await flow.result, { error: "timeout" });
+      assert.equal(cancelled, true);
+    });
+  } finally {
+    (globalThis as { setTimeout: unknown }).setTimeout = originalSetTimeout;
+    (globalThis as { clearTimeout: unknown }).clearTimeout = originalClearTimeout;
+  }
 });

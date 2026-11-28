@@ -34,6 +34,19 @@ export interface BrowserSignInResult {
   error?: string;
 }
 
+/**
+ * How long a system-browser round-trip may stay open before the app gives up.
+ *
+ * Five minutes is the usual window for interactive sign-in: Microsoft Entra's
+ * default interactive auth timeout is 5 minutes per step, the same guideline
+ * Okta and Auth0 document for browser redirect flows, and RFC 8628's device
+ * grant leaves `expires_in` to the server with 5–30 minutes as the common
+ * range. Anything longer reads as a frozen page; anything shorter cuts off a
+ * user who is typing a password or completing MFA. The reader can also cancel
+ * at any moment, so this is the ceiling, not the expected wait.
+ */
+export const SIGN_IN_DEADLINE_MS = 5 * 60 * 1000;
+
 export interface BrowserSignInFlow {
   /** Resolves with the ticket or error; `null` when the flow was cancelled. */
   result: Promise<BrowserSignInResult | null>;
@@ -79,13 +92,30 @@ export function startBrowserSignIn(
   let settle: (value: BrowserSignInResult | null) => void = () => {};
   const result = new Promise<BrowserSignInResult | null>((resolve) => { settle = resolve; });
 
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+
   const finish = (value: BrowserSignInResult | null): void => {
     if (finished) return;
     finished = true;
+    if (deadline !== undefined) {
+      clearTimeout(deadline);
+      deadline = undefined;
+    }
     unsubscribe?.();
     unsubscribe = undefined;
     settle(value);
   };
+
+  // The reader can close the browser tab or walk away: without a deadline the
+  // page would spin forever, because no callback ever arrives to settle it.
+  deadline = setTimeout(() => {
+    if (finished) return;
+    // Tell the shell to release its loopback server; a late callback must not
+    // land on a flow this app has already abandoned.
+    void accountSignIn.cancel().catch(() => undefined);
+    finish({ error: "timeout" });
+  }, SIGN_IN_DEADLINE_MS);
+  (deadline as { unref?: () => void }).unref?.();
 
   // Subscribe before opening the browser: the callback can arrive before
   // `open` resolves on a fast sign-in.
@@ -104,10 +134,10 @@ export function startBrowserSignIn(
     result,
     cancel: () => {
       if (finished) return;
-      finished = true;
-      unsubscribe?.();
-      unsubscribe = undefined;
-      settle(null);
+      // finish() releases the deadline and the subscription; the shell server
+      // is stopped explicitly so a late callback cannot land on a flow this
+      // page has already abandoned.
+      finish(null);
       void accountSignIn.cancel().catch(() => undefined);
     },
   };

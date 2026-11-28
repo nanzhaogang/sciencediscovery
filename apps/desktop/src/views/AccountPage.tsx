@@ -598,18 +598,18 @@ export function AccountPage({
  * action that changes that. The workspace stays behind it — a custom-model
  * workspace keeps working without an account, and signing in can wait.
  */
-export function SignedOutAccount({ pending = false, onClose, onBrowserSignIn, onEnterWorkspace }: {
+export function SignedOutAccount({ pending = false, onClose, onBrowserSignIn, onSignedIn }: {
   pending?: boolean;
   onClose?: () => void;
-  /** Exchange a ticket from the system-browser sign-in without entering yet:
-   *  the panel shows the success summary first. Rejects on failure. */
+  /** Exchange a ticket from the system-browser sign-in. Rejects on failure. */
   onBrowserSignIn?: (ticket: string) => Promise<{ session: UserSession; localToken: string }>;
-  /** Enter the workspace after the success summary. */
-  onEnterWorkspace?: (session: UserSession, localToken: string) => void;
+  /** Adopt the settled session: the panel swaps straight to the account details.
+   *  The install-time config page is the only place that stops on a success
+   *  summary — here the panel is already the account surface. */
+  onSignedIn?: (session: UserSession, localToken: string) => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState(false);
-  const [signedIn, setSignedIn] = useState<{ session: UserSession; localToken: string } | null>(null);
   const flow = useRef<BrowserSignInFlow | null>(null);
   // Leaving the panel abandons a browser sign-in that has not called back yet.
   useEffect(() => () => { flow.current?.cancel(); }, []);
@@ -638,7 +638,8 @@ export function SignedOutAccount({ pending = false, onClose, onBrowserSignIn, on
       return;
     }
     try {
-      setSignedIn(await onBrowserSignIn(result.ticket));
+      const settled = await onBrowserSignIn(result.ticket);
+      onSignedIn?.(settled.session, settled.localToken);
     } catch {
       setFailed(true);
     } finally {
@@ -647,6 +648,15 @@ export function SignedOutAccount({ pending = false, onClose, onBrowserSignIn, on
   }
 
   const waiting = pending || busy;
+
+  /** Abandon a system-browser sign-in that has not called back yet: the panel
+   *  returns to its signed-out state, which still offers both ways forward. */
+  function cancelSignIn(): void {
+    flow.current?.cancel();
+    flow.current = null;
+    setBusy(false);
+    setFailed(false);
+  }
 
   return (
     <div className="account-page">
@@ -658,66 +668,58 @@ export function SignedOutAccount({ pending = false, onClose, onBrowserSignIn, on
         </div>
       ) : null}
       <div className="account-scroll">
-        {signedIn ? (
-          <div className="account-signedout">
-            <h1>{TEXT.login.successTitle}</h1>
-            <p className="account-signin-notice">{TEXT.login.welcome(signedIn.session.displayName)}</p>
-            <p className="account-signin-notice">{TEXT.login.credits(signedIn.session.balanceCredits)}</p>
-            <button
-              className="primary-button account-signin"
-              onClick={() => onEnterWorkspace?.(signedIn.session, signedIn.localToken)}
-              type="button"
+        <div className="account-signedout">
+          <span className="account-hero-avatar is-guest" aria-hidden="true">
+            <svg
+              fill="none"
+              height="28"
+              stroke="currentColor"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth="1.6"
+              viewBox="0 0 24 24"
+              width="28"
             >
-              {TEXT.login.enterWorkspace}
-            </button>
-          </div>
-        ) : (
-          <div className="account-signedout">
-            <span className="account-hero-avatar is-guest" aria-hidden="true">
-              <svg
-                fill="none"
-                height="28"
-                stroke="currentColor"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth="1.6"
-                viewBox="0 0 24 24"
-                width="28"
-              >
-                <circle cx="12" cy="8" r="3.4" />
-                <path d="M5.5 19.2c.9-3 3.4-4.7 6.5-4.7s5.6 1.7 6.5 4.7" />
-              </svg>
-            </span>
-            {waiting ? (
-              // The HUAWEI sign-in is in flight: the browser is open, or the
-              // callback is being exchanged.
+              <circle cx="12" cy="8" r="3.4" />
+              <path d="M5.5 19.2c.9-3 3.4-4.7 6.5-4.7s5.6 1.7 6.5 4.7" />
+            </svg>
+          </span>
+          {waiting ? (
+            // The HUAWEI sign-in is in flight: the browser is open, or the
+            // callback is being exchanged.
+            <>
               <p className="account-signin-pending">
                 <span className="login-spinner" aria-hidden="true" />
                 {TEXT.login.verifying}
               </p>
-            ) : failed ? (
-              <div className="account-signin-failed">
-                <p className="account-signin-notice" role="status">{TEXT.login.browserFailed}</p>
-                <button className="login-huawei-button account-signin" onClick={() => void startSignIn()} type="button">
-                  <span className="login-huawei-mark" aria-hidden="true">ID</span>{TEXT.login.retry}
+              {busy ? (
+                <button className="account-secondary" onClick={cancelSignIn} type="button">
+                  {TEXT.login.cancelSignIn}
                 </button>
-              </div>
-            ) : accountsConfigured() ? (
-              <button
-                className="login-huawei-button account-signin"
-                onClick={() => void startSignIn()}
-                type="button"
-              >
-                <span className="login-huawei-mark" aria-hidden="true">ID</span>{TEXT.login.huaweiButton}
+              ) : null}
+            </>
+          ) : failed ? (
+            <div className="account-signin-failed">
+              <p className="account-signin-notice" role="status">{TEXT.login.browserFailed}</p>
+              <button className="login-huawei-button account-signin" onClick={() => void startSignIn()} type="button">
+                <span className="login-huawei-mark" aria-hidden="true">ID</span>{TEXT.login.retry}
               </button>
-            ) : (
-              // No account-service base in this build: the panel says so instead of
-              // navigating to a path this app's own static host would answer with
-              // the SPA, which reloads the workspace with nothing to show for it.
-              <p className="account-signin-notice" role="status">{TEXT.login.accountServiceMissing}</p>
-            )}
-          </div>
-        )}
+            </div>
+          ) : accountsConfigured() ? (
+            <button
+              className="login-huawei-button account-signin"
+              onClick={() => void startSignIn()}
+              type="button"
+            >
+              <span className="login-huawei-mark" aria-hidden="true">ID</span>{TEXT.login.huaweiButton}
+            </button>
+          ) : (
+            // No account-service base in this build: the panel says so instead of
+            // navigating to a path this app's own static host would answer with
+            // the SPA, which reloads the workspace with nothing to show for it.
+            <p className="account-signin-notice" role="status">{TEXT.login.accountServiceMissing}</p>
+          )}
+        </div>
       </div>
     </div>
   );

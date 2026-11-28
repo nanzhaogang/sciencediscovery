@@ -1773,10 +1773,13 @@ export function App({ initialToken }: Props) {
           onClose={() => setAccountOpen(false)}
           pending={settlingAuth}
           onBrowserSignIn={(ticket) => settleAuthTicket(ticket)}
-          onEnterWorkspace={async (session, localToken) => {
-            // Entering the workspace is the final press: authenticate swaps the
-            // panel for the workbench.
+          onSignedIn={async (session, localToken) => {
+            // The panel is the account surface, so a settled sign-in swaps it
+            // for the details rather than stopping on a success summary or
+            // leaving for the workspace. authenticate() closes the panel on its
+            // ordinary path, so it is reopened on the details afterwards.
             await authenticate(session, localToken);
+            setAccountOpen(true);
           }}
         />
       ) : null}

@@ -215,6 +215,9 @@ export const ZH = {
     verifying: "正在确认登录状态…",
     errorTitle: "登录未完成",
     errorBody: "华为账号返回了错误，或账号服务未能验证这次登录。请重试。",
+    timeoutBody: "等待华为账号登录超时。请重新登录，或先配置一个自定义模型继续使用。",
+    waitHint: "最多等待 5 分钟。如果浏览器没有打开或已被关闭，可以直接取消。",
+    cancelSignIn: "取消登录",
     accountServiceMissing:
       "本次构建未配置账号服务地址，华为账号登录暂不可用。请联系构建方设置 VITE_ACCOUNTS_API 后重新构建。",
     localTokenMissing: "登录已完成，但本机访问凭据未能签发。请确认本地服务已启动后重试，或退出登录。",

@@ -110,6 +110,9 @@ export function LoginPage({
   /** True when this mount settled a real sign-in (not a cached-session restore):
    *  the success panel then waits for the reader to enter the workspace. */
   const [freshSignIn, setFreshSignIn] = useState(false);
+  /** Why the sign-in page is showing its failure panel: a timed-out wait says
+   *  so instead of blaming the account service for a refusal it never made. */
+  const [failure, setFailure] = useState<"error" | "timeout">("error");
   /** The in-flight system-browser sign-in, cancelled when the page unmounts. */
   const signInFlow = useRef<BrowserSignInFlow | null>(null);
   // Baked at build time, so this never changes while the page is mounted.
@@ -263,6 +266,7 @@ export function LoginPage({
     signInFlow.current = null;
     if (result === null) return;
     if (!result.ticket) {
+      setFailure(result.error === "timeout" ? "timeout" : "error");
       setStep("error");
       return;
     }
@@ -274,8 +278,18 @@ export function LoginPage({
       setFreshSignIn(true);
       setStep("done");
     } catch {
+      setFailure("error");
       setStep("error");
     }
+  }
+
+  /** Abandon a system-browser sign-in that has not called back yet. The entry
+   *  page already offers both ways forward — sign in again, or configure a
+   *  custom model — so this returns there rather than to the failure panel. */
+  function cancelSignIn(): void {
+    signInFlow.current?.cancel();
+    signInFlow.current = null;
+    setStep("idle");
   }
 
   return (
@@ -363,11 +377,19 @@ export function LoginPage({
                     {step === "redirecting" ? TEXT.login.redirecting : TEXT.login.verifying}
                   </p>
                 </div>
+                <p className="login-notice">{TEXT.login.waitHint}</p>
+                <div className="login-actions">
+                  <button className="secondary-button login-wide" onClick={cancelSignIn} type="button">
+                    {TEXT.login.cancelSignIn}
+                  </button>
+                </div>
               </section>
             ) : step === "error" ? (
               <section>
                 <h1>{TEXT.login.errorTitle}</h1>
-                <p className="login-lead">{TEXT.login.errorBody}</p>
+                <p className="login-lead">
+                  {failure === "timeout" ? TEXT.login.timeoutBody : TEXT.login.errorBody}
+                </p>
                 <div className="login-actions">
                   {offerModelSetup ? (
                     <button
