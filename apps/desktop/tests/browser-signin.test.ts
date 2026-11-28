@@ -140,3 +140,28 @@ test("a flow the browser never calls back times out instead of spinning", async 
     (globalThis as { clearTimeout: unknown }).clearTimeout = originalClearTimeout;
   }
 });
+
+test("cancelling while the shell is still starting its callback closes it too", async () => {
+  // `begin()` may resolve after the reader already gave up; the server it
+  // creates belongs to no live flow and must not stay listening.
+  let cancels = 0;
+  let release: (() => void) | undefined;
+  const bridge = {
+    begin: () => new Promise<{ callbackUrl: string }>((resolve) => {
+      release = () => resolve({ callbackUrl: "http://127.0.0.1:43214/callback/nonce" });
+    }),
+    open: async () => {},
+    cancel: async () => { cancels += 1; },
+    onResult: () => () => {},
+  };
+  await withWindow({ sdShell: { accountSignIn: bridge } }, async () => {
+    const flow = startBrowserSignIn((callbackUrl) => callbackUrl);
+    flow.cancel();
+    assert.equal(await flow.result, null);
+    assert.equal(cancels, 1);
+    release?.();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(cancels, 2);
+  });
+});

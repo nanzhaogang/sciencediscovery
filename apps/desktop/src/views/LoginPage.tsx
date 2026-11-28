@@ -378,11 +378,16 @@ export function LoginPage({
                   </p>
                 </div>
                 <p className="login-notice">{TEXT.login.waitHint}</p>
-                <div className="login-actions">
-                  <button className="secondary-button login-wide" onClick={cancelSignIn} type="button">
-                    {TEXT.login.cancelSignIn}
-                  </button>
-                </div>
+                {step === "redirecting" ? (
+                  // Only the browser leg can be abandoned: once the ticket is in
+                  // hand the exchange is already running, and cancelling here
+                  // would let the success panel appear after the press.
+                  <div className="login-actions">
+                    <button className="secondary-button login-fit" onClick={cancelSignIn} type="button">
+                      {TEXT.login.cancelSignIn}
+                    </button>
+                  </div>
+                ) : null}
               </section>
             ) : step === "error" ? (
               <section>

@@ -120,12 +120,22 @@ export function startBrowserSignIn(
   // Subscribe before opening the browser: the callback can arrive before
   // `open` resolves on a fast sign-in.
   unsubscribe = accountSignIn.onResult((value) => finish(value));
+  /** Tell the shell to release a server this flow no longer wants. Needed
+   *  separately from `cancel()`: `begin()` may resolve after the reader has
+   *  already given up, and that server would otherwise stay listening. */
+  const abandon = (): void => { void accountSignIn.cancel().catch(() => undefined); };
   void (async () => {
     try {
       const { callbackUrl } = await accountSignIn.begin();
-      if (finished) return;
+      if (finished) {
+        // Cancelled while the shell was still starting its callback server:
+        // the server it has just created belongs to no flow, so close it.
+        abandon();
+        return;
+      }
       await accountSignIn.open(buildSignInUrl(callbackUrl));
     } catch (error) {
+      abandon();
       finish({ error: error instanceof Error ? error.message : String(error) });
     }
   })();

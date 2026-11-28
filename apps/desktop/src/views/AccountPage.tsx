@@ -602,14 +602,18 @@ export function SignedOutAccount({ pending = false, onClose, onBrowserSignIn, on
   pending?: boolean;
   onClose?: () => void;
   /** Exchange a ticket from the system-browser sign-in. Rejects on failure. */
-  onBrowserSignIn?: (ticket: string) => Promise<{ session: UserSession; localToken: string }>;
+  onBrowserSignIn: (ticket: string) => Promise<{ session: UserSession; localToken: string }>;
   /** Adopt the settled session: the panel swaps straight to the account details.
    *  The install-time config page is the only place that stops on a success
-   *  summary — here the panel is already the account surface. */
-  onSignedIn?: (session: UserSession, localToken: string) => void;
+   *  summary — here the panel is already the account surface. Awaited, so the
+   *  pending state lasts until the session is really adopted. */
+  onSignedIn: (session: UserSession, localToken: string) => void | Promise<void>;
 }) {
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState(false);
+  /** True once the ticket is being exchanged: the browser leg has finished, so
+   *  there is nothing left for the reader to cancel. */
+  const [exchanging, setExchanging] = useState(false);
   const flow = useRef<BrowserSignInFlow | null>(null);
   // Leaving the panel abandons a browser sign-in that has not called back yet.
   useEffect(() => () => { flow.current?.cancel(); }, []);
@@ -617,7 +621,7 @@ export function SignedOutAccount({ pending = false, onClose, onBrowserSignIn, on
   async function startSignIn(): Promise<void> {
     if (!accountsConfigured()) return;
     setFailed(false);
-    if (!browserSignInAvailable() || !onBrowserSignIn) {
+    if (!browserSignInAvailable()) {
       // Plain browser (web build, SPA dev server): keep the same-window
       // redirect that the app settles from `?account=1` and the fragment.
       window.location.assign(huaweiSignInUrl(`${window.location.origin}/?account=1`));
@@ -637,12 +641,14 @@ export function SignedOutAccount({ pending = false, onClose, onBrowserSignIn, on
       setFailed(true);
       return;
     }
+    setExchanging(true);
     try {
       const settled = await onBrowserSignIn(result.ticket);
-      onSignedIn?.(settled.session, settled.localToken);
+      await onSignedIn(settled.session, settled.localToken);
     } catch {
       setFailed(true);
     } finally {
+      setExchanging(false);
       setBusy(false);
     }
   }
@@ -692,7 +698,7 @@ export function SignedOutAccount({ pending = false, onClose, onBrowserSignIn, on
                 <span className="login-spinner" aria-hidden="true" />
                 {TEXT.login.verifying}
               </p>
-              {busy ? (
+              {busy && !exchanging ? (
                 <button className="account-secondary" onClick={cancelSignIn} type="button">
                   {TEXT.login.cancelSignIn}
                 </button>

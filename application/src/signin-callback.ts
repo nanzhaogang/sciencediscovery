@@ -30,6 +30,7 @@
 
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { randomBytes } from "node:crypto";
 import type { AddressInfo } from "node:net";
 
 /** What the browser posted back: a ticket, or the service's failure marker. */
@@ -57,15 +58,17 @@ export interface StartSignInCallbackOptions {
 const MAX_BODY_BYTES = 16 * 1024;
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 
-/** The page the browser lands on. It reads the fragment, posts it, and says
- *  whether the app now has the sign-in. Plain and self-contained: no network
- *  fetches beyond the loopback POST, no external assets. */
+/** The page the browser lands on. It reads the fragment, posts it to the
+ *  per-flow result URL derived from its own path, and says whether the app now
+ *  has the sign-in. Plain and self-contained: no network fetches beyond the
+ *  loopback POST, no external assets. The copy is bilingual because this page
+ *  is rendered by the system browser, whose language the app cannot know. */
 const CALLBACK_PAGE = `<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ScienceDiscovery 登录</title>
+<title>ScienceDiscovery · 登录 / Sign-in</title>
 <style>
   :root { color-scheme: light dark; }
   body { margin: 0; min-height: 100vh; display: grid; place-items: center;
@@ -82,8 +85,8 @@ const CALLBACK_PAGE = `<!doctype html>
 </head>
 <body>
 <main>
-  <h1 id="title">正在确认登录…</h1>
-  <p id="status">请保持此页面打开，完成后可以返回 ScienceDiscovery 应用。</p>
+  <h1 id="title">正在确认登录… · Signing you in…</h1>
+  <p id="status">请保持此页面打开，完成后可以返回 ScienceDiscovery 应用。<br>Keep this page open; you can return to the app when it finishes.</p>
 </main>
 <script>
 (function () {
@@ -97,29 +100,46 @@ const CALLBACK_PAGE = `<!doctype html>
     // Do not leave the single-use ticket in the address bar.
     history.replaceState(null, "", location.pathname);
   }
+  // The result endpoint carries the same per-flow nonce as this page.
+  var endpoint = location.pathname.replace(/^\\/callback\\//, "/result/");
   var body = ticket ? { ticket: ticket } : { error: error || "sign-in failed" };
-  fetch("/result", {
+  fetch(endpoint, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body)
   }).then(function (response) {
     if (!response.ok) throw new Error("callback rejected");
-    title.textContent = ticket ? "登录成功" : "登录未完成";
+    title.textContent = ticket ? "登录成功 · Signed in" : "登录未完成 · Sign-in did not complete";
     status.textContent = ticket
-      ? "请返回 ScienceDiscovery 应用，点击「进入工作台」。"
-      : "请返回应用后重试登录。";
+      ? "请返回 ScienceDiscovery 应用。 / Return to the ScienceDiscovery app."
+      : "请返回应用后重试登录。 / Return to the app and try again.";
     window.close();
   }).catch(function () {
-    title.textContent = "登录未完成";
-    status.textContent = "请返回应用后重试登录。";
+    title.textContent = "登录未完成 · Sign-in did not complete";
+    status.textContent = "请返回应用后重试登录。 / Return to the app and try again.";
   });
 })();
 </script>
 </body>
 </html>`;
 
-function send(response: ServerResponse, status: number, type: string, body: string): void {
-  response.writeHead(status, { "content-type": type, "cache-control": "no-store" });
+/** Headers every callback-page response carries: the page is a one-shot
+ *  bridge, so nothing may frame it, and the fragment must not travel onward. */
+const PAGE_HEADERS: Record<string, string> = {
+  "x-frame-options": "DENY",
+  "referrer-policy": "no-referrer",
+  "content-security-policy":
+    "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'",
+};
+
+function send(
+  response: ServerResponse,
+  status: number,
+  type: string,
+  body: string,
+  extra: Record<string, string> = {},
+): void {
+  response.writeHead(status, { "content-type": type, "cache-control": "no-store", ...extra });
   response.end(body);
 }
 
@@ -153,14 +173,37 @@ export function startSignInCallbackServer(
   return new Promise((resolve, reject) => {
     let finished = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    /** Unguessable per flow: it is what ties a posted result to this sign-in,
+     *  so another page (or another local process) cannot settle it. */
+    const nonce = randomBytes(18).toString("base64url");
+    /** This server's own origin, known once it is listening. */
+    let selfOrigin = "";
 
     const server = createServer((request, response) => {
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
-      if (request.method === "GET" && url.pathname === "/callback") {
-        send(response, 200, "text/html; charset=utf-8", CALLBACK_PAGE);
+      if (request.method === "GET" && url.pathname === `/callback/${nonce}`) {
+        send(response, 200, "text/html; charset=utf-8", CALLBACK_PAGE, PAGE_HEADERS);
         return;
       }
-      if (request.method === "POST" && url.pathname === "/result") {
+      if (request.method === "POST" && url.pathname === `/result/${nonce}`) {
+        // Depth behind the nonce: the page this server served posts a JSON body
+        // from its own origin. A cross-site `text/plain` POST, which needs no
+        // preflight, fails both checks.
+        const origin = request.headers.origin;
+        if (origin !== undefined && origin !== selfOrigin) {
+          send(response, 403, "application/json; charset=utf-8", '{"ok":false,"error":"cross_origin"}');
+          return;
+        }
+        const fetchSite = request.headers["sec-fetch-site"];
+        if (fetchSite !== undefined && fetchSite !== "same-origin") {
+          send(response, 403, "application/json; charset=utf-8", '{"ok":false,"error":"cross_origin"}');
+          return;
+        }
+        const contentType = (request.headers["content-type"] ?? "").toLowerCase();
+        if (!contentType.startsWith("application/json")) {
+          send(response, 415, "application/json; charset=utf-8", '{"ok":false,"error":"unsupported_media_type"}');
+          return;
+        }
         void readBody(request).then((text) => {
           let body: { ticket?: unknown; error?: unknown };
           try {
@@ -212,6 +255,7 @@ export function startSignInCallbackServer(
 
     server.listen(0, "127.0.0.1", () => {
       const address = server.address() as AddressInfo;
+      selfOrigin = `http://127.0.0.1:${address.port}`;
       timer = setTimeout(() => {
         if (finished) return;
         finished = true;
@@ -220,7 +264,7 @@ export function startSignInCallbackServer(
       }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
       timer.unref?.();
       resolve({
-        callbackUrl: `http://127.0.0.1:${address.port}/callback`,
+        callbackUrl: `${selfOrigin}/callback/${nonce}`,
         stop,
       });
     });
