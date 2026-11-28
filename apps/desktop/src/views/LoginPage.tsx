@@ -390,26 +390,28 @@ export function LoginPage({
                 <p className="login-lead">
                   {failure === "timeout" ? TEXT.login.timeoutBody : TEXT.login.errorBody}
                 </p>
-                <div className="login-actions">
+                <div className={offerModelSetup ? "login-actions login-actions-inline" : "login-actions"}>
                   {offerModelSetup ? (
-                    <button
-                      className="primary-button login-wide"
-                      onClick={() => {
-                        setStep("idle");
-                        setEntry("model");
-                      }}
-                      type="button"
-                    >
-                      {TEXT.login.continueToModel}
+                    <>
+                      <button className="secondary-button login-fit" onClick={() => setStep("idle")} type="button">
+                        {TEXT.login.retry}
+                      </button>
+                      <button
+                        className="primary-button login-fit"
+                        onClick={() => {
+                          setStep("idle");
+                          setEntry("model");
+                        }}
+                        type="button"
+                      >
+                        {TEXT.login.continueToModel}
+                      </button>
+                    </>
+                  ) : (
+                    <button className="primary-button login-wide" onClick={() => setStep("idle")} type="button">
+                      {TEXT.login.retry}
                     </button>
-                  ) : null}
-                  <button
-                    className={offerModelSetup ? "secondary-button login-wide" : "primary-button login-wide"}
-                    onClick={() => setStep("idle")}
-                    type="button"
-                  >
-                    {TEXT.login.retry}
-                  </button>
+                  )}
                 </div>
               </section>
             ) : (
