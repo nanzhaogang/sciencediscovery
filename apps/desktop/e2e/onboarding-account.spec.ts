@@ -302,7 +302,7 @@ test.describe("the two-step entry gate", () => {
     await expect(page.locator(".login-step-badge")).toHaveCount(0);
   });
 
-  test("a HUAWEI callback opens the workspace without an enter press", async ({ page }) => {
+  test("a HUAWEI callback shows the success panel, then enters the workspace", async ({ page }) => {
     const mock = await installMockApi(page, { models: [], sessions: [makeSession()] });
     // The loopback credential is issued after the ticket is exchanged; the real
     // service verifies the account token, the mock hands the machine token over.
@@ -311,13 +311,19 @@ test.describe("the two-step entry gate", () => {
 
     await page.goto("/#auth-ticket=single-use-ticket");
 
-    // No 进入工作台 step: the shell appears as the callback settles.
-    await expect(page.locator(".app-shell")).toBeVisible();
-    await expect(page.getByRole("button", { name: "进入工作台" })).toHaveCount(0);
+    // A settled sign-in stops on a success panel: it names the account and
+    // offers the one press that opens the workspace.
+    await expect(page.getByRole("heading", { name: "登录成功" })).toBeVisible();
+    await expect(page.getByText("欢迎 研究者 用户")).toBeVisible();
+    await expect(page.getByRole("button", { name: "进入工作台" })).toBeVisible();
     expect(account.state.displayName).toBe("研究者");
     await expect
       .poll(() => page.evaluate((key) => localStorage.getItem(key), TOKEN_STORAGE_KEY))
       .toBe(TOKEN);
+    await expect(page.locator(".app-shell")).toHaveCount(0);
+
+    await page.getByRole("button", { name: "进入工作台" }).click();
+    await expect(page.locator(".app-shell")).toBeVisible();
 
     // A build that *does* name an account service registers the credits-backed
     // provider from that gateway's model list, which is what lets a signed-in

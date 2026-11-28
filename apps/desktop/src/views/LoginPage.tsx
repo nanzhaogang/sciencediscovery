@@ -23,6 +23,7 @@ import {
   refreshAccountSession,
   revokeAccountSession,
 } from "../auth/account.js";
+import { browserSignInAvailable, startBrowserSignIn, type BrowserSignInFlow } from "../auth/browser-signin.js";
 import { clearSession, readSession, saveSession, sessionNeedsRefresh, type UserSession } from "../auth/session.js";
 import { acquireLocalAccessToken } from "../local-access-token.js";
 import { TEXT } from "../text.js";
@@ -70,17 +71,27 @@ export function hasAuthCallback(hash: string): boolean {
  *  first, so a reload cannot spend the single-use ticket twice. Used by the
  *  sign-in page and by the account panel, which settles the same callback
  *  without leaving the panel. */
+/** Exchange a ticket the account service issued for a session and this
+ *  machine's credential, storing both. Shared by the fragment callback and by
+ *  the system-browser callback, which delivers the same ticket over the shell
+ *  bridge. */
+export async function settleAuthTicket(
+  ticket: string,
+): Promise<{ session: UserSession; localToken: string }> {
+  const account = await exchangeTicket(ticket, describeDevice());
+  const next = accountSessionToUserSession(account, readSession(), defaultAccountName());
+  const localToken = await acquireLocalAccessToken(account.accessToken);
+  saveSession(next);
+  return { session: next, localToken };
+}
+
 export async function settleAuthCallback(
   hash: string,
 ): Promise<{ session: UserSession; localToken: string } | undefined> {
   const ticket = readAuthTicket(hash);
   if (!ticket) return undefined;
   window.history.replaceState(null, "", window.location.pathname);
-  const account = await exchangeTicket(ticket, describeDevice());
-  const next = accountSessionToUserSession(account, readSession(), defaultAccountName());
-  const localToken = await acquireLocalAccessToken(account.accessToken);
-  saveSession(next);
-  return { session: next, localToken };
+  return settleAuthTicket(ticket);
 }
 
 export function LoginPage({
@@ -96,6 +107,11 @@ export function LoginPage({
   const [step, setStep] = useState<Step>(() => (readSession() ? "verifying" : "idle"));
   const [entry, setEntry] = useState<Entry>("account");
   const [localToken, setLocalToken] = useState("");
+  /** True when this mount settled a real sign-in (not a cached-session restore):
+   *  the success panel then waits for the reader to enter the workspace. */
+  const [freshSignIn, setFreshSignIn] = useState(false);
+  /** The in-flight system-browser sign-in, cancelled when the page unmounts. */
+  const signInFlow = useRef<BrowserSignInFlow | null>(null);
   // Baked at build time, so this never changes while the page is mounted.
   const accountServiceConfigured = accountsConfigured();
   // Settling consumes the ticket and rotates the refresh token, so it must run
@@ -135,6 +151,7 @@ export function LoginPage({
           if (settled) {
             setSession(settled.session);
             setLocalToken(settled.localToken);
+            setFreshSignIn(true);
             setStep("done");
           }
         } catch {
@@ -198,10 +215,13 @@ export function LoginPage({
   // the session and this machine's credential are both in hand, so there is no
   // second "enter" press between a successful sign-in and the workbench.
   useEffect(() => {
-    if (step !== "done" || session === undefined || localToken === "" || entered.current) return;
+    if (step !== "done" || freshSignIn || session === undefined || localToken === "" || entered.current) return;
     entered.current = true;
     onAuthenticatedRef.current(session, localToken);
-  }, [localToken, session, step]);
+  }, [freshSignIn, localToken, session, step]);
+
+  // Leaving the page abandons a browser sign-in that has not called back yet.
+  useEffect(() => () => { signInFlow.current?.cancel(); }, []);
 
   /** The cached-session path can settle without a local credential (the loopback
    *  service was down). Re-run the whole settle rather than only the credential:
@@ -223,16 +243,39 @@ export function LoginPage({
     if (current) void revokeAccountSession(current.accessToken).catch(() => undefined);
   }
 
-  function startSignIn(): void {
+  async function startSignIn(): Promise<void> {
     // An empty base cannot start a server-owned sign-in: the navigation would be
     // answered by this app's own static host. The entry renders the "not
     // configured" notice instead, so this is only the guard behind it.
     if (!accountServiceConfigured) return;
     setStep("redirecting");
-    // This workbench has no `/login` route: the sign-in page is what `/`
-    // renders while the local service credential is missing. Returning to the
-    // root keeps the fragment on the page that exchanges the ticket.
-    window.location.assign(huaweiSignInUrl(`${window.location.origin}/`));
+    if (!browserSignInAvailable()) {
+      // Plain browser (web build, SPA dev server, Playwright): keep the
+      // same-window redirect whose fragment carries the ticket back here.
+      window.location.assign(huaweiSignInUrl(`${window.location.origin}/`));
+      return;
+    }
+    // Electron shell: the account service opens in the system browser. The
+    // shell receives the ticket on a loopback callback and forwards it here.
+    const flow = startBrowserSignIn((callbackUrl) => huaweiSignInUrl(callbackUrl));
+    signInFlow.current = flow;
+    const result = await flow.result;
+    signInFlow.current = null;
+    if (result === null) return;
+    if (!result.ticket) {
+      setStep("error");
+      return;
+    }
+    setStep("verifying");
+    try {
+      const settled = await settleAuthTicket(result.ticket);
+      setSession(settled.session);
+      setLocalToken(settled.localToken);
+      setFreshSignIn(true);
+      setStep("done");
+    } catch {
+      setStep("error");
+    }
   }
 
   return (
@@ -288,6 +331,21 @@ export function LoginPage({
                   </button>
                 </div>
               </section>
+            ) : step === "done" && freshSignIn && session ? (
+              <section>
+                <h1>{TEXT.login.successTitle}</h1>
+                <p className="login-lead is-ink">{TEXT.login.welcome(session.displayName)}</p>
+                <p className="login-lead">{TEXT.login.credits(session.balanceCredits)}</p>
+                <div className="login-actions">
+                  <button
+                    className="primary-button login-wide"
+                    onClick={() => onAuthenticated(session, localToken)}
+                    type="button"
+                  >
+                    {TEXT.login.enterWorkspace}
+                  </button>
+                </div>
+              </section>
             ) : step === "done" && session ? (
               <section>
                 <h1>{TEXT.login.title}</h1>
@@ -311,7 +369,23 @@ export function LoginPage({
                 <h1>{TEXT.login.errorTitle}</h1>
                 <p className="login-lead">{TEXT.login.errorBody}</p>
                 <div className="login-actions">
-                  <button className="primary-button login-wide" onClick={() => setStep("idle")} type="button">
+                  {offerModelSetup ? (
+                    <button
+                      className="primary-button login-wide"
+                      onClick={() => {
+                        setStep("idle");
+                        setEntry("model");
+                      }}
+                      type="button"
+                    >
+                      {TEXT.login.continueToModel}
+                    </button>
+                  ) : null}
+                  <button
+                    className={offerModelSetup ? "secondary-button login-wide" : "primary-button login-wide"}
+                    onClick={() => setStep("idle")}
+                    type="button"
+                  >
                     {TEXT.login.retry}
                   </button>
                 </div>
@@ -324,7 +398,7 @@ export function LoginPage({
                   <button
                     className="login-huawei-button login-entry-primary"
                     disabled={!accountServiceConfigured}
-                    onClick={startSignIn}
+                    onClick={() => void startSignIn()}
                     type="button"
                   >
                     <span className="login-huawei-mark" aria-hidden="true">ID</span>{TEXT.login.huaweiButton}

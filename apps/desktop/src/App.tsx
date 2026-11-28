@@ -30,7 +30,7 @@ import { CREDITS_PROVIDER_NAME, ensureCreditsModel } from "./auth/credits-model.
 import { requiresLocalToken } from "./auth/gate.js";
 import { clearSession, readSession, saveSession, sessionRefreshDelayMs, type UserSession } from "./auth/session.js";
 import { ensureFreshAccountSession } from "./auth/session-refresh.js";
-import { LoginPage, hasAuthCallback, settleAuthCallback } from "./views/LoginPage.js";
+import { LoginPage, hasAuthCallback, settleAuthCallback, settleAuthTicket } from "./views/LoginPage.js";
 import { AccountPage, SignedOutAccount } from "./views/AccountPage.js";
 import { cancelRun, getSubagent } from "./api/sessions.js";
 import type {
@@ -1769,7 +1769,16 @@ export function App({ initialToken }: Props) {
         // After signing out the account surface shows a grey avatar and the
         // single way back in; the workspace behind it stays usable with a
         // custom model.
-        <SignedOutAccount onClose={() => setAccountOpen(false)} pending={settlingAuth} />
+        <SignedOutAccount
+          onClose={() => setAccountOpen(false)}
+          pending={settlingAuth}
+          onBrowserSignIn={(ticket) => settleAuthTicket(ticket)}
+          onEnterWorkspace={async (session, localToken) => {
+            // Entering the workspace is the final press: authenticate swaps the
+            // panel for the workbench.
+            await authenticate(session, localToken);
+          }}
+        />
       ) : null}
 
       {settingsOpen ? (
